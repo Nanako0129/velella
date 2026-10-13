@@ -1,9 +1,12 @@
 import AppKit
 import SwiftUI
+import VelellaUI
 
 @main
 struct VelellaApp: App {
-    @State private var model = ProbeModel()
+    /// `swift run Velella --demo` fills the shell with fixture data; without it the shell is
+    /// shown in its "not signed in" state.
+    private let state: ShellState = CommandLine.arguments.contains("--demo") ? .demo : .signedOut
 
     init() {
         // `swift run` launches a bare executable; make it a regular foreground app.
@@ -13,15 +16,7 @@ struct VelellaApp: App {
 
     var body: some Scene {
         WindowGroup("Velella") {
-            VStack(spacing: 12) {
-                Text("Async ran on: \(model.probe)")
-                Text("Ticks: \(model.ticks)").monospacedDigit()
-                Button("Stop") { model.stop() }
-                    .disabled(!model.isRunning)
-            }
-            .padding(32)
-            .frame(minWidth: 320)
-            .task { await model.start() }
+            ShellView(state: state)
         }
     }
 }
