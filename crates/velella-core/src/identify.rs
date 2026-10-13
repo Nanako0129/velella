@@ -2,6 +2,7 @@
 //! user-account IDENTIFY (refs/concord/src/discord/gateway.rs, GPL-3.0-only; see
 //! THIRD_PARTY_NOTICES.md), with Safari-on-macOS properties instead of Concord's Chrome ones.
 use crate::token::{self, Token};
+use base64::Engine as _;
 use serde::Serialize;
 use zeroize::Zeroizing;
 
@@ -35,7 +36,9 @@ const BROWSER: &str = "Safari";
 const BROWSER_VERSION: &str = "26.0";
 /// Safari freezes the macOS version in its UA at 10.15.7.
 const OS_VERSION: &str = "10.15.7";
-const LOCALE: &str = "en-US";
+pub(crate) const LOCALE: &str = "en-US";
+/// Safari's Accept-Language for an en-US system, matching `LOCALE`.
+pub(crate) const ACCEPT_LANGUAGE: &str = "en-US,en;q=0.9";
 /// Concord's fallback build number (refs/concord/src/discord/fingerprint.rs); the live number
 /// would need a REST call, which M1 forbids. Whether Discord accepts a stale value is
 /// unverified; the first live login (S3) is the check.
@@ -105,28 +108,55 @@ pub(crate) struct Payload<D> {
     d: D,
 }
 
+/// The one source of the client properties: IDENTIFY sends them as `properties`, REST as the
+/// base64 `X-Super-Properties` header, so the two can never disagree.
+fn properties() -> Properties {
+    Properties {
+        os: OS,
+        browser: BROWSER,
+        device: "",
+        system_locale: LOCALE,
+        browser_user_agent: USER_AGENT,
+        browser_version: BROWSER_VERSION,
+        os_version: OS_VERSION,
+        referrer: "",
+        referring_domain: "",
+        referrer_current: "",
+        referring_domain_current: "",
+        release_channel: "stable",
+        client_build_number: CLIENT_BUILD_NUMBER,
+        client_event_source: None,
+    }
+}
+
+/// `X-Super-Properties`: standard base64 of the IDENTIFY properties JSON, as the web client sends.
+pub(crate) fn super_properties() -> String {
+    let json = serde_json::to_string(&properties()).expect("properties serialize");
+    base64::engine::general_purpose::STANDARD.encode(json)
+}
+
+/// `X-Discord-Timezone`: the system's IANA zone, which a browser reports from the same setting.
+/// macOS keeps it as the `/etc/localtime` symlink into `.../zoneinfo/<Zone>`; anything unreadable
+/// or outside the IANA name alphabet falls back to "UTC".
+pub(crate) fn timezone() -> String {
+    std::fs::read_link("/etc/localtime")
+        .ok()
+        .and_then(|p| Some(p.to_str()?.split_once("zoneinfo/")?.1.to_owned()))
+        .filter(|z| {
+            !z.is_empty()
+                && z.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"/_+-".contains(&b))
+        })
+        .unwrap_or_else(|| "UTC".to_owned())
+}
+
 pub(crate) fn identify(token: &Token) -> Payload<IdentifyData<'_>> {
     Payload {
         op: 2,
         d: IdentifyData {
             token,
             capabilities: CAPABILITIES,
-            properties: Properties {
-                os: OS,
-                browser: BROWSER,
-                device: "",
-                system_locale: LOCALE,
-                browser_user_agent: USER_AGENT,
-                browser_version: BROWSER_VERSION,
-                os_version: OS_VERSION,
-                referrer: "",
-                referring_domain: "",
-                referrer_current: "",
-                referring_domain_current: "",
-                release_channel: "stable",
-                client_build_number: CLIENT_BUILD_NUMBER,
-                client_event_source: None,
-            },
+            properties: properties(),
             presence: Presence {
                 since: 0,
                 activities: [],
@@ -197,6 +227,20 @@ mod tests {
         assert_eq!(wire["d"]["token"], MARKER);
         assert_eq!(wire["d"]["session_id"], "sess");
         assert_eq!(wire["d"]["seq"], 7);
+    }
+
+    #[test]
+    fn super_properties_decode_to_the_identify_properties() {
+        let token = Token::new(MARKER.into()).unwrap();
+        let wire: serde_json::Value = serde_json::from_str(&encode(&identify(&token))).unwrap();
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(super_properties())
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&raw).contains("SYNTHETIC"));
+        let decoded: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(decoded, wire["d"]["properties"]);
+        let tz = timezone();
+        assert!(!tz.is_empty() && reqwest::header::HeaderValue::from_str(&tz).is_ok());
     }
 
     #[test]

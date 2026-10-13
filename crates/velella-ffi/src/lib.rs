@@ -89,6 +89,10 @@ pub trait SessionListener: Send + Sync {
     fn on_reconnecting(&self, generation: u64);
     fn on_auth_failed(&self, generation: u64);
     fn on_closed(&self, generation: u64);
+    /// A REST call got 401: REST stays off for this session, the gateway carries on. At most once
+    /// per session and never after `on_auth_failed`/`on_closed`. Not a reason to delete the
+    /// saved sign-in (that stays tied to `on_auth_failed`).
+    fn on_rest_unauthorized(&self, generation: u64);
 }
 
 /// A running session. Dropping the last reference disconnects it.
@@ -294,6 +298,7 @@ pub fn connect(
         SessionEvent::Reconnecting { generation } => listener.on_reconnecting(generation),
         SessionEvent::AuthFailed { generation } => listener.on_auth_failed(generation),
         SessionEvent::Closed { generation } => listener.on_closed(generation),
+        SessionEvent::RestUnauthorized { generation } => listener.on_rest_unauthorized(generation),
     });
     Ok(Arc::new(SessionHandle(handle)))
 }
@@ -333,6 +338,7 @@ mod tests {
         fn on_reconnecting(&self, _: u64) {}
         fn on_auth_failed(&self, _: u64) {}
         fn on_closed(&self, _: u64) {}
+        fn on_rest_unauthorized(&self, _: u64) {}
     }
 
     /// Only invalid tokens here: a valid one would start a real gateway dial.

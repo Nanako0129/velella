@@ -9,7 +9,10 @@ struct MessageArea: View {
     let header: ChannelHeader?
     var isSignedIn = true
     let messages: [MessagePlaceholder]
+    /// Not drawn yet: the message slice shows its loading and failure states.
+    var load: MessageLoad = .idle
     @Binding var reply: ReplyPreview?
+    var onSend: ((String) -> Void)?
 
     var body: some View {
         if header != nil {
@@ -24,7 +27,7 @@ struct MessageArea: View {
             // Messages pass under the toolbar through a glass band with a hard lower edge, on a
             // darker pane than the translucent sidebar (Swiftcord v2, user's captures 2026-10-13).
             .scrollEdgeEffectStyle(.hard, for: .top)
-            .safeAreaInset(edge: .bottom) { Composer(reply: $reply) }
+            .safeAreaInset(edge: .bottom) { Composer(reply: $reply, onSend: onSend) }
             // Under the toolbar too, so the toolbar band carries the pane's tint (a band of bare
             // window material over the messages read as a separate, lighter strip).
             .background(T.Palette.messagePane)
@@ -95,6 +98,8 @@ struct ImageAttachmentView: View {
 /// sticker and emoji are decoration until their pickers exist.
 struct Composer: View {
     @Binding var reply: ReplyPreview?
+    /// Not called yet: the message slice wires submit (and its empty-draft and IME rules).
+    var onSend: ((String) -> Void)?
     @State private var draft = ""
     @State private var plusMenuOpen = false
 

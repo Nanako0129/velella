@@ -342,3 +342,38 @@ fn ready_without_a_user_is_rejected_and_numeric_ids_are_accepted() {
     let s = applied("READY", ready(vec![g]));
     assert_eq!(s.guild(77).unwrap().channels[0].id, 78);
 }
+
+#[test]
+fn role_name_and_colour_carry_through_ready_and_role_updates() {
+    let g = json!({"id": "100", "name": "g", "owner_id": "999", "channels": [], "roles": [
+        {"id": "100", "name": "@everyone", "permissions": "0", "position": 0, "color": 0},
+        {"id": "7", "name": "Mods", "permissions": "0", "position": 2, "color": 0x1abc9c},
+        {"id": "8", "permissions": "0", "position": 1}
+    ]});
+    let mut s = applied("READY", ready(vec![g]));
+    let role = |s: &State, id: u64| {
+        let r = s.guild(100).unwrap().roles.as_ref().unwrap();
+        r.iter().find(|r| r.id == id).cloned().unwrap()
+    };
+    assert_eq!(
+        (role(&s, 7).name.as_deref(), role(&s, 7).color),
+        (Some("Mods"), 0x1abc9c)
+    );
+    assert_eq!((role(&s, 8).name, role(&s, 8).color), (None, 0));
+    assert!(s.ap(
+        "GUILD_ROLE_UPDATE",
+        json!({"guild_id": "100", "role": {"id": "7", "name": "Admins", "permissions": "0", "position": 2, "color": 0xe91e63}})
+    ));
+    assert_eq!(
+        (role(&s, 7).name.as_deref(), role(&s, 7).color),
+        (Some("Admins"), 0xe91e63)
+    );
+    assert!(s.ap(
+        "GUILD_ROLE_CREATE",
+        json!({"guild_id": "100", "role": {"id": "9", "name": "New", "permissions": "0", "position": 3, "color": 255}})
+    ));
+    assert_eq!(
+        (role(&s, 9).name.as_deref(), role(&s, 9).color),
+        (Some("New"), 255)
+    );
+}

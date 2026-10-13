@@ -20,6 +20,18 @@ pub struct Role {
     pub id: u64,
     pub permissions: u64,
     pub position: i64,
+    pub name: Option<String>,
+    /// RGB integer (0xRRGGBB); 0 = no colour, as Discord sends it.
+    pub color: u32,
+}
+
+/// The member-list selection set through `SessionHandle::set_member_subscription`. `epoch` grows
+/// with every change, so a reader can tell a new selection from the same one set again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemberSub {
+    pub epoch: u64,
+    pub guild_id: u64,
+    pub channel_id: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -95,6 +107,8 @@ pub struct State {
     pub private_channels: Vec<PrivateChannel>,
     /// `None` when READY carried no `user_settings.guild_folders`.
     pub guild_folders: Option<Vec<GuildFolder>>,
+    /// Written by `SessionHandle::set_member_subscription` under the state lock; kept across READY.
+    pub member_sub: Option<MemberSub>,
 }
 
 fn id(v: &Value) -> Option<u64> {
@@ -141,6 +155,12 @@ fn parse_role(v: &Value) -> Option<Role> {
         id: get_id(v, "id")?,
         permissions: v.get("permissions").and_then(bits).unwrap_or(0),
         position: v.get("position").and_then(Value::as_i64).unwrap_or(0),
+        name: get_str(v, "name"),
+        color: v
+            .get("color")
+            .and_then(Value::as_u64)
+            .and_then(|c| u32::try_from(c).ok())
+            .unwrap_or(0),
     })
 }
 
@@ -337,9 +357,12 @@ impl State {
         };
         let revision = self.revision;
         let mut users = std::mem::take(&mut self.users);
+        // The selection outlives the connection: L re-arms on the SYNC after the re-send.
+        let member_sub = self.member_sub.take();
         *self = State {
             revision,
             user_id: Some(me.id),
+            member_sub,
             ..Default::default()
         };
         // DEDUPE_USER_OBJECTS: every referenced user once, here.

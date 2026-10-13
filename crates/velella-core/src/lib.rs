@@ -5,7 +5,9 @@
 mod compression;
 mod gateway;
 mod identify;
+mod messages;
 mod permissions;
+mod rest;
 mod session;
 mod sidebar;
 mod state;
@@ -13,6 +15,8 @@ mod token;
 
 #[cfg(test)]
 mod fixture_tests;
+#[cfg(test)]
+mod rest_tests;
 #[cfg(test)]
 mod session_tests;
 #[cfg(test)]
@@ -24,5 +28,7 @@ pub use sidebar::{
     channel_categories, dm_list, guild_entries, SidebarCategory, SidebarChannel, SidebarDm,
     SidebarEntry, SidebarGuild,
 };
-pub use state::{Channel, Guild, GuildFolder, Overwrite, PrivateChannel, Role, State, User};
+pub use state::{
+    Channel, Guild, GuildFolder, MemberSub, Overwrite, PrivateChannel, Role, State, User,
+};
 pub use token::{Token, TokenError};

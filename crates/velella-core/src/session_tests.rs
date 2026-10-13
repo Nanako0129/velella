@@ -72,6 +72,30 @@ impl Conn {
         serde_json::from_str(&self.recv_raw().await).unwrap()
     }
 
+    /// Next client packet that is not a heartbeat: the first beat is jittered and may go out at
+    /// any moment, even right after HELLO.
+    async fn recv_non_beat(&mut self) -> Value {
+        loop {
+            let packet = self.recv().await;
+            if packet["op"] != 1 {
+                return packet;
+            }
+        }
+    }
+
+    /// True when nothing but heartbeats arrives for a while.
+    async fn quiet(&mut self) -> bool {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(400);
+        loop {
+            match tokio::time::timeout_at(deadline, self.ws.next()).await {
+                Err(_) => return true,
+                Ok(Some(Ok(Message::Text(t))))
+                    if serde_json::from_str::<Value>(&t).is_ok_and(|v| v["op"] == 1) => {}
+                Ok(_) => return false,
+            }
+        }
+    }
+
     async fn close(&mut self, code: u16) {
         let frame = CloseFrame {
             code: code.into(),
@@ -317,15 +341,41 @@ async fn close_4004_is_auth_failed_and_not_retried() {
     assert_eq!(timeout(WAIT, rig.events.recv()).await.unwrap(), None);
 }
 
+/// The client may beat at any moment before it closes: its first beat is jittered, and the jitter
+/// comes in whole seconds on macOS (`SystemTime` has microsecond resolution, so
+/// `subsec_nanos() % 30_000` is a multiple of 1000), so about one run in 30 beat at once and the
+/// heartbeat, not the Close frame, was the next frame here. The mock's op 1 below makes that beat
+/// happen in (nearly) every run; heartbeats before the Close frame are skipped.
 #[tokio::test]
 async fn disconnect_emits_closed_and_generations_increase() {
     let mut rig = Rig::start().await;
     let mut conn = rig.ready(30_000, "wss://gateway-resume.discord.gg/").await;
     let generation = rig.handle.generation();
+    conn.send(json!({"op": 1, "d": null})).await;
+    // ACK the beat that op 1 provoked: an unacked beat would make a later jittered tick report
+    // "heartbeat ACK missed" and Reconnect before the disconnect lands (seen under load).
+    while conn.recv().await["op"] != 1 {}
+    conn.send(json!({"op": 11})).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
     rig.handle.disconnect();
-    assert_eq!(rig.event().await, SessionEvent::Closed { generation });
+    // A heartbeat tick can still race the disconnect under load (macOS jitter is whole seconds)
+    // and report one Reconnecting first; the claim here is that Closed always ends the session.
+    let ended = loop {
+        match rig.event().await {
+            SessionEvent::Reconnecting { generation: g } if g == generation => continue,
+            other => break other,
+        }
+    };
+    assert_eq!(ended, SessionEvent::Closed { generation });
+    let closing = loop {
+        match timeout(WAIT, conn.ws.next()).await.unwrap() {
+            Some(Ok(Message::Text(t))) if serde_json::from_str::<Value>(&t).unwrap()["op"] == 1 => {
+            }
+            other => break other,
+        }
+    };
     assert!(matches!(
-        timeout(WAIT, conn.ws.next()).await.unwrap(),
+        closing,
         Some(Ok(Message::Close(_))) | Some(Err(_)) | None
     ));
     let second = Rig::start().await;
@@ -608,5 +658,284 @@ mod subscriptions {
         assert!(matches!(rig.event().await, SessionEvent::Closed { .. }));
         // The handle is still alive, yet the driver has returned and dropped its closure.
         assert_eq!(timeout(WAIT, rx.recv()).await.unwrap(), None);
+    }
+}
+
+// ---- Member-list subscription (op 37), through the mock gateway ----
+
+mod member_sub {
+    use super::*;
+
+    fn sub(guild: u64, typing: bool, channel: Option<u64>) -> Value {
+        let channels = match channel {
+            Some(c) => json!({ c.to_string(): [[0, 99]] }),
+            None => json!({}),
+        };
+        json!({"op": 37, "d": {"subscriptions": {guild.to_string(): {"typing": typing,
+            "threads": false, "activities": true, "member_updates": false, "members": [],
+            "channels": channels, "thread_member_lists": []}}}})
+    }
+
+    /// Subscribe the guild, then ask for the channel's rows.
+    async fn expect_subscribe(conn: &mut Conn, guild: u64, channel: u64) {
+        assert_eq!(conn.recv_non_beat().await, sub(guild, true, None));
+        assert_eq!(conn.recv_non_beat().await, sub(guild, true, Some(channel)));
+    }
+
+    #[tokio::test]
+    async fn member_sub_set_before_ready_is_sent_once_after_ready() {
+        let rig = Rig::start().await;
+        rig.handle.set_member_subscription(Some((10, 20)));
+        let mut conn = Conn::accept(&rig.initial).await;
+        conn.hello(30_000).await;
+        assert_eq!(conn.recv_non_beat().await["op"], 2);
+        assert!(conn.quiet().await, "op 37 went out before READY");
+        conn.send(ready(1, "wss://gateway-resume.discord.gg/"))
+            .await;
+        expect_subscribe(&mut conn, 10, 20).await;
+        assert!(conn.quiet().await, "sent more than once");
+    }
+
+    #[tokio::test]
+    async fn member_sub_is_resent_after_a_forced_reidentify() {
+        let mut rig = Rig::start().await;
+        let mut first = rig.ready(30_000, "wss://gateway-resume.discord.gg/").await;
+        rig.handle.set_member_subscription(Some((10, 20)));
+        expect_subscribe(&mut first, 10, 20).await;
+        first.send(json!({"op": 9, "d": false})).await;
+        let mut conn = Conn::accept(&rig.initial).await;
+        conn.hello(30_000).await;
+        assert_eq!(conn.recv_non_beat().await["op"], 2);
+        conn.send(ready(1, "wss://gateway-resume.discord.gg/"))
+            .await;
+        expect_subscribe(&mut conn, 10, 20).await;
+        assert!(conn.quiet().await);
+    }
+
+    #[tokio::test]
+    async fn member_sub_is_resent_after_resumed() {
+        let mut rig = Rig::start().await;
+        rig.handle.set_member_subscription(Some((10, 20)));
+        // 100 ms beats that the mock never ACKs: the session resumes at the resume endpoint.
+        let _first = rig.ready(100, "wss://gateway-resume.discord.gg/").await;
+        let mut conn = Conn::accept(&rig.resume).await;
+        conn.hello(30_000).await;
+        assert_eq!(conn.recv_non_beat().await["op"], 6);
+        conn.send(json!({"op": 0, "t": "RESUMED", "s": 2, "d": {}}))
+            .await;
+        expect_subscribe(&mut conn, 10, 20).await;
+        assert!(conn.quiet().await);
+    }
+
+    #[tokio::test]
+    async fn member_sub_guild_switch_sends_a_leave_frame_for_the_old_guild() {
+        let mut rig = Rig::start().await;
+        let mut conn = rig.ready(30_000, "wss://gateway-resume.discord.gg/").await;
+        rig.handle.set_member_subscription(Some((10, 20)));
+        expect_subscribe(&mut conn, 10, 20).await;
+        // Another channel in the same guild: ranges only.
+        rig.handle.set_member_subscription(Some((10, 21)));
+        assert_eq!(conn.recv_non_beat().await, sub(10, true, Some(21)));
+        assert!(conn.quiet().await);
+        // Another guild: leave the old one, then subscribe the new one.
+        rig.handle.set_member_subscription(Some((11, 30)));
+        assert_eq!(conn.recv_non_beat().await, sub(10, false, None));
+        expect_subscribe(&mut conn, 11, 30).await;
+        // Cleared (a DM or nothing selected): leave.
+        rig.handle.set_member_subscription(None);
+        assert_eq!(conn.recv_non_beat().await, sub(11, false, None));
+        assert!(conn.quiet().await);
+    }
+
+    #[tokio::test]
+    async fn two_quick_member_sub_sets_send_only_the_latest() {
+        let mut rig = Rig::start().await;
+        let mut conn = rig.ready(30_000, "wss://gateway-resume.discord.gg/").await;
+        // No await in between: the loop wakes once and sees only the newest value.
+        rig.handle.set_member_subscription(Some((10, 20)));
+        rig.handle.set_member_subscription(Some((11, 30)));
+        expect_subscribe(&mut conn, 11, 30).await;
+        assert!(conn.quiet().await, "the first selection was sent too");
+    }
+
+    #[tokio::test]
+    async fn member_sub_is_visible_to_a_dispatch_applied_right_after_the_call() {
+        let mut rig = Rig::start().await;
+        let mut conn = rig.ready(30_000, "wss://gateway-resume.discord.gg/").await;
+        rig.handle.set_member_subscription(Some((10, 20)));
+        // Before the session task has run at all, State already holds the selection.
+        let set = rig
+            .handle
+            .snapshot()
+            .member_sub
+            .clone()
+            .expect("not in State");
+        assert_eq!((set.guild_id, set.channel_id), (10, 20));
+        let mut revision = rig.handle.state();
+        revision.borrow_and_update();
+        conn.send(json!({"op": 0, "t": "GUILD_CREATE", "s": 2, "d": {"id": "10", "name": "g", "owner_id": "9", "roles": [], "channels": []}})).await;
+        timeout(WAIT, revision.changed()).await.unwrap().unwrap();
+        let applied = rig.handle.applied();
+        let (name, seen) = applied.last().unwrap();
+        assert_eq!(name, "GUILD_CREATE");
+        assert_eq!(
+            seen.as_ref(),
+            Some(&set),
+            "the dispatch did not see the new selection"
+        );
+    }
+
+    #[tokio::test]
+    async fn member_sub_survives_ready() {
+        let mut rig = Rig::start().await;
+        let mut conn = rig.ready(30_000, "wss://gateway-resume.discord.gg/").await;
+        rig.handle.set_member_subscription(Some((10, 20)));
+        let set = rig.handle.snapshot().member_sub.clone().unwrap();
+        // A second READY rebuilds State (its guild list here) but keeps the selection.
+        let mut again = ready(5, "wss://gateway-resume.discord.gg/");
+        again["d"]["guilds"] = json!([{"id": "77", "name": "n", "channels": []}]);
+        conn.send(again).await;
+        assert!(matches!(rig.event().await, SessionEvent::Ready { .. }));
+        let state = rig.handle.snapshot();
+        assert!(state.guild(77).is_some(), "READY was not applied");
+        assert_eq!(state.member_sub.as_ref(), Some(&set));
+    }
+
+    #[tokio::test]
+    async fn setting_the_same_member_sub_again_sends_nothing_and_keeps_the_epoch() {
+        let mut rig = Rig::start().await;
+        let mut conn = rig.ready(30_000, "wss://gateway-resume.discord.gg/").await;
+        rig.handle.set_member_subscription(Some((10, 20)));
+        expect_subscribe(&mut conn, 10, 20).await;
+        conn.send(json!({"op": 0, "t": "GUILD_MEMBER_LIST_UPDATE", "s": 2, "d": {
+            "guild_id": "10", "id": "everyone", "member_count": 1, "online_count": 1,
+            "groups": [{"id": "online", "count": 1}],
+            "ops": [{"op": "SYNC", "range": [0, 99], "items": [{"group": {"id": "online", "count": 1}}]}]
+        }}))
+        .await;
+        let before = rig.handle.snapshot();
+        rig.handle.set_member_subscription(Some((10, 20)));
+        let after = rig.handle.snapshot();
+        assert_eq!(after.member_sub, before.member_sub, "the epoch moved");
+        assert_eq!(after.revision, before.revision);
+        assert!(
+            conn.quiet().await,
+            "a frame went out for the same selection"
+        );
+    }
+}
+
+// ---- Message-store observer slot ----
+
+#[tokio::test]
+async fn a_dispatch_reaches_the_message_store_observer() {
+    let mut rig = Rig::start().await;
+    let mut conn = rig.ready(30_000, "wss://gateway-resume.discord.gg/").await;
+    let store = rig.handle.messages();
+    assert!(
+        Arc::ptr_eq(&store, &rig.handle.messages()),
+        "one store per session"
+    );
+    // State ignores MESSAGE_CREATE (no revision bump); the observer still sees it.
+    conn.send(json!({"op": 0, "t": "MESSAGE_CREATE", "s": 2, "d": {"id": "5", "channel_id": "20", "content": "hi"}}))
+        .await;
+    timeout(WAIT, async {
+        while !store
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|n| n == "MESSAGE_CREATE")
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the observer never saw the dispatch");
+}
+
+// ---- REST 401 through the session ----
+
+mod rest_401 {
+    use super::*;
+    use crate::rest::{
+        test_support::{response, MockHttp},
+        RestError,
+    };
+
+    async fn unauthorized_mock() -> MockHttp {
+        let mock = MockHttp::start(vec![response(401, "", "")]).await;
+        mock.install();
+        mock
+    }
+
+    async fn call(rig: &Rig) -> Result<Value, RestError> {
+        rig.handle.rest().get("/users/@me").await
+    }
+
+    #[tokio::test]
+    async fn a_rest_401_leaves_the_gateway_up_and_blocks_later_calls() {
+        let mock = unauthorized_mock().await;
+        let mut rig = Rig::start().await;
+        let generation = rig.handle.generation();
+        let mut conn = rig.ready(30_000, "wss://gateway-resume.discord.gg/").await;
+        assert_eq!(call(&rig).await.unwrap_err(), RestError::Unauthorized);
+        assert_eq!(
+            rig.event().await,
+            SessionEvent::RestUnauthorized { generation }
+        );
+        // The gateway carries on: a dispatch still lands, and no AuthFailed or reconnect follows.
+        let mut revision = rig.handle.state();
+        revision.borrow_and_update();
+        conn.send(json!({"op": 0, "t": "GUILD_CREATE", "s": 2, "d": {"id": "10", "name": "g", "owner_id": "9", "roles": [], "channels": []}})).await;
+        timeout(WAIT, revision.changed()).await.unwrap().unwrap();
+        assert!(
+            timeout(Duration::from_millis(400), rig.events.recv())
+                .await
+                .is_err(),
+            "an event followed the REST 401"
+        );
+        assert_eq!(call(&rig).await.unwrap_err(), RestError::Unauthorized);
+        assert_eq!(mock.count(), 1, "a call after the 401 reached the server");
+    }
+
+    #[tokio::test]
+    async fn two_401s_from_two_rest_clones_give_one_event() {
+        let mock = unauthorized_mock().await;
+        let mut rig = Rig::start().await;
+        let generation = rig.handle.generation();
+        let _conn = rig.ready(30_000, "wss://gateway-resume.discord.gg/").await;
+        let (a, b) = (rig.handle.rest(), rig.handle.rest());
+        // Both pass the latch check before either answer arrives.
+        let (ra, rb) = tokio::join!(a.get::<Value>("/users/@me"), b.get::<Value>("/users/@me"));
+        assert_eq!(
+            (ra.unwrap_err(), rb.unwrap_err()),
+            (RestError::Unauthorized, RestError::Unauthorized)
+        );
+        assert_eq!(mock.count(), 2, "both requests reached the server");
+        assert_eq!(
+            rig.event().await,
+            SessionEvent::RestUnauthorized { generation }
+        );
+        assert!(
+            timeout(Duration::from_millis(400), rig.events.recv())
+                .await
+                .is_err(),
+            "a second RestUnauthorized"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_401_after_disconnect_emits_nothing() {
+        let mock = unauthorized_mock().await;
+        let mut rig = Rig::start().await;
+        let generation = rig.handle.generation();
+        let _conn = rig.ready(30_000, "wss://gateway-resume.discord.gg/").await;
+        rig.handle.disconnect();
+        assert_eq!(rig.event().await, SessionEvent::Closed { generation });
+        assert_eq!(call(&rig).await.unwrap_err(), RestError::Unauthorized);
+        assert_eq!(mock.count(), 1);
+        // The task ended and dropped its callback: the channel closes with nothing after Closed.
+        assert_eq!(timeout(WAIT, rig.events.recv()).await.unwrap(), None);
     }
 }

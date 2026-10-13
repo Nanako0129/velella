@@ -13,14 +13,21 @@ public struct ShellView: View {
     /// Owned by the app (or a fixture), so its later changes reach the window.
     @Binding private var state: ShellState
     private let onSignIn: (() -> Void)?
+    private let onSend: ((String) -> Void)?
     @State private var showMembers = true
     @State private var search = ""
-    @State private var sidebarWidth: CGFloat = 0
+    /// Starts at the sidebar's ideal width, not 0: the title's frame is this minus the reserved
+    /// space, and before the first geometry callback a 0 here made the toolbar title zero-wide,
+    /// which AppKit warned about at launch.
+    @State private var sidebarWidth: CGFloat = T.Size.railWidth + T.Size.railColumnDivider + T.Size.channelColumnIdeal
 
-    /// - Parameter onSignIn: shown as "Sign In…" on the signed-out placeholder when set.
-    public init(state: Binding<ShellState>, onSignIn: (() -> Void)? = nil) {
+    /// - Parameters:
+    ///   - onSignIn: shown as "Sign In…" on the signed-out placeholder when set.
+    ///   - onSend: receives the composer's text; nil (fixtures, `--demo`) sends nothing.
+    public init(state: Binding<ShellState>, onSignIn: (() -> Void)? = nil, onSend: ((String) -> Void)? = nil) {
         _state = state
         self.onSignIn = onSignIn
+        self.onSend = onSend
     }
 
     public var body: some View {
@@ -50,7 +57,10 @@ public struct ShellView: View {
                 ToolbarItem(placement: .primaryAction) { sidebarButton }
             }
         } detail: {
-            MessageArea(header: state.header, isSignedIn: state.isSignedIn, messages: state.messages, reply: $state.reply)
+            MessageArea(
+                header: state.header, isSignedIn: state.isSignedIn, messages: state.messages,
+                load: state.messageLoad, reply: $state.reply, onSend: onSend
+            )
                 // No minimum of its own: SwiftUI's `.inspector` adds the floating sidebar's current
                 // width to this column's minimum twice (measured 2026-10-13, macOS 27.0.1,
                 // offscreen: 1486 = 343 × 2 + 320 + 480), so any minimum here made the window

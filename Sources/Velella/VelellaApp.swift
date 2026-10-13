@@ -44,8 +44,18 @@ private struct MainWindow: View {
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
-        ShellView(state: $model.shell, onSignIn: model.isDemo ? nil : { openWindow(id: LoginWindow.id) })
-            .onChange(of: model.shell.selectedRailID) { model.syncSelection() }
+        ShellView(
+            state: $model.shell,
+            onSignIn: model.isDemo ? nil : { openWindow(id: LoginWindow.id) },
+            onSend: model.isDemo ? nil : { model.send($0) }
+        )
+            .onChange(of: model.shell.selectedRailID) {
+                model.syncSelection()
+                // Always, also when syncSelection returns early (DM entry, same guild, no session).
+                model.selectionChanged()
+            }
+            .onChange(of: model.shell.selectedChannelID) { model.selectionChanged() }
+            .onChange(of: model.shell.selectedDMID) { model.selectionChanged() }
             .alert(model.notice ?? "", isPresented: Binding(
                 get: { model.notice != nil }, set: { if !$0 { model.notice = nil } }
             )) {

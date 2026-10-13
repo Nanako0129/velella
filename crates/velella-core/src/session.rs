@@ -6,9 +6,11 @@
 //! Logging policy: tracing records op codes and event names only, never payloads or the token.
 use crate::{
     compression::{DecodeError, Decoder, MAX_GATEWAY_WIRE},
-    gateway::{backoff, close_action, jitter_ms, validated_resume_url, CloseAction},
+    gateway::{backoff, close_action, jitter_ms, member_frames, validated_resume_url, CloseAction},
     identify::{self, GATEWAY_URL},
-    state::State,
+    messages::MessageStore,
+    rest::Rest,
+    state::{MemberSub, State},
     token::Token,
 };
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
@@ -16,14 +18,15 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::{
     fmt,
+    future::Future,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
     },
     time::Duration,
 };
 use tokio::{
-    sync::{watch, Notify},
+    sync::{mpsc, watch, Notify},
     time::{interval_at, sleep, timeout, Instant, MissedTickBehavior},
 };
 use tokio_tungstenite::{
@@ -54,6 +57,12 @@ pub enum SessionEvent {
     Closed {
         generation: u64,
     },
+    /// A REST call got 401: REST is latched off for this session while the gateway carries on.
+    /// At most once per session, and never after `AuthFailed` or `Closed`. Takes no Keychain
+    /// action (plan Q3): a revoked token also fails IDENTIFY with 4004, which is `AuthFailed`.
+    RestUnauthorized {
+        generation: u64,
+    },
 }
 
 /// Process-wide, monotonic per connect.
@@ -64,6 +73,17 @@ struct Shared {
     revision: watch::Sender<u64>,
     /// Set once the session task has returned (Closed or AuthFailed): no further mutations.
     ended: watch::Sender<bool>,
+    /// The session's one REST client (shared latch and global-429 deadline).
+    rest: Rest,
+    /// Created by `SessionHandle::messages()`; sees every dispatch after `State::apply`.
+    messages: OnceLock<Arc<MessageStore>>,
+    /// Latest member-list selection (guild, channel) for the connection loop. A watch, not a
+    /// queue: the loop only ever acts on the newest value.
+    member_sub: watch::Sender<Option<(u64, u64)>>,
+    /// Last `MemberSub::epoch` handed out; only changed under the state lock.
+    member_epoch: AtomicU64,
+    #[cfg(test)]
+    applied: Mutex<Vec<(String, Option<MemberSub>)>>,
 }
 
 impl Shared {
@@ -75,10 +95,23 @@ impl Shared {
     // ponytail: clones the whole State when a reader holds a snapshot; fine at sidebar sizes,
     // switch to per-guild Arcs if profiling says otherwise.
     fn apply(&self, event: &str, d: &Value) -> bool {
-        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let changed = Arc::make_mut(&mut guard).apply(event, d);
-        if changed {
-            self.revision.send_replace(guard.revision);
+        let changed = {
+            let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let changed = Arc::make_mut(&mut guard).apply(event, d);
+            if changed {
+                self.revision.send_replace(guard.revision);
+            }
+            #[cfg(test)]
+            self.applied
+                .lock()
+                .unwrap()
+                .push((event.to_owned(), guard.member_sub.clone()));
+            changed
+        };
+        // Outside the state lock: the store keeps its own buffers. Every dispatch goes through,
+        // including the ones `State` ignores (MESSAGE_*).
+        if let Some(store) = self.messages.get() {
+            store.observe(event, d);
         }
         changed
     }
@@ -109,6 +142,57 @@ impl SessionHandle {
     /// Immutable snapshot of the current state.
     pub fn snapshot(&self) -> Arc<State> {
         self.shared.snapshot()
+    }
+
+    /// Selects the member list to subscribe to (op 37), or `None` to leave it. The selection and a
+    /// new epoch land in `State::member_sub` before this returns, so every dispatch applied
+    /// afterwards sees it; only then is the connection loop woken, and it sends the frames for the
+    /// newest selection once the connection is established. Setting the current value again does
+    /// nothing: no epoch, no wake, no frame.
+    pub fn set_member_subscription(&self, selection: Option<(u64, u64)>) {
+        let shared = &self.shared;
+        let mut guard = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        if guard
+            .member_sub
+            .as_ref()
+            .map(|m| (m.guild_id, m.channel_id))
+            == selection
+        {
+            return;
+        }
+        let epoch = shared.member_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+        let state = Arc::make_mut(&mut guard);
+        state.member_sub = selection.map(|(guild_id, channel_id)| MemberSub {
+            epoch,
+            guild_id,
+            channel_id,
+        });
+        state.revision += 1;
+        shared.revision.send_replace(state.revision);
+        // Still under the lock, so two racing calls leave the watch and `State` agreeing.
+        shared.member_sub.send_replace(selection);
+    }
+
+    /// The session's REST client: a clone sharing its 401 latch and global-429 deadline.
+    #[allow(dead_code)] // Seam for wave-1 M; used by the tests until then.
+    pub(crate) fn rest(&self) -> Rest {
+        self.shared.rest.clone()
+    }
+
+    /// The session's message store, created (with the session's `Rest`) on first use. From then
+    /// on it observes every dispatch.
+    #[allow(dead_code)] // Seam for wave-1 M; used by the tests until then.
+    pub(crate) fn messages(&self) -> Arc<MessageStore> {
+        self.shared
+            .messages
+            .get_or_init(|| Arc::new(MessageStore::new(self.shared.rest.clone())))
+            .clone()
+    }
+
+    /// (dispatch name, `State::member_sub` as that dispatch's `State::apply` left it).
+    #[cfg(test)]
+    pub(crate) fn applied(&self) -> Vec<(String, Option<MemberSub>)> {
+        self.shared.applied.lock().unwrap().clone()
     }
 
     /// Runs `compute` on the current state now and after every revision change, calling `deliver`
@@ -176,18 +260,28 @@ impl Session {
         events: impl Fn(SessionEvent) + Send + Sync + 'static,
     ) -> SessionHandle {
         let generation = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+        let token = Arc::new(token);
+        let (notice, rest_notice) = mpsc::unbounded_channel();
         let shared = Arc::new(Shared {
             state: Mutex::new(Arc::new(State::default())),
             revision: watch::channel(0).0,
             ended: watch::channel(false).0,
+            rest: Rest::new(token.clone(), generation, notice),
+            messages: OnceLock::new(),
+            member_sub: watch::channel(None).0,
+            member_epoch: AtomicU64::new(0),
+            #[cfg(test)]
+            applied: Mutex::default(),
         });
         let stop = Arc::new(Notify::new());
         let task = Task {
             token,
             generation,
             events: Box::new(events),
+            member_rx: shared.member_sub.subscribe(),
             shared: shared.clone(),
             stop: stop.clone(),
+            rest_notice,
             session_id: None,
             resume_url: None,
             seq: None,
@@ -235,11 +329,15 @@ enum End {
 }
 
 struct Task {
-    token: Token,
+    /// Shared with the session's `Rest`; zeroized when the last holder drops it.
+    token: Arc<Token>,
     generation: u64,
     events: Box<dyn Fn(SessionEvent) + Send + Sync>,
     shared: Arc<Shared>,
     stop: Arc<Notify>,
+    /// The REST 401 notice. Dropped with the task, so a 401 after the end reaches nobody.
+    rest_notice: mpsc::UnboundedReceiver<()>,
+    member_rx: watch::Receiver<Option<(u64, u64)>>,
     session_id: Option<String>,
     /// Already validated and normalized.
     resume_url: Option<String>,
@@ -293,10 +391,14 @@ impl Task {
             let config = WebSocketConfig::default()
                 .max_message_size(Some(MAX_GATEWAY_WIRE))
                 .max_frame_size(Some(MAX_GATEWAY_WIRE));
-            let dialed = tokio::select! {
-                biased;
-                () = self.stop.notified() => return self.emit(SessionEvent::Closed { generation: self.generation }),
-                r = timeout(Duration::from_secs(15), connect_async_with_config(target, Some(config), false)) => r,
+            let dial = timeout(
+                Duration::from_secs(15),
+                connect_async_with_config(target, Some(config), false),
+            );
+            let Some(dialed) = self.unless_stopped(dial).await else {
+                return self.emit(SessionEvent::Closed {
+                    generation: self.generation,
+                });
             };
             let mut established = false;
             let end = match dialed {
@@ -336,12 +438,54 @@ impl Task {
                 End::InvalidSession => Duration::from_millis(1000 + jitter_ms(4000)),
                 _ => backoff(failures),
             };
-            tokio::select! {
-                biased;
-                () = self.stop.notified() => return self.emit(SessionEvent::Closed { generation: self.generation }),
-                () = sleep(delay) => {}
+            if self.unless_stopped(sleep(delay)).await.is_none() {
+                return self.emit(SessionEvent::Closed {
+                    generation: self.generation,
+                });
             }
         }
+    }
+
+    /// Drives `fut` to completion unless `disconnect()` fires first (`None`). A REST 401 notice
+    /// arriving meanwhile is emitted, so it never waits for the next connection.
+    async fn unless_stopped<F: Future>(&mut self, fut: F) -> Option<F::Output> {
+        tokio::pin!(fut);
+        loop {
+            tokio::select! {
+                biased;
+                () = self.stop.notified() => return None,
+                Some(()) = self.rest_notice.recv() => self.rest_unauthorized(),
+                out = &mut fut => return Some(out),
+            }
+        }
+    }
+
+    /// Only reached through the one notice `Rest`'s latch sends per session.
+    fn rest_unauthorized(&self) {
+        self.emit(SessionEvent::RestUnauthorized {
+            generation: self.generation,
+        });
+    }
+
+    /// Sends the op-37 frames that bring this connection to the newest selection.
+    async fn sync_members<S: Sink<Message, Error = WsError> + Unpin>(
+        &mut self,
+        socket: &mut S,
+        sent: &mut Option<(u64, u64)>,
+    ) -> bool {
+        let want = *self.member_rx.borrow_and_update();
+        for frame in member_frames(*sent, want) {
+            tracing::trace!(
+                generation = self.generation,
+                op = 37,
+                "gateway send member subscription"
+            );
+            if !send(socket, &frame).await {
+                return false;
+            }
+        }
+        *sent = want;
+        true
     }
 
     async fn connection<S>(&mut self, socket: &mut S, resuming: bool, established: &mut bool) -> End
@@ -395,6 +539,9 @@ impl Task {
         timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut awaiting_ack = false;
         let ready_deadline = Instant::now() + Duration::from_secs(30);
+        // What this connection has subscribed; a new connection starts with nothing, so READY or
+        // RESUMED re-sends the current selection.
+        let mut members_sent = None;
         loop {
             tokio::select! {
                 biased;
@@ -413,6 +560,12 @@ impl Task {
                     }
                 }
                 () = tokio::time::sleep_until(ready_deadline), if !*established => return End::Retry,
+                Some(()) = self.rest_notice.recv() => self.rest_unauthorized(),
+                Ok(()) = self.member_rx.changed() => {
+                    if *established && !self.sync_members(socket, &mut members_sent).await {
+                        return End::Retry;
+                    }
+                }
                 frame = read_packet(socket, &mut decoder) => {
                     let packet = match frame {
                         Ok(p) => p,
@@ -421,8 +574,15 @@ impl Task {
                     tracing::trace!(generation = self.generation, op = packet.op, t = packet.t.as_deref().unwrap_or(""), "gateway packet");
                     match packet.op {
                         0 => {
+                            let was_established = *established;
                             if let Some(end) = self.dispatch(packet, established) {
                                 return end;
+                            }
+                            if !was_established
+                                && *established
+                                && !self.sync_members(socket, &mut members_sent).await
+                            {
+                                return End::Retry;
                             }
                         }
                         1 => {

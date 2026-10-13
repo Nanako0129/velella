@@ -271,6 +271,14 @@ public struct ReplyPreview: Hashable, Sendable {
     }
 }
 
+// MARK: Message loading
+
+/// Load state of the open channel's messages; `failed` carries fixed text for the message column.
+public enum MessageLoad: Hashable, Sendable {
+    case idle, loading, loaded
+    case failed(String)
+}
+
 // MARK: Whole shell
 
 public struct ShellState: Equatable, Sendable {
@@ -287,6 +295,7 @@ public struct ShellState: Equatable, Sendable {
     public var selectedDMID: String?
     /// Set while the composer is replying to a message.
     public var reply: ReplyPreview?
+    public var messageLoad: MessageLoad = .idle
 
     public init(
         rail: [RailItem] = [], selectedRailID: String? = nil, serverName: String? = nil,
@@ -310,6 +319,12 @@ public struct ShellState: Equatable, Sendable {
     /// True while the selected rail entry is the direct-messages entry.
     public var isDMMode: Bool {
         rail.contains { if case .dm(let dm) = $0 { dm.id == selectedRailID } else { false } }
+    }
+
+    /// The conversation the message column shows: the selected DM in DM mode, else the selected
+    /// channel (the same rule as `header`). nil when nothing is open.
+    public var openTarget: String? {
+        isDMMode ? selectedDMID : selectedChannelID
     }
 
     public var header: ChannelHeader? {

@@ -107,6 +107,11 @@ final class AppModel {
             guard gen == generation else { return }
             endSession()
             notice = "Disconnected."
+        case .restUnauthorized(let gen):
+            // Non-destructive (plan Q3): the session and the saved sign-in stay; only REST is off.
+            // A revoked token also fails IDENTIFY with 4004, which is `.authFailed` above.
+            guard gen == generation else { return }
+            notice = "Discord didn't accept this sign-in for loading or sending messages. Sign out and sign in again if this continues."
         case .resumed, .reconnecting:
             break
         }
@@ -164,6 +169,16 @@ final class AppModel {
             guildId: guild, listener: ChannelSnapshots(model: self, generation: generation)
         )
     }
+
+    /// Runs after every change of the selected channel, DM or rail entry (the window calls it, after
+    /// `syncSelection()` for a rail change). `shell.openTarget` is the conversation now open.
+    func selectionChanged() {
+        // L: the member list follows the (guild, channel) target here.
+        // M: the message history follows `shell.openTarget` here.
+    }
+
+    /// The composer's submit. Filled by the message slice.
+    func send(_ text: String) {}
 
     fileprivate func apply(guilds entries: [SidebarEntry], generation gen: UInt64) {
         guard gen == generation else { return }
@@ -269,6 +284,7 @@ private final class Listener: SessionListener {
         case reconnecting(UInt64)
         case authFailed(UInt64)
         case closed(UInt64)
+        case restUnauthorized(UInt64)
 
         /// Event name only: no username, id or token reaches stderr.
         var name: String {
@@ -278,6 +294,7 @@ private final class Listener: SessionListener {
             case .reconnecting: "RECONNECTING"
             case .authFailed: "AUTH_FAILED"
             case .closed: "CLOSED"
+            case .restUnauthorized: "REST_UNAUTHORIZED"
             }
         }
     }
@@ -294,6 +311,7 @@ private final class Listener: SessionListener {
     func onReconnecting(generation: UInt64) { send(.reconnecting(generation)) }
     func onAuthFailed(generation: UInt64) { send(.authFailed(generation)) }
     func onClosed(generation: UInt64) { send(.closed(generation)) }
+    func onRestUnauthorized(generation: UInt64) { send(.restUnauthorized(generation)) }
 }
 
 /// Sidebar callbacks arrive on `velella-rt` threads; each goes to the main queue in order and is
