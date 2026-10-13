@@ -123,6 +123,8 @@ pub struct State {
     pub presence: Presence,
     pub relationships: Relationships,
     pub threads: Threads,
+    /// The adopted member list of `member_sub` (see `member_list.rs`); rebuilt by READY.
+    pub(crate) member_list: crate::member_list::MemberList,
 }
 
 pub(crate) fn id(v: &Value) -> Option<u64> {
@@ -370,6 +372,7 @@ impl State {
             "THREAD_LIST_SYNC" => self.threads.list_sync(d),
             "THREAD_MEMBER_UPDATE" => self.threads.member_update(d, self.user_id),
             "THREAD_MEMBERS_UPDATE" => self.threads.members_update(d, self.user_id),
+            "GUILD_MEMBER_LIST_UPDATE" => self.member_list_update(d),
             _ => false,
         };
         if changed {

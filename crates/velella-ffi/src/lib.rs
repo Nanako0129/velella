@@ -10,6 +10,8 @@ pub use decorations::{SidebarOccupant, SidebarStatus, SidebarThread};
 
 uniffi::setup_scaffolding!();
 
+mod members;
+
 /// The one process-wide runtime. Exported async fns spawn onto it and await the
 /// JoinHandle, so bodies run on `velella-rt` threads regardless of who polls the
 /// returned future. (`uniffi::export(async_runtime = "tokio")` is deliberately

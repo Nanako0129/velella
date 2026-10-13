@@ -26,6 +26,7 @@ final class AppModel {
     /// Guild of the live `channelsSub`; the only guild whose channel snapshots may be applied.
     @ObservationIgnored private var channelsGuild: UInt64?
     @ObservationIgnored private var guildNames: [UInt64: String] = [:]
+    @ObservationIgnored private lazy var members = MembersController(model: self)
 
     init(demo: Bool) {
         isDemo = demo
@@ -145,6 +146,7 @@ final class AppModel {
         channelsSub = nil
         channelsGuild = nil
         guildNames = [:]
+        members.teardown()
     }
 
     /// Follows the shell's own selection binding (the window calls this when it changes).
@@ -170,7 +172,7 @@ final class AppModel {
     /// Runs after every change of the selected channel, DM or rail entry (the window calls it, after
     /// `syncSelection()` for a rail change). `shell.openTarget` is the conversation now open.
     func selectionChanged() {
-        // L: the member list follows the (guild, channel) target here.
+        members.retarget(handle: handle, generation: generation) // L
         // M: the message history follows `shell.openTarget` here.
     }
 

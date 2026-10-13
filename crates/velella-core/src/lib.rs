@@ -6,6 +6,7 @@ mod compression;
 mod gateway;
 mod guild_settings;
 mod identify;
+mod member_list;
 mod messages;
 mod permissions;
 mod presence;
@@ -22,6 +23,8 @@ mod voice;
 #[cfg(test)]
 mod fixture_tests;
 #[cfg(test)]
+mod member_list_tests;
+#[cfg(test)]
 mod rest_tests;
 #[cfg(test)]
 mod session_tests;
@@ -31,6 +34,7 @@ mod sidebar_state_tests;
 mod sidebar_tests;
 
 pub use identify::USER_AGENT;
+pub use member_list::{member_sections, MemberListEntry, MemberListSection, MemberListStatus};
 pub use session::{Session, SessionEvent, SessionHandle, Subscription};
 pub use presence::PresenceStatus;
 pub use sidebar::{

@@ -825,6 +825,121 @@ mod member_sub {
     }
 }
 
+// ---- Member list (GUILD_MEMBER_LIST_UPDATE), through the mock gateway ----
+
+mod member_list {
+    use super::*;
+    use crate::member_list_tests::{header, member, sync, CHANNEL, GUILD};
+    use crate::MemberListSection;
+
+    fn watch(rig: &Rig, channel: u64) -> mpsc::UnboundedReceiver<Vec<MemberListSection>> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        // Dropped with the session; the test ends first.
+        std::mem::forget(rig.handle.subscribe_members(GUILD, channel, move |v| {
+            let _ = tx.send(v);
+        }));
+        rx
+    }
+
+    async fn next(
+        rx: &mut mpsc::UnboundedReceiver<Vec<MemberListSection>>,
+    ) -> Vec<MemberListSection> {
+        timeout(WAIT, rx.recv())
+            .await
+            .expect("no delivery")
+            .expect("subscription ended")
+    }
+
+    /// The subscribe frame and the range frame for the selection.
+    async fn two_frames(conn: &mut Conn) {
+        assert_eq!(conn.recv_non_beat().await["op"], 37);
+        assert_eq!(conn.recv_non_beat().await["op"], 37);
+    }
+
+    fn names(rows: &[MemberListSection]) -> Vec<&str> {
+        rows.iter()
+            .flat_map(|s| s.members.iter().map(|m| &*m.name))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn subscribe_members_then_a_sync_adopts_the_list() {
+        let mut rig = Rig::start().await;
+        let mut conn = rig.ready(30_000, "wss://gateway-resume.discord.gg/").await;
+        let mut rx = watch(&rig, CHANNEL);
+        assert!(
+            next(&mut rx).await.is_empty(),
+            "empty until a list is adopted"
+        );
+        two_frames(&mut conn).await;
+        let items = vec![
+            header("online", 1),
+            member(1, "m1"),
+            header("offline", 4),
+            member(2, "m2"),
+        ];
+        conn.send(
+            json!({"op": 0, "t": "GUILD_MEMBER_LIST_UPDATE", "s": 2, "d": sync("everyone", items)}),
+        )
+        .await;
+        let rows = next(&mut rx).await;
+        assert_eq!(names(&rows), ["m1", "m2"]);
+        assert_eq!((rows[0].title.as_str(), rows[1].count), ("Online", 4));
+    }
+
+    #[tokio::test]
+    async fn resumed_then_a_sync_with_the_same_id_leaves_the_list_filled() {
+        let mut rig = Rig::start().await;
+        let mut conn = rig.ready(30_000, "wss://gateway-resume.discord.gg/").await;
+        let mut rx = watch(&rig, CHANNEL);
+        next(&mut rx).await;
+        two_frames(&mut conn).await;
+        conn.send(
+            json!({"op": 0, "t": "GUILD_MEMBER_LIST_UPDATE", "s": 2, "d":
+            sync("everyone", vec![header("online", 1), member(1, "before")])}),
+        )
+        .await;
+        assert_eq!(names(&next(&mut rx).await), ["before"]);
+        // Opcode 7 makes the client reconnect and resume at the resume endpoint.
+        conn.send(json!({"op": 7, "d": null})).await;
+        let mut conn = Conn::accept(&rig.resume).await;
+        conn.hello(30_000).await;
+        assert_eq!(conn.recv_non_beat().await["op"], 6);
+        conn.send(json!({"op": 0, "t": "RESUMED", "s": 3, "d": {}}))
+            .await;
+        two_frames(&mut conn).await;
+        conn.send(
+            json!({"op": 0, "t": "GUILD_MEMBER_LIST_UPDATE", "s": 4, "d":
+            sync("everyone", vec![header("online", 1), member(2, "after")])}),
+        )
+        .await;
+        assert_eq!(names(&next(&mut rx).await), ["after"]);
+    }
+
+    #[tokio::test]
+    async fn selecting_another_channel_shows_no_rows_before_its_first_update() {
+        let mut rig = Rig::start().await;
+        let mut conn = rig.ready(30_000, "wss://gateway-resume.discord.gg/").await;
+        let mut first = watch(&rig, CHANNEL);
+        next(&mut first).await;
+        two_frames(&mut conn).await;
+        conn.send(
+            json!({"op": 0, "t": "GUILD_MEMBER_LIST_UPDATE", "s": 2, "d":
+            sync("everyone", vec![header("online", 1), member(1, "m1")])}),
+        )
+        .await;
+        assert_eq!(names(&next(&mut first).await), ["m1"]);
+        let mut second = watch(&rig, 21);
+        assert!(
+            next(&mut second).await.is_empty(),
+            "the old channel's rows leaked"
+        );
+        // Only the channel-range frame goes out for another channel of the same guild.
+        assert_eq!(conn.recv_non_beat().await["op"], 37);
+        assert!(conn.quiet().await);
+    }
+}
+
 // ---- Message-store observer slot ----
 
 #[tokio::test]
