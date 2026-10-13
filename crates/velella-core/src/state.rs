@@ -109,6 +109,8 @@ pub struct State {
     pub guild_folders: Option<Vec<GuildFolder>>,
     /// Written by `SessionHandle::set_member_subscription` under the state lock; kept across READY.
     pub member_sub: Option<MemberSub>,
+    /// The adopted member list of `member_sub` (see `member_list.rs`); rebuilt by READY.
+    pub(crate) member_list: crate::member_list::MemberList,
 }
 
 fn id(v: &Value) -> Option<u64> {
@@ -117,10 +119,10 @@ fn id(v: &Value) -> Option<u64> {
         .or_else(|| v.as_u64())
         .filter(|n| *n != 0)
 }
-fn get_id(d: &Value, key: &str) -> Option<u64> {
+pub(crate) fn get_id(d: &Value, key: &str) -> Option<u64> {
     d.get(key).and_then(id)
 }
-fn get_str(d: &Value, key: &str) -> Option<String> {
+pub(crate) fn get_str(d: &Value, key: &str) -> Option<String> {
     d.get(key).and_then(Value::as_str).map(str::to_owned)
 }
 /// Permission bitfields are strings on the wire; numbers are accepted too.
@@ -343,6 +345,7 @@ impl State {
             "GUILD_ROLE_CREATE" | "GUILD_ROLE_UPDATE" => self.role_upsert(d),
             "GUILD_ROLE_DELETE" => self.role_delete(d),
             "GUILD_MEMBER_UPDATE" => self.self_member_update(d),
+            "GUILD_MEMBER_LIST_UPDATE" => self.member_list_update(d),
             _ => false,
         };
         if changed {

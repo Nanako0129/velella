@@ -5,6 +5,7 @@
 mod compression;
 mod gateway;
 mod identify;
+mod member_list;
 mod messages;
 mod permissions;
 mod rest;
@@ -16,6 +17,8 @@ mod token;
 #[cfg(test)]
 mod fixture_tests;
 #[cfg(test)]
+mod member_list_tests;
+#[cfg(test)]
 mod rest_tests;
 #[cfg(test)]
 mod session_tests;
@@ -23,6 +26,7 @@ mod session_tests;
 mod sidebar_tests;
 
 pub use identify::USER_AGENT;
+pub use member_list::{member_sections, MemberListEntry, MemberListSection, MemberListStatus};
 pub use session::{Session, SessionEvent, SessionHandle, Subscription};
 pub use sidebar::{
     channel_categories, dm_list, guild_entries, SidebarCategory, SidebarChannel, SidebarDm,
