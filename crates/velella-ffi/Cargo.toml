@@ -1,0 +1,15 @@
+[package]
+name = "velella-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+uniffi = { version = "0.32", features = ["cli"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+
+[dev-dependencies]
+futures = "0.3"

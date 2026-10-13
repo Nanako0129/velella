@@ -1,0 +1,32 @@
+// swift-tools-version: 6.2
+import PackageDescription
+
+// `make build` generates Sources/VelellaFFI*/ and builds target/release/libvelella_ffi.a first.
+// Run swift from the repo root so the relative archive path resolves.
+let package = Package(
+    name: "Velella",
+    platforms: [.macOS(.v26)],
+    targets: [
+        // Generated header + modulemap (module name velella_ffiFFI, as the bindings import it).
+        .target(name: "VelellaFFIC", path: "Sources/VelellaFFIC"),
+        .target(
+            name: "VelellaFFI",
+            dependencies: ["VelellaFFIC"],
+            path: "Sources/VelellaFFI"
+        ),
+        .executableTarget(
+            name: "Velella",
+            dependencies: ["VelellaFFI"],
+            path: "Sources/Velella",
+            linkerSettings: [
+                // Explicit archive path, NOT -l: Darwin -l prefers a dylib if one sits beside the .a.
+                .unsafeFlags(["-Xlinker", "target/release/libvelella_ffi.a"]),
+                .linkedFramework("Security"),
+                .linkedFramework("SystemConfiguration"),
+                .linkedFramework("CoreFoundation"),
+                .linkedLibrary("c++"),
+                .linkedLibrary("resolv"),
+            ]
+        ),
+    ]
+)
