@@ -211,6 +211,28 @@ async fn missed_ack_resumes_at_the_resume_endpoint() {
 }
 
 #[tokio::test]
+async fn resumed_dispatch_emits_resumed_and_no_second_ready() {
+    let mut rig = Rig::start().await;
+    let generation = rig.handle.generation();
+    let _first = rig.ready(100, "wss://gateway-resume.discord.gg/").await;
+    let mut conn = Conn::accept(&rig.resume).await;
+    assert_eq!(rig.event().await, SessionEvent::Reconnecting { generation });
+    conn.hello(30_000).await;
+    assert_eq!(conn.recv().await["op"], 6);
+    conn.send(json!({"op": 0, "t": "RESUMED", "s": 2, "d": {}}))
+        .await;
+    assert_eq!(rig.event().await, SessionEvent::Resumed { generation });
+    // Nothing else follows: no second Ready, no further reconnect.
+    assert!(
+        timeout(Duration::from_millis(400), rig.events.recv())
+            .await
+            .is_err(),
+        "unexpected event after Resumed"
+    );
+    assert!(!format!("{:?}", SessionEvent::Resumed { generation }).contains("SYNTHETIC"));
+}
+
+#[tokio::test]
 async fn acked_heartbeats_keep_the_connection_and_carry_the_sequence() {
     let mut rig = Rig::start().await;
     let mut conn = rig.ready(100, "wss://gateway-resume.discord.gg/").await;

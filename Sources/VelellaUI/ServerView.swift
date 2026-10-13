@@ -12,6 +12,14 @@ private typealias T = DesignTokens
 /// window toolbar (see ShellView), so the list starts directly under it.
 struct ServerView: View {
     @Binding var state: ShellState
+    var onSignIn: (() -> Void)?
+
+    /// Signed in with no server chosen yet (before S4 fills the rail) is not "no channels".
+    private var placeholder: (title: String, detail: String) {
+        if !state.isSignedIn { return ("Not signed in", "Sign in to see your servers.") }
+        if state.selectedRailID == nil { return ("No server selected", "Pick a server on the left.") }
+        return ("No channels", "This server has no channels you can see.")
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -19,9 +27,13 @@ struct ServerView: View {
                 DMList(topRows: state.dmTopRows, dms: state.dms, selection: $state.selectedDMID)
             } else if state.categories.isEmpty {
                 ContentUnavailableView {
-                    Label(state.isSignedIn ? "No channels" : "Not signed in", systemImage: "number")
+                    Label(placeholder.title, systemImage: "number")
                 } description: {
-                    Text(state.isSignedIn ? "This server has no channels you can see." : "Sign in to see your servers.")
+                    Text(placeholder.detail)
+                } actions: {
+                    if !state.isSignedIn, let onSignIn {
+                        Button("Sign In…", action: onSignIn)
+                    }
                 }
                 .frame(maxHeight: .infinity)
             } else {

@@ -41,6 +41,10 @@ pub enum SessionEvent {
         user_id: u64,
         username: String,
     },
+    /// The gateway answered a RESUME with the RESUMED dispatch; state carried over, no new READY.
+    Resumed {
+        generation: u64,
+    },
     Reconnecting {
         generation: u64,
     },
@@ -447,7 +451,12 @@ impl Task {
                     username,
                 });
             }
-            "RESUMED" => *established = true,
+            "RESUMED" => {
+                *established = true;
+                self.emit(SessionEvent::Resumed {
+                    generation: self.generation,
+                });
+            }
             _ => {
                 self.shared.apply(name, &packet.d);
             }

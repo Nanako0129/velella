@@ -19,7 +19,7 @@ private func splitViews(in view: NSView) -> [NSSplitView] {
         contentRect: NSRect(x: 0, y: 0, width: minWidth, height: 800),
         styleMask: [.titled, .resizable, .fullSizeContentView], backing: .buffered, defer: false
     )
-    window.contentViewController = NSHostingController(rootView: ShellView(state: .demo))
+    window.contentViewController = NSHostingController(rootView: ShellView(state: .constant(.demo)))
     func settle() {
         for _ in 0..<5 {
             window.contentView?.layoutSubtreeIfNeeded()

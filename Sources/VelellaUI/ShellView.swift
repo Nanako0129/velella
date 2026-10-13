@@ -10,13 +10,17 @@ private typealias T = DesignTokens
 
 /// The main window: sidebar (server rail + channel column), message column, member list.
 public struct ShellView: View {
-    @State private var state: ShellState
+    /// Owned by the app (or a fixture), so its later changes reach the window.
+    @Binding private var state: ShellState
+    private let onSignIn: (() -> Void)?
     @State private var showMembers = true
     @State private var search = ""
     @State private var sidebarWidth: CGFloat = 0
 
-    public init(state: ShellState) {
-        _state = State(initialValue: state)
+    /// - Parameter onSignIn: shown as "Sign In…" on the signed-out placeholder when set.
+    public init(state: Binding<ShellState>, onSignIn: (() -> Void)? = nil) {
+        _state = state
+        self.onSignIn = onSignIn
     }
 
     public var body: some View {
@@ -25,7 +29,7 @@ public struct ShellView: View {
             HStack(spacing: 0) {
                 ServerRail(items: state.rail, selection: $state.selectedRailID)
                 Rectangle().fill(T.Palette.railColumnDivider).frame(width: T.Size.railColumnDivider)
-                ServerView(state: $state)
+                ServerView(state: $state, onSignIn: onSignIn)
             }
             .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { sidebarWidth = $0 }
             .navigationSplitViewColumnWidth(
@@ -46,7 +50,7 @@ public struct ShellView: View {
                 ToolbarItem(placement: .primaryAction) { sidebarButton }
             }
         } detail: {
-            MessageArea(header: state.header, messages: state.messages, reply: $state.reply)
+            MessageArea(header: state.header, isSignedIn: state.isSignedIn, messages: state.messages, reply: $state.reply)
                 // No minimum of its own: SwiftUI's `.inspector` adds the floating sidebar's current
                 // width to this column's minimum twice (measured 2026-10-13, macOS 27.0.1,
                 // offscreen: 1486 = 343 × 2 + 320 + 480), so any minimum here made the window
@@ -113,15 +117,15 @@ public struct ShellView: View {
 }
 
 #Preview("Shell, demo", traits: .fixedLayout(width: 1200, height: 720)) {
-    ShellView(state: .demo)
+    @Previewable @State var state = ShellState.demo
+    ShellView(state: $state)
 }
 
 #Preview("Shell, DM mode", traits: .fixedLayout(width: 1200, height: 720)) {
-    var state = ShellState.demo
-    state.selectedRailID = "dm"
-    return ShellView(state: state)
+    @Previewable @State var state = { var state = ShellState.demo; state.selectedRailID = "dm"; return state }()
+    ShellView(state: $state)
 }
 
 #Preview("Shell, not signed in", traits: .fixedLayout(width: 1200, height: 720)) {
-    ShellView(state: .signedOut)
+    ShellView(state: .constant(.signedOut), onSignIn: {})
 }

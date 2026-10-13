@@ -8,8 +8,10 @@ license.workspace = true
 crate-type = ["staticlib"]
 
 [dependencies]
+velella-core = { path = "../velella-core" }
 uniffi = { version = "0.32", features = ["cli"] }
-tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+# `net`: the session's WebSocket dial needs the runtime's IO driver (see `runtime()`).
+tokio = { version = "1", features = ["rt-multi-thread", "time", "net"] }
 
 [dev-dependencies]
 futures = "0.3"

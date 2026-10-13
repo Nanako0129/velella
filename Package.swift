@@ -17,9 +17,12 @@ let package = Package(
         // SwiftUI shell; plain view-state values and fixtures, deliberately NO VelellaFFI dependency.
         .target(name: "VelellaUI", path: "Sources/VelellaUI"),
         .testTarget(name: "VelellaUITests", dependencies: ["VelellaUI"], path: "Tests/VelellaUITests"),
+        // Login webview, capture checks and the Keychain decision; also NO VelellaFFI dependency.
+        .target(name: "VelellaLogin", path: "Sources/VelellaLogin"),
+        .testTarget(name: "VelellaLoginTests", dependencies: ["VelellaLogin"], path: "Tests/VelellaLoginTests"),
         .executableTarget(
             name: "Velella",
-            dependencies: ["VelellaFFI", "VelellaUI"],
+            dependencies: ["VelellaFFI", "VelellaUI", "VelellaLogin"],
             path: "Sources/Velella",
             linkerSettings: [
                 // Explicit archive path, NOT -l: Darwin -l prefers a dylib if one sits beside the .a.

@@ -7,6 +7,7 @@ private typealias T = DesignTokens
 /// replace `MessageRow` in a later slice.
 struct MessageArea: View {
     let header: ChannelHeader?
+    var isSignedIn = true
     let messages: [MessagePlaceholder]
     @Binding var reply: ReplyPreview?
 
@@ -27,6 +28,8 @@ struct MessageArea: View {
             // Under the toolbar too, so the toolbar band carries the pane's tint (a band of bare
             // window material over the messages read as a separate, lighter strip).
             .background(T.Palette.messagePane)
+        } else if isSignedIn {
+            ContentUnavailableView("No channel selected", systemImage: "number", description: Text("Pick a channel on the left."))
         } else {
             ContentUnavailableView {
                 Label("Not signed in", systemImage: "person.crop.circle.badge.questionmark")

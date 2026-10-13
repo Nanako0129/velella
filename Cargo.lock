@@ -1432,6 +1432,7 @@ dependencies = [
  "futures",
  "tokio",
  "uniffi",
+ "velella-core",
 ]
 
 [[package]]
