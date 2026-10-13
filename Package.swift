@@ -14,9 +14,12 @@ let package = Package(
             dependencies: ["VelellaFFIC"],
             path: "Sources/VelellaFFI"
         ),
+        // SwiftUI shell; plain view-state values and fixtures, deliberately NO VelellaFFI dependency.
+        .target(name: "VelellaUI", path: "Sources/VelellaUI"),
+        .testTarget(name: "VelellaUITests", dependencies: ["VelellaUI"], path: "Tests/VelellaUITests"),
         .executableTarget(
             name: "Velella",
-            dependencies: ["VelellaFFI"],
+            dependencies: ["VelellaFFI", "VelellaUI"],
             path: "Sources/Velella",
             linkerSettings: [
                 // Explicit archive path, NOT -l: Darwin -l prefers a dylib if one sits beside the .a.
