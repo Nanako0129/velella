@@ -42,18 +42,18 @@ fn state(d: Value) -> State {
 }
 
 fn plain(id: u64) -> SidebarEntry {
-    SidebarEntry::Guild(SidebarGuild {
-        id,
-        name: format!("g{id}"),
-        icon_url: None,
-    })
+    SidebarEntry::Guild(sg(id))
 }
 
+/// Every channel in these READY fixtures has no `last_message_id`, so nothing is unread.
 fn sg(id: u64) -> SidebarGuild {
     SidebarGuild {
         id,
         name: format!("g{id}"),
         icon_url: None,
+        unread: false,
+        mention_count: 0,
+        muted: false,
     }
 }
 
@@ -205,6 +205,12 @@ fn listed(id: u64, kind: u8, name: &str) -> SidebarChannel {
         id,
         kind,
         name: name.into(),
+        unread: false,
+        mention_count: 0,
+        muted: false,
+        private: false,
+        occupants: vec![],
+        threads: vec![],
     }
 }
 
@@ -342,6 +348,10 @@ fn dm_order_names_and_icons() {
         id,
         name: name.into(),
         icon_url: icon,
+        // These DMs have a last_message_id (or none) and no read state: unread; 1:1 DMs offline.
+        unread: ![502, 505].contains(&id),
+        mention_count: 0,
+        status: [500, 503, 504].contains(&id).then_some(crate::PresenceStatus::Offline),
     };
     assert_eq!(
         dm_list(&s),

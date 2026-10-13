@@ -5,7 +5,7 @@
 use crate::state::{Channel, Guild};
 
 const ADMINISTRATOR: u64 = 1 << 3;
-const VIEW_CHANNEL: u64 = 1 << 10;
+pub(crate) const VIEW_CHANNEL: u64 = 1 << 10;
 
 pub(crate) fn can_view_channel(user_id: u64, guild: &Guild, channel: &Channel) -> Option<bool> {
     if guild.owner_id == Some(user_id) {

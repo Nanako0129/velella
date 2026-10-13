@@ -33,6 +33,7 @@ struct ServerButton: View {
     let icon: Avatar
     var hasUnread = false
     var mentionCount = 0
+    var isMuted = false
     let onSelect: () -> Void
     @State private var hovered = false
 
@@ -44,6 +45,7 @@ struct ServerButton: View {
     var body: some View {
         Button(name, action: onSelect)
             .buttonStyle(ServerButtonStyle(selected: selected, icon: icon, hovered: hovered, mentionCount: mentionCount))
+            .opacity(isMuted ? T.Palette.mutedOpacity : 1)
             .onHover { hovered = $0 }
             .help(name)
             .frame(width: T.Size.railWidth)
@@ -52,6 +54,17 @@ struct ServerButton: View {
             }
             .accessibilityElement(children: .combine)
             .accessibilityLabel(mentionCount > 0 ? "\(name), \(mentionCount) mentions" : name)
+    }
+}
+
+extension ServerButton {
+    /// The one place a `RailGuild` becomes a rail button, shared by `ServerRail` and
+    /// `ServerFolder` so a muted server is dimmed whether it sits in a folder or not.
+    init(guild: RailGuild, selected: Bool, onSelect: @escaping () -> Void) {
+        self.init(
+            selected: selected, name: guild.name, icon: guild.icon, hasUnread: guild.hasUnread,
+            mentionCount: guild.mentionCount, isMuted: guild.isMuted, onSelect: onSelect
+        )
     }
 }
 

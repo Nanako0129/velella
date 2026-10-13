@@ -4,14 +4,20 @@
 //! runtime. Nothing here owns a runtime.
 mod compression;
 mod gateway;
+mod guild_settings;
 mod identify;
 mod messages;
 mod permissions;
+mod presence;
+mod read_state;
+mod relationships;
 mod rest;
 mod session;
 mod sidebar;
 mod state;
+mod threads;
 mod token;
+mod voice;
 
 #[cfg(test)]
 mod fixture_tests;
@@ -20,13 +26,16 @@ mod rest_tests;
 #[cfg(test)]
 mod session_tests;
 #[cfg(test)]
+mod sidebar_state_tests;
+#[cfg(test)]
 mod sidebar_tests;
 
 pub use identify::USER_AGENT;
 pub use session::{Session, SessionEvent, SessionHandle, Subscription};
+pub use presence::PresenceStatus;
 pub use sidebar::{
-    channel_categories, dm_list, guild_entries, SidebarCategory, SidebarChannel, SidebarDm,
-    SidebarEntry, SidebarGuild,
+    channel_categories, dm_list, guild_entries, SidebarCategory, SidebarChannel,
+    SidebarDm, SidebarEntry, SidebarGuild, SidebarOccupant, SidebarThread,
 };
 pub use state::{
     Channel, Guild, GuildFolder, MemberSub, Overwrite, PrivateChannel, Role, State, User,
