@@ -3,3 +3,22 @@ name = "velella-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[dependencies]
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+# Stock rustls with webpki roots and normal certificate verification; no TLS impersonation.
+tokio-tungstenite = { version = "=0.30.0", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+# tokio-tungstenite enables rustls without a crypto provider; with none selected, the first wss dial
+# panics. Exactly one provider feature must be on, so name it here (ring: no C toolchain beyond cc).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+flate2 = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+zeroize = "1.8"
+tracing = "0.1"
+url = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "net", "rt", "sync", "time"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
