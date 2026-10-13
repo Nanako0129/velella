@@ -13,6 +13,7 @@ mod presence;
 mod read_state;
 mod relationships;
 mod rest;
+mod rest_messages;
 mod session;
 mod sidebar;
 mod state;
@@ -35,6 +36,9 @@ mod sidebar_tests;
 
 pub use identify::USER_AGENT;
 pub use member_list::{member_sections, MemberListEntry, MemberListSection, MemberListStatus};
+pub use messages::{
+    LoadState, MessageImage, MessageReply, MessageRow, MessageSubscription, MessagesSnapshot,
+};
 pub use session::{Session, SessionEvent, SessionHandle, Subscription};
 pub use presence::PresenceStatus;
 pub use sidebar::{

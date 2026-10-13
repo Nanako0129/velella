@@ -379,7 +379,7 @@ fn dm_name(state: &State, dm: &PrivateChannel) -> String {
 
 /// Avatar of `user_id`, or Discord's default avatar when there is no hash: index
 /// `(id >> 22) % 6` for the new username system (discriminator "0"), else `discriminator % 5`.
-fn avatar_url(user_id: u64, hash: Option<&str>, discriminator: Option<&str>) -> String {
+pub(crate) fn avatar_url(user_id: u64, hash: Option<&str>, discriminator: Option<&str>) -> String {
     match hash {
         Some(h) => format!("{CDN}/avatars/{user_id}/{h}.png?size=64"),
         None => {

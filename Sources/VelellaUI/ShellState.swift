@@ -163,9 +163,17 @@ public struct ChannelHeader: Hashable, Sendable {
     }
 }
 
-// MARK: Messages (placeholder rows; real message rows come in a later slice)
+// MARK: Messages
 
-public struct MessagePlaceholder: Identifiable, Hashable, Sendable {
+/// One message row. `text`, `authorName` and the reply preview are shown verbatim: no Markdown,
+/// no link detection (plan M, F5).
+public struct MessageItem: Identifiable, Hashable, Sendable {
+    /// A local echo is `pending` until Discord confirms it, or `failed` with fixed text.
+    public enum Delivery: Hashable, Sendable {
+        case sent, pending
+        case failed(String)
+    }
+
     public var id: String
     public var authorName: String
     public var authorColor: RGB?
@@ -173,22 +181,72 @@ public struct MessagePlaceholder: Identifiable, Hashable, Sendable {
     public var timestamp: Date
     public var text: String
     public var displayNameStyle: DisplayNameStyle?
-    public var image: ImageAttachment?
-    public init(id: String, authorName: String, authorColor: RGB? = nil, avatar: Avatar, timestamp: Date, text: String, displayNameStyle: DisplayNameStyle? = nil, image: ImageAttachment? = nil) {
+    public var images: [ImageAttachment]
+    /// Filenames of non-image attachments.
+    public var files: [String]
+    /// The message this one replies to.
+    public var reply: ReplyPreview?
+    public var edited: Bool
+    public var delivery: Delivery
+    public init(
+        id: String, authorName: String, authorColor: RGB? = nil, avatar: Avatar, timestamp: Date, text: String,
+        displayNameStyle: DisplayNameStyle? = nil, images: [ImageAttachment] = [], files: [String] = [],
+        reply: ReplyPreview? = nil, edited: Bool = false, delivery: Delivery = .sent
+    ) {
         self.id = id; self.authorName = authorName; self.authorColor = authorColor
         self.avatar = avatar; self.timestamp = timestamp; self.text = text
-        self.displayNameStyle = displayNameStyle; self.image = image
+        self.displayNameStyle = displayNameStyle; self.images = images; self.files = files
+        self.reply = reply; self.edited = edited; self.delivery = delivery
     }
 }
 
-/// An image under a message. Fixtures draw generated art from `seed` (no network, no bundled
-/// files); real rows will carry a URL once messages are wired.
+/// An image under a message: a URL for live rows (dimensions validated > 0 in core), or generated
+/// art from `seed` for fixtures (no network, no bundled files).
 public struct ImageAttachment: Hashable, Sendable {
     public var seed: Int
+    public var url: URL?
     public var width: Double
     public var height: Double
     public init(seed: Int, width: Double, height: Double) {
         self.seed = seed; self.width = width; self.height = height
+    }
+    public init(url: URL, width: Double, height: Double) {
+        self.seed = 0; self.url = url; self.width = width; self.height = height
+    }
+}
+
+public extension MessageItem {
+    /// One engine row, passed as plain values (VelellaUI sees no FFI types). Text is kept as is.
+    static func live(
+        id: UInt64, authorName: String, authorColor: UInt32?, avatarURL: String, timestampMs: UInt64,
+        content: String, edited: Bool, images: [(url: String, width: UInt32, height: UInt32)],
+        files: [String], replyAuthor: String?, replyContent: String?, pending: Bool, failure: String?
+    ) -> MessageItem {
+        MessageItem(
+            id: String(id), authorName: authorName, authorColor: authorColor.map { RGB(rgb: $0) },
+            avatar: URL(string: avatarURL).map(Avatar.url) ?? .initials(initials(of: authorName)),
+            timestamp: Date(timeIntervalSince1970: Double(timestampMs) / 1000), text: content,
+            images: images.compactMap { image in
+                URL(string: image.url).map { ImageAttachment(url: $0, width: Double(image.width), height: Double(image.height)) }
+            },
+            files: files,
+            reply: replyAuthor.map { ReplyPreview(authorName: $0, segments: [.text(replyContent ?? "")]) },
+            edited: edited,
+            delivery: failure.map(Delivery.failed) ?? (pending ? .pending : .sent)
+        )
+    }
+}
+
+// MARK: Composer submit
+
+/// The composer's submit rule (plan M, F10): blank drafts and a Return that commits an input
+/// method's marked text never send; otherwise the draft is sent once and cleared at once.
+public enum ComposerSubmit {
+    public static func submit(_ draft: inout String, hasMarkedText: Bool, onSend: ((String) -> Void)?) {
+        guard let onSend, !hasMarkedText, !draft.allSatisfy(\.isWhitespace) else { return }
+        let text = draft
+        draft = ""
+        onSend(text)
     }
 }
 
@@ -300,7 +358,7 @@ public struct ShellState: Equatable, Sendable {
     public var serverName: String?
     public var categories: [ChannelCategory]
     public var selectedChannelID: String?
-    public var messages: [MessagePlaceholder]
+    public var messages: [MessageItem]
     public var memberSections: [MemberSection]
     public var currentUser: CurrentUser?
     public var dmTopRows: [DMTopRow]
@@ -313,7 +371,7 @@ public struct ShellState: Equatable, Sendable {
     public init(
         rail: [RailItem] = [], selectedRailID: String? = nil, serverName: String? = nil,
         categories: [ChannelCategory] = [], selectedChannelID: String? = nil,
-        messages: [MessagePlaceholder] = [], memberSections: [MemberSection] = [],
+        messages: [MessageItem] = [], memberSections: [MemberSection] = [],
         currentUser: CurrentUser? = nil,
         dmTopRows: [DMTopRow] = [], dms: [DMEntry] = [], selectedDMID: String? = nil,
         reply: ReplyPreview? = nil

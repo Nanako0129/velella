@@ -11,6 +11,8 @@ pub use decorations::{SidebarOccupant, SidebarStatus, SidebarThread};
 uniffi::setup_scaffolding!();
 
 mod members;
+mod messages;
+pub use messages::*;
 
 /// The one process-wide runtime. Exported async fns spawn onto it and await the
 /// JoinHandle, so bodies run on `velella-rt` threads regardless of who polls the

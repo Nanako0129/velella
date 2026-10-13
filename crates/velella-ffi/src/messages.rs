@@ -1,0 +1,193 @@
+//! Messages across FFI (plan M): open one channel's messages and send to it. Only ids, text and
+//! fixed-text states cross; the token stays in core.
+use crate::{runtime, SessionHandle};
+use std::sync::Arc;
+
+/// Message callbacks run on a `velella-rt` thread and must not block.
+#[uniffi::export(with_foreign)]
+pub trait MessagesListener: Send + Sync {
+    /// Every delivery names the channel it was made for.
+    fn on_messages(&self, channel_id: u64, snapshot: MessagesSnapshot);
+}
+
+#[derive(uniffi::Enum)]
+pub enum MessageLoad {
+    Loading,
+    Loaded,
+    /// Fixed text.
+    Failed {
+        text: String,
+    },
+}
+
+#[derive(uniffi::Record)]
+pub struct MessageImage {
+    pub url: String,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(uniffi::Record)]
+pub struct MessageReply {
+    pub author_name: String,
+    pub content: String,
+}
+
+#[derive(uniffi::Record)]
+pub struct MessageRow {
+    pub id: u64,
+    pub author_id: u64,
+    pub author_name: String,
+    pub author_avatar_url: String,
+    pub author_color: Option<u32>,
+    pub content: String,
+    pub timestamp_ms: u64,
+    pub edited: bool,
+    pub images: Vec<MessageImage>,
+    pub files: Vec<String>,
+    pub reply: Option<MessageReply>,
+    pub pending: bool,
+    /// Fixed text.
+    pub failure: Option<String>,
+}
+
+#[derive(uniffi::Record)]
+pub struct MessagesSnapshot {
+    pub load: MessageLoad,
+    pub rows: Vec<MessageRow>,
+}
+
+/// Dropping this leaves the channel: deliveries stop and an in-flight history fetch is cancelled.
+#[derive(uniffi::Object)]
+pub struct MessageSubscription(#[allow(dead_code)] velella_core::MessageSubscription);
+
+#[uniffi::export]
+impl SessionHandle {
+    /// Opens `channel_id` (guild channel or DM) and delivers its messages now and on every
+    /// change. Opening another channel ends the previous subscription's deliveries.
+    pub fn subscribe_messages(
+        &self,
+        channel_id: u64,
+        listener: Arc<dyn MessagesListener>,
+    ) -> Arc<MessageSubscription> {
+        let _context = runtime().enter();
+        Arc::new(MessageSubscription(
+            self.0.subscribe_messages(channel_id, move |snapshot| {
+                listener.on_messages(snapshot.channel_id, snapshot.into())
+            }),
+        ))
+    }
+
+    /// Sends `content` to `channel_id` only if that is the open channel (the one the live
+    /// `subscribe_messages` opened); false when nothing was sent (blank text, not open, before
+    /// READY). The result shows in the snapshot as an echo that is confirmed or fails.
+    pub fn send_message(&self, channel_id: u64, content: String) -> bool {
+        let _context = runtime().enter();
+        self.0.send_message(channel_id, content).is_some()
+    }
+}
+
+impl From<velella_core::MessagesSnapshot> for MessagesSnapshot {
+    fn from(s: velella_core::MessagesSnapshot) -> Self {
+        Self {
+            load: match s.load {
+                velella_core::LoadState::Loading => MessageLoad::Loading,
+                velella_core::LoadState::Loaded => MessageLoad::Loaded,
+                velella_core::LoadState::Failed(text) => MessageLoad::Failed {
+                    text: text.to_owned(),
+                },
+            },
+            rows: s.rows.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<velella_core::MessageRow> for MessageRow {
+    fn from(r: velella_core::MessageRow) -> Self {
+        Self {
+            id: r.id,
+            author_id: r.author_id,
+            author_name: r.author_name,
+            author_avatar_url: r.author_avatar_url,
+            author_color: r.author_color,
+            content: r.content,
+            timestamp_ms: r.timestamp_ms,
+            edited: r.edited,
+            images: r
+                .images
+                .into_iter()
+                .map(|i| MessageImage {
+                    url: i.url,
+                    width: i.width,
+                    height: i.height,
+                })
+                .collect(),
+            files: r.files,
+            reply: r.reply.map(|p| MessageReply {
+                author_name: p.author_name,
+                content: p.content,
+            }),
+            pending: r.pending,
+            failure: r.failure.map(str::to_owned),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn core_snapshot_converts_field_for_field() {
+        let row = velella_core::MessageRow {
+            id: 1,
+            author_id: 2,
+            author_name: "n".into(),
+            author_avatar_url: "https://cdn.discordapp.com/embed/avatars/0.png".into(),
+            author_color: Some(0x112233),
+            content: "[a](file:///etc)".into(),
+            timestamp_ms: 3,
+            edited: true,
+            images: vec![velella_core::MessageImage {
+                url: "u".into(),
+                width: 4,
+                height: 5,
+            }],
+            files: vec!["f.txt".into()],
+            reply: Some(velella_core::MessageReply {
+                author_name: "r".into(),
+                content: "c".into(),
+            }),
+            pending: false,
+            failure: Some("Not sent"),
+        };
+        let s = MessagesSnapshot::from(velella_core::MessagesSnapshot {
+            channel_id: 9,
+            load: velella_core::LoadState::Failed("Couldn't load messages"),
+            rows: vec![row],
+        });
+        assert!(
+            matches!(&s.load, MessageLoad::Failed { text } if text == "Couldn't load messages")
+        );
+        let r = &s.rows[0];
+        assert_eq!(
+            (
+                r.id,
+                r.author_id,
+                &*r.author_name,
+                r.author_color,
+                &*r.content
+            ),
+            (1, 2, "n", Some(0x112233), "[a](file:///etc)")
+        );
+        assert_eq!((r.timestamp_ms, r.edited, r.pending), (3, true, false));
+        assert_eq!(
+            (&*r.images[0].url, r.images[0].width, r.images[0].height),
+            ("u", 4, 5)
+        );
+        assert_eq!(r.files, ["f.txt"]);
+        let reply = r.reply.as_ref().unwrap();
+        assert_eq!((&*reply.author_name, &*reply.content), ("r", "c"));
+        assert_eq!(r.failure.as_deref(), Some("Not sent"));
+    }
+}
