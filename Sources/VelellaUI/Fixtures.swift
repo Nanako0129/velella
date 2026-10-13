@@ -72,7 +72,7 @@ public enum Fixtures {
 
     /// Enough rows to scroll, with images among them, so the toolbar band and the composer glass
     /// have colourful content passing under them.
-    public static let messages: [MessagePlaceholder] = {
+    public static let messages: [MessageItem] = {
         let authors: [(String, RGB?)] = [
             ("Ada Placeholder", orange), ("Bob Example", blue), ("Cleo Sample", green),
             ("Dex Dummy", nil), ("Test User", purple), ("Hana Ipsum", pink),
@@ -98,12 +98,12 @@ public enum Fixtures {
         ]
         return (0..<36).map { index in
             let author = authors[(index * 5 + index / 3) % authors.count]
-            return MessagePlaceholder(
+            return MessageItem(
                 id: "m\(index)", authorName: author.0, authorColor: author.1,
                 avatar: .initials(String(author.0.prefix(2)).uppercased()),
                 timestamp: baseTime.addingTimeInterval(Double(index) * 240),
                 text: images[index] != nil ? lines[8] : lines[index % 8],
-                image: images[index]
+                images: images[index].map { [$0] } ?? []
             )
         }
     }()

@@ -939,3 +939,230 @@ mod rest_401 {
         assert_eq!(timeout(WAIT, rig.events.recv()).await.unwrap(), None);
     }
 }
+
+// ---- Messages through the session (plan M) ----
+
+mod messages_live {
+    use super::*;
+    use crate::{
+        rest::test_support::{response, MockHttp},
+        LoadState, MessageSubscription, MessagesSnapshot,
+    };
+
+    fn ok(body: Value) -> String {
+        response(200, "Content-Type: application/json\r\n", &body.to_string())
+    }
+
+    fn dispatch(seq: u64, t: &str, d: Value) -> Value {
+        json!({"op": 0, "t": t, "s": seq, "d": d})
+    }
+
+    /// Snapshots until one satisfies `done`.
+    async fn until(
+        rx: &mut mpsc::UnboundedReceiver<MessagesSnapshot>,
+        done: impl Fn(&MessagesSnapshot) -> bool,
+    ) -> MessagesSnapshot {
+        loop {
+            let s = timeout(WAIT, rx.recv())
+                .await
+                .expect("no snapshot")
+                .expect("deliveries ended");
+            if done(&s) {
+                return s;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn history_live_events_and_a_send_flow_through_the_session() {
+        let history = json!([
+            {"id": "11", "channel_id": "20", "content": "second", "author": {"id": "9", "username": "u9", "global_name": "Nine"}},
+            {"id": "10", "channel_id": "20", "content": "first <#20>", "author": {"id": "9", "username": "u9"}},
+        ]);
+        let sent = json!({"id": "14", "channel_id": "20", "content": "out",
+            "author": {"id": "1", "username": "synthetic", "global_name": "Syn"}});
+        let mock = MockHttp::start(vec![ok(history), ok(sent)]).await;
+        mock.install();
+        let mut rig = Rig::start().await;
+        let mut conn = rig.ready(30_000, "wss://gateway-resume.discord.gg/").await;
+        conn.send(dispatch(2, "GUILD_CREATE", json!({
+            "id": "10", "name": "g", "owner_id": "1",
+            "roles": [{"id": "10", "permissions": "1024", "position": 0},
+                      {"id": "77", "permissions": "0", "position": 3, "name": "mods", "color": 0x112233}],
+            "channels": [{"id": "20", "type": 0, "name": "general"}],
+        })))
+        .await;
+        let mut revision = rig.handle.state();
+        timeout(WAIT, revision.wait_for(|r| *r >= 2))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sub = rig.handle.subscribe_messages(20, move |s| {
+            let _ = tx.send(s);
+        });
+        let s = until(&mut rx, |s| s.load == LoadState::Loaded).await;
+        assert_eq!(
+            s.rows
+                .iter()
+                .map(|r| (r.id, r.content.as_str()))
+                .collect::<Vec<_>>(),
+            [(10, "first #general"), (11, "second")]
+        );
+
+        // Live: a create with a member (nick, role colour), one for another channel (ignored),
+        // then an update and a delete.
+        conn.send(dispatch(3, "MESSAGE_CREATE", json!({
+            "id": "12", "channel_id": "20", "content": "hey <@&77>",
+            "author": {"id": "9", "username": "u9"}, "member": {"nick": "Niner", "roles": ["77"]},
+        })))
+        .await;
+        conn.send(dispatch(4, "MESSAGE_CREATE", json!({
+            "id": "13", "channel_id": "21", "content": "elsewhere", "author": {"id": "9", "username": "u9"},
+        })))
+        .await;
+        let s = until(&mut rx, |s| s.rows.len() == 3).await;
+        let live = &s.rows[2];
+        assert_eq!(
+            (
+                live.author_name.as_str(),
+                live.author_color,
+                live.content.as_str()
+            ),
+            ("Niner", Some(0x112233), "hey @mods")
+        );
+        conn.send(dispatch(5, "MESSAGE_UPDATE", json!({"id": "11", "channel_id": "20", "content": "edited", "edited_timestamp": "2026-10-14T00:00:00+00:00"}))).await;
+        conn.send(dispatch(
+            6,
+            "MESSAGE_DELETE",
+            json!({"id": "10", "channel_id": "20"}),
+        ))
+        .await;
+        let s = until(&mut rx, |s| s.rows.len() == 2 && s.rows[0].edited).await;
+        assert_eq!(
+            s.rows
+                .iter()
+                .map(|r| (r.id, r.content.as_str()))
+                .collect::<Vec<_>>(),
+            [(11, "edited"), (12, "hey @mods")]
+        );
+
+        // Send: only to the open channel, never for blank text; the gateway echo reconciles.
+        assert!(rig
+            .handle
+            .send_message(21, "wrong channel".into())
+            .is_none());
+        assert!(rig.handle.send_message(20, " \n\t".into()).is_none());
+        rig.handle
+            .send_message(20, "out".into())
+            .unwrap()
+            .await
+            .unwrap();
+        let posts: Vec<_> = mock
+            .requests()
+            .into_iter()
+            .filter(|r| r.starts_with("POST"))
+            .collect();
+        assert_eq!(posts.len(), 1);
+        assert!(
+            posts[0].starts_with("POST /api/v9/channels/20/messages "),
+            "{}",
+            posts[0]
+        );
+        let body: Value = serde_json::from_str(posts[0].split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        let nonce = body["nonce"].as_str().unwrap().to_owned();
+        // The POST answer replaces the echo (the echo itself is covered in messages_tests.rs), and
+        // the gateway's copy of the same message (same nonce, self author) adds no second row.
+        until(&mut rx, |s| {
+            s.rows.last().is_some_and(|r| r.id == 14 && !r.pending)
+        })
+        .await;
+        conn.send(dispatch(
+            7,
+            "MESSAGE_CREATE",
+            json!({
+                "id": "14", "channel_id": "20", "content": "out", "nonce": nonce,
+                "author": {"id": "1", "username": "synthetic", "global_name": "Syn"},
+                "member": {"nick": "Me", "roles": []},
+            }),
+        ))
+        .await;
+        let s = until(&mut rx, |s| {
+            s.rows.last().is_some_and(|r| r.author_name == "Me")
+        })
+        .await;
+        assert_eq!(
+            s.rows.iter().map(|r| (r.id, r.pending)).collect::<Vec<_>>(),
+            [(11, false), (12, false), (14, false)]
+        );
+
+        // Leaving ends the deliveries.
+        drop(sub);
+        conn.send(dispatch(8, "MESSAGE_CREATE", json!({
+            "id": "15", "channel_id": "20", "content": "late", "author": {"id": "9", "username": "u9"},
+        })))
+        .await;
+        assert!(
+            matches!(
+                timeout(Duration::from_millis(400), rx.recv()).await,
+                Err(_) | Ok(None)
+            ),
+            "a snapshot after the subscription was dropped"
+        );
+    }
+
+    async fn open_general(
+        rig: &mut Rig,
+    ) -> (Conn, mpsc::UnboundedReceiver<MessagesSnapshot>, MessageSubscription) {
+        let mut conn = rig.ready(30_000, "wss://gateway-resume.discord.gg/").await;
+        conn.send(dispatch(2, "GUILD_CREATE", json!({
+            "id": "10", "name": "g", "owner_id": "1",
+            "roles": [{"id": "10", "permissions": "1024", "position": 0}],
+            "channels": [{"id": "20", "type": 0, "name": "general"}],
+        })))
+        .await;
+        let mut revision = rig.handle.state();
+        timeout(WAIT, revision.wait_for(|r| *r >= 2))
+            .await
+            .unwrap()
+            .unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let sub = rig.handle.subscribe_messages(20, move |s| {
+            let _ = tx.send(s);
+        });
+        (conn, rx, sub)
+    }
+
+    #[tokio::test]
+    async fn a_failed_send_through_the_session_posts_once_and_shows_not_sent() {
+        let mock = MockHttp::start(vec![ok(json!([])), response(500, "", ""), ok(json!({}))]).await;
+        mock.install();
+        let mut rig = Rig::start().await;
+        let (_conn, mut rx, _sub) = open_general(&mut rig).await;
+        until(&mut rx, |s| s.load == LoadState::Loaded).await;
+        rig.handle
+            .send_message(20, "hi".into())
+            .unwrap()
+            .await
+            .unwrap();
+        let s = until(&mut rx, |s| s.rows.last().is_some_and(|r| !r.pending)).await;
+        assert_eq!(s.rows.last().unwrap().failure, Some("Not sent"));
+        let posts = mock.requests().into_iter().filter(|r| r.starts_with("POST")).count();
+        assert_eq!(posts, 1, "the POST was retried");
+    }
+
+    #[tokio::test]
+    async fn nothing_is_sent_before_ready_even_to_the_open_channel() {
+        let mock = MockHttp::start(vec![ok(json!([]))]).await;
+        mock.install();
+        let rig = Rig::start().await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let _sub = rig.handle.subscribe_messages(20, move |s| {
+            let _ = tx.send(s);
+        });
+        until(&mut rx, |s| s.load == LoadState::Loaded).await;
+        assert!(rig.handle.send_message(20, "hi".into()).is_none());
+        assert_eq!(mock.count(), 1, "only the history GET");
+    }
+}

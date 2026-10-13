@@ -26,6 +26,13 @@ final class AppModel {
     /// Guild of the live `channelsSub`; the only guild whose channel snapshots may be applied.
     @ObservationIgnored private var channelsGuild: UInt64?
     @ObservationIgnored private var guildNames: [UInt64: String] = [:]
+    /// The open conversation's messages; dropping it leaves the channel (and cancels its fetch).
+    @ObservationIgnored private var messagesSub: MessageSubscription?
+    /// Channel `messagesSub` opened from `shell.openTarget`: the only channel `send` posts to.
+    @ObservationIgnored private var messagesChannel: UInt64?
+    /// Bumped by every `openMessages`; only snapshots of the latest subscription are applied, so a
+    /// late one from an earlier visit to the same channel (X, Y, back to X) is dropped too.
+    @ObservationIgnored private var messagesOpen: UInt64 = 0
 
     init(demo: Bool) {
         isDemo = demo
@@ -148,6 +155,10 @@ final class AppModel {
         channelsSub = nil
         channelsGuild = nil
         guildNames = [:]
+        messagesSub = nil
+        messagesChannel = nil
+        shell.messages = []
+        shell.messageLoad = .idle
     }
 
     /// Follows the shell's own selection binding (the window calls this when it changes).
@@ -175,10 +186,53 @@ final class AppModel {
     func selectionChanged() {
         // L: the member list follows the (guild, channel) target here.
         // M: the message history follows `shell.openTarget` here.
+        openMessages(shell.openTarget.flatMap { UInt64($0) })
     }
 
-    /// The composer's submit. Filled by the message slice.
-    func send(_ text: String) {}
+    /// The composer's submit: to the channel this model opened, never to a selection read now.
+    /// Core sends only if that is still its open channel.
+    func send(_ text: String) {
+        guard let handle, let channel = messagesChannel else { return }
+        _ = handle.sendMessage(channelId: channel, content: text)
+    }
+
+    // MARK: Messages
+
+    /// Opens `target`'s messages (nil: none) unless it is already open.
+    private func openMessages(_ target: UInt64?) {
+        guard !isDemo, target != messagesChannel else { return }
+        messagesOpen &+= 1
+        messagesSub = nil
+        messagesChannel = nil
+        shell.messages = []
+        shell.messageLoad = .idle
+        guard let target, let handle, let generation else { return }
+        messagesChannel = target
+        shell.messageLoad = .loading
+        messagesSub = handle.subscribeMessages(
+            channelId: target,
+            listener: MessageSnapshots(model: self, generation: generation, open: messagesOpen)
+        )
+    }
+
+    fileprivate func apply(messages snapshot: MessagesSnapshot, open: UInt64, generation gen: UInt64) {
+        // A late snapshot of a dropped subscription must not fill another conversation.
+        guard gen == generation, open == messagesOpen else { return }
+        shell.messages = snapshot.rows.map { row in
+            MessageItem.live(
+                id: row.id, authorName: row.authorName, authorColor: row.authorColor,
+                avatarURL: row.authorAvatarUrl, timestampMs: row.timestampMs, content: row.content,
+                edited: row.edited, images: row.images.map { ($0.url, $0.width, $0.height) },
+                files: row.files, replyAuthor: row.reply?.authorName, replyContent: row.reply?.content,
+                pending: row.pending, failure: row.failure
+            )
+        }
+        shell.messageLoad = switch snapshot.load {
+        case .loading: .loading
+        case .loaded: .loaded
+        case .failed(let text): .failed(text)
+        }
+    }
 
     fileprivate func apply(guilds entries: [SidebarEntry], generation gen: UInt64) {
         guard gen == generation else { return }
@@ -334,6 +388,21 @@ private final class ChannelSnapshots: ChannelsListener {
     func onChannels(guildId: UInt64, categories: [SidebarCategory]) {
         DispatchQueue.main.async { [model, generation] in
             model.apply(channels: categories, guild: guildId, generation: generation)
+        }
+    }
+}
+
+private final class MessageSnapshots: MessagesListener {
+    let model: AppModel
+    let generation: UInt64
+    let open: UInt64
+    init(model: AppModel, generation: UInt64, open: UInt64) {
+        self.model = model; self.generation = generation; self.open = open
+    }
+
+    func onMessages(channelId: UInt64, snapshot: MessagesSnapshot) {
+        DispatchQueue.main.async { [model, generation, open] in
+            model.apply(messages: snapshot, open: open, generation: generation)
         }
     }
 }

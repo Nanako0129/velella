@@ -1,15 +1,16 @@
+import AppKit
 import SwiftUI
 
 private typealias T = DesignTokens
 
-/// Message column: placeholder rows and the composer. Fresh code (Swiftcord legacy has no
-/// matching view; its message list is a separate, DiscordKit-bound subsystem). Real message rows
-/// replace `MessageRow` in a later slice.
+/// Message column: message rows, their load state and the composer. Fresh code (Swiftcord legacy
+/// has no matching view; its message list is a separate, DiscordKit-bound subsystem). Every
+/// payload string (content, names, reply previews, fixed failure texts) goes through
+/// `Text(verbatim:)`: no Markdown, no link detection (plan M, F5).
 struct MessageArea: View {
     let header: ChannelHeader?
     var isSignedIn = true
-    let messages: [MessagePlaceholder]
-    /// Not drawn yet: the message slice shows its loading and failure states.
+    let messages: [MessageItem]
     var load: MessageLoad = .idle
     @Binding var reply: ReplyPreview?
     var onSend: ((String) -> Void)?
@@ -18,6 +19,7 @@ struct MessageArea: View {
         if header != nil {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: T.Spacing.lg) {
+                    LoadStatus(load: load, isEmpty: messages.isEmpty)
                     ForEach(messages) { MessageRow(message: $0) }
                 }
                 .padding(T.Spacing.lg)
@@ -43,50 +45,107 @@ struct MessageArea: View {
     }
 }
 
+/// Above the rows: a spinner while the first load runs, or the fixed failure text.
+private struct LoadStatus: View {
+    let load: MessageLoad
+    let isEmpty: Bool
+
+    var body: some View {
+        switch load {
+        case .loading where isEmpty:
+            ProgressView().controlSize(.small).frame(maxWidth: .infinity)
+        case .failed(let text):
+            Label { Text(verbatim: text) } icon: { Image(systemName: "exclamationmark.triangle.fill") }
+                .font(T.Typography.messageBody)
+                .foregroundStyle(.secondary)
+        default:
+            EmptyView()
+        }
+    }
+}
+
 struct MessageRow: View {
-    let message: MessagePlaceholder
+    let message: MessageItem
 
     var body: some View {
         HStack(alignment: .top, spacing: T.Spacing.md) {
             AvatarView(avatar: message.avatar, size: T.Size.messageAvatar)
             VStack(alignment: .leading, spacing: 0) {
+                if let reply = message.reply {
+                    HStack(spacing: T.Spacing.xs) {
+                        Image(systemName: "arrowshape.turn.up.left.fill")
+                        Text(verbatim: reply.authorName).fontWeight(.semibold)
+                        Text(verbatim: reply.segments.map { if case .text(let text) = $0 { text } else { "" } }.joined())
+                    }
+                    .font(T.Typography.timestamp)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                }
                 HStack(alignment: .firstTextBaseline, spacing: T.Spacing.sm) {
-                    Text(message.authorName)
+                    Text(verbatim: message.authorName)
                         .font(T.Typography.authorName)
                         .displayNameStyle(message.displayNameStyle)
                         .foregroundStyle(message.authorColor.map(Color.init) ?? Color.primary)
                     Text(message.timestamp.formatted(date: .omitted, time: .shortened))
                         .font(T.Typography.timestamp)
                         .foregroundStyle(.secondary)
+                    if message.edited {
+                        Text("(edited)").font(T.Typography.timestamp).foregroundStyle(.secondary)
+                    }
                 }
-                Text(message.text).font(T.Typography.messageBody)
-                if let image = message.image {
+                if !message.text.isEmpty {
+                    Text(verbatim: message.text).font(T.Typography.messageBody)
+                }
+                ForEach(Array(message.images.enumerated()), id: \.offset) { _, image in
                     ImageAttachmentView(image: image).padding(.top, T.Spacing.xs)
+                }
+                ForEach(Array(message.files.enumerated()), id: \.offset) { _, file in
+                    Label { Text(verbatim: file) } icon: { Image(systemName: "doc") }
+                        .font(T.Typography.messageBody)
+                        .foregroundStyle(.secondary)
+                }
+                if case .failed(let reason) = message.delivery {
+                    Text(verbatim: reason).font(T.Typography.timestamp).foregroundStyle(.red)
                 }
             }
         }
+        // An unconfirmed echo is dimmed until Discord confirms it.
+        .opacity(message.delivery == .pending ? 0.5 : 1)
     }
 }
 
-/// An image under a message, scaled down to the column's image width and rounded. Fixture images
-/// are generated art: a mesh gradient whose hues come from the seed.
+/// An image under a message, scaled down to the column's image width and rounded. Live images
+/// load from their URL; fixture images are generated art, a mesh gradient whose hues come from
+/// the seed.
 struct ImageAttachmentView: View {
     let image: ImageAttachment
 
     var body: some View {
+        Group {
+            if let url = image.url {
+                AsyncImage(url: url) { phase in
+                    if let loaded = phase.image { loaded.resizable() } else { T.Palette.replyBarFill }
+                }
+            } else {
+                generated
+            }
+        }
+        .aspectRatio(image.width / image.height, contentMode: .fit)
+        .frame(maxWidth: min(image.width, T.Size.messageImageMaxWidth), alignment: .leading)
+        .clipShape(RoundedRectangle(cornerRadius: T.Radius.messageImage, style: .continuous))
+    }
+
+    private var generated: some View {
         let hue = Double(image.seed % 12) / 12
         let colors = (0..<9).map { i in
             Color(hue: (hue + Double(i) * 0.07).truncatingRemainder(dividingBy: 1),
                   saturation: 0.7, brightness: i % 2 == 0 ? 0.95 : 0.6)
         }
-        MeshGradient(
+        return MeshGradient(
             width: 3, height: 3,
             points: [[0, 0], [0.5, 0], [1, 0], [0, 0.5], [0.6, 0.4], [1, 0.5], [0, 1], [0.5, 1], [1, 1]],
             colors: colors
         )
-        .aspectRatio(image.width / image.height, contentMode: .fit)
-        .frame(maxWidth: min(image.width, T.Size.messageImageMaxWidth), alignment: .leading)
-        .clipShape(RoundedRectangle(cornerRadius: T.Radius.messageImage, style: .continuous))
     }
 }
 
@@ -98,7 +157,7 @@ struct ImageAttachmentView: View {
 /// sticker and emoji are decoration until their pickers exist.
 struct Composer: View {
     @Binding var reply: ReplyPreview?
-    /// Not called yet: the message slice wires submit (and its empty-draft and IME rules).
+    /// Receives the draft on Return (`ComposerSubmit`: never blank, never an IME commit).
     var onSend: ((String) -> Void)?
     @State private var draft = ""
     @State private var plusMenuOpen = false
@@ -124,6 +183,12 @@ struct Composer: View {
                 TextField("Message", text: $draft)
                     .textFieldStyle(.plain)
                     .font(T.Typography.composer)
+                    .onSubmit {
+                        // The field editor still holding marked text means this Return belongs to
+                        // the input method (it commits a candidate), not to the composer.
+                        let editor = NSApp.keyWindow?.firstResponder as? NSTextView
+                        ComposerSubmit.submit(&draft, hasMarkedText: editor?.hasMarkedText() ?? false, onSend: onSend)
+                    }
 
                 // White glyphs, as in v2.
                 Group {

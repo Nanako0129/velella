@@ -8,6 +8,7 @@ mod identify;
 mod messages;
 mod permissions;
 mod rest;
+mod rest_messages;
 mod session;
 mod sidebar;
 mod state;
@@ -23,6 +24,9 @@ mod session_tests;
 mod sidebar_tests;
 
 pub use identify::USER_AGENT;
+pub use messages::{
+    LoadState, MessageImage, MessageReply, MessageRow, MessageSubscription, MessagesSnapshot,
+};
 pub use session::{Session, SessionEvent, SessionHandle, Subscription};
 pub use sidebar::{
     channel_categories, dm_list, guild_entries, SidebarCategory, SidebarChannel, SidebarDm,
