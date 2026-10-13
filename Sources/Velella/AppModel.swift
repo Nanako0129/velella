@@ -127,16 +127,13 @@ final class AppModel {
 
     // MARK: Sidebar
 
-    private static let dmRailID = "dm"
-    private static let dmItem = RailItem.dm(
-        RailDM(id: "dm", name: "Direct Messages", icon: .symbol("bubble.left.fill"))
-    )
+    private static let dmRailID = RailDM.directMessages.id
 
     /// On READY: guilds and DMs for the whole session (a repeated READY reuses them: the engine
     /// replaces its state in place and pushes fresh snapshots).
     private func subscribeSidebar(generation gen: UInt64) {
         guard let handle, guildsSub == nil else { return }
-        shell.rail = [Self.dmItem]
+        shell.rail = [.dm(.directMessages)]
         guildsSub = handle.subscribeGuilds(listener: GuildsSnapshots(model: self, generation: gen))
         dmsSub = handle.subscribeDms(listener: DMSnapshots(model: self, generation: gen))
         if shell.selectedRailID == nil { shell.selectedRailID = Self.dmRailID }
@@ -183,7 +180,7 @@ final class AppModel {
     fileprivate func apply(guilds entries: [SidebarEntry], generation gen: UInt64) {
         guard gen == generation else { return }
         var names: [UInt64: String] = [:]
-        var rail = [Self.dmItem]
+        var rail: [RailItem] = []
         for entry in entries {
             switch entry {
             case .guild(let guild):
@@ -200,7 +197,7 @@ final class AppModel {
             }
         }
         guildNames = names
-        shell.rail = rail
+        shell.applyGuildRail(rail)
         // The selected guild vanished (GUILD_DELETE, or this account left it): back to DMs.
         if let selected = shell.selectedRailID.flatMap({ UInt64($0) }) {
             if let name = names[selected] { shell.serverName = name } else { shell.selectedRailID = Self.dmRailID }
@@ -216,25 +213,19 @@ final class AppModel {
         let mapped = categories.map { category in
             ChannelCategory(
                 id: category.id.map { "cat-\($0)" } ?? "root", name: category.name,
-                channels: category.channels.map {
-                    ChannelItem(id: String($0.id), name: $0.name, kind: Self.channelKind($0.kind))
-                }
+                channels: category.channels.map(Self.channelItem)
             )
         }
         shell.categories = mapped
-        if let selected = shell.selectedChannelID, !mapped.contains(where: { $0.channels.contains { $0.id == selected } }) {
+        let listed = mapped.flatMap(\.channels).flatMap { [$0] + $0.threads }
+        if let selected = shell.selectedChannelID, !listed.contains(where: { $0.id == selected }) {
             shell.selectedChannelID = nil
         }
     }
 
-    fileprivate func apply(dms: [SidebarDm], generation gen: UInt64) {
+    fileprivate func apply(dms: [SidebarDm], friendsPending: UInt32, generation gen: UInt64) {
         guard gen == generation else { return }
-        shell.dms = dms.map {
-            DMEntry(id: String($0.id), name: $0.name, avatar: Self.avatar(url: $0.iconUrl, name: $0.name), status: nil)
-        }
-        if let selected = shell.selectedDMID, !shell.dms.contains(where: { $0.id == selected }) {
-            shell.selectedDMID = nil
-        }
+        shell.applyDMs(dms.map(Self.dmEntry), friendsPending: Int(friendsPending))
     }
 
     private static func avatar(url: String?, name: String) -> Avatar {
@@ -242,7 +233,43 @@ final class AppModel {
     }
 
     private static func railGuild(_ guild: SidebarGuild) -> RailGuild {
-        RailGuild(id: String(guild.id), name: guild.name, icon: avatar(url: guild.iconUrl, name: guild.name))
+        RailGuild(
+            id: String(guild.id), name: guild.name, icon: avatar(url: guild.iconUrl, name: guild.name),
+            hasUnread: guild.unread, mentionCount: Int(guild.mentionCount), isMuted: guild.muted
+        )
+    }
+
+    private static func channelItem(_ channel: SidebarChannel) -> ChannelItem {
+        ChannelItem(
+            id: String(channel.id), name: channel.name, kind: channelKind(channel.kind),
+            isUnread: channel.unread, mentionCount: Int(channel.mentionCount),
+            isMuted: channel.muted, isPrivate: channel.`private`,
+            occupants: channel.occupants.map {
+                VoiceOccupant(id: String($0.id), name: $0.name, avatar: avatar(url: $0.iconUrl, name: $0.name))
+            },
+            threads: channel.threads.map {
+                ChannelItem(
+                    id: String($0.id), name: $0.name, isUnread: $0.unread,
+                    mentionCount: Int($0.mentionCount), isMuted: $0.muted
+                )
+            }
+        )
+    }
+
+    private static func dmEntry(_ dm: SidebarDm) -> DMEntry {
+        DMEntry(
+            id: String(dm.id), name: dm.name, avatar: avatar(url: dm.iconUrl, name: dm.name),
+            status: dm.status.map(presence), unread: dm.unread, mentionCount: Int(dm.mentionCount)
+        )
+    }
+
+    private static func presence(_ status: SidebarStatus) -> PresenceStatus {
+        switch status {
+        case .online: .online
+        case .idle: .idle
+        case .doNotDisturb: .doNotDisturb
+        case .offline: .offline
+        }
     }
 
     private static func channelKind(_ kind: UInt8) -> ChannelKind {
@@ -343,7 +370,9 @@ private final class DMSnapshots: DmsListener {
     let generation: UInt64
     init(model: AppModel, generation: UInt64) { self.model = model; self.generation = generation }
 
-    func onDms(dms: [SidebarDm]) {
-        DispatchQueue.main.async { [model, generation] in model.apply(dms: dms, generation: generation) }
+    func onDms(dms: [SidebarDm], friendsPending: UInt32) {
+        DispatchQueue.main.async { [model, generation] in
+            model.apply(dms: dms, friendsPending: friendsPending, generation: generation)
+        }
     }
 }

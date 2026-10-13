@@ -42,9 +42,11 @@ public struct RailGuild: Identifiable, Hashable, Sendable {
     public var icon: Avatar
     public var hasUnread: Bool
     public var mentionCount: Int
-    public init(id: String, name: String, icon: Avatar, hasUnread: Bool = false, mentionCount: Int = 0) {
+    /// Dimmed on the rail. A muted server carries no unread or mention state (the engine zeroes it).
+    public var isMuted: Bool
+    public init(id: String, name: String, icon: Avatar, hasUnread: Bool = false, mentionCount: Int = 0, isMuted: Bool = false) {
         self.id = id; self.name = name; self.icon = icon
-        self.hasUnread = hasUnread; self.mentionCount = mentionCount
+        self.hasUnread = hasUnread; self.mentionCount = mentionCount; self.isMuted = isMuted
     }
 }
 
@@ -56,6 +58,11 @@ public struct RailFolder: Identifiable, Hashable, Sendable {
     public init(id: String, name: String? = nil, color: RGB, children: [RailGuild]) {
         self.id = id; self.name = name; self.color = color; self.children = children
     }
+
+    /// What the closed folder tile shows: the children's mentions summed, and an unread mark when
+    /// any child is unread. Computed from the children, so the engine sends nothing for folders.
+    public var mentionCount: Int { children.reduce(0) { $0 + $1.mentionCount } }
+    public var hasUnread: Bool { children.contains { $0.hasUnread } }
 }
 
 public struct RailDM: Identifiable, Hashable, Sendable {
@@ -117,6 +124,7 @@ public struct ChannelItem: Identifiable, Hashable, Sendable {
     public var kind: ChannelKind
     public var topic: String?
     public var isUnread: Bool
+    public var mentionCount: Int
     public var isMuted: Bool
     /// Hidden from @everyone; drawn with a lock on the glyph.
     public var isPrivate: Bool
@@ -125,11 +133,12 @@ public struct ChannelItem: Identifiable, Hashable, Sendable {
     public var threads: [ChannelItem]
     public init(
         id: String, name: String, kind: ChannelKind = .text, topic: String? = nil,
-        isUnread: Bool = false, isMuted: Bool = false, isPrivate: Bool = false,
+        isUnread: Bool = false, mentionCount: Int = 0, isMuted: Bool = false, isPrivate: Bool = false,
         occupants: [VoiceOccupant] = [], threads: [ChannelItem] = []
     ) {
         self.id = id; self.name = name; self.kind = kind; self.topic = topic
-        self.isUnread = isUnread; self.isMuted = isMuted; self.isPrivate = isPrivate
+        self.isUnread = isUnread; self.mentionCount = mentionCount
+        self.isMuted = isMuted; self.isPrivate = isPrivate
         self.occupants = occupants; self.threads = threads
     }
 }
@@ -241,16 +250,20 @@ public struct DMEntry: Identifiable, Hashable, Sendable {
     public var id: String
     public var name: String
     public var avatar: Avatar
-    /// nil draws no presence dot (live DMs: presence is not wired yet).
+    /// nil draws no presence dot (group DMs).
     public var status: PresenceStatus?
     /// Server-tag pill next to the name, e.g. "DEV".
     public var serverTag: String?
     /// Activity subtitle under the name, e.g. "Playing Placeholder Quest".
     public var activity: String?
     public var displayNameStyle: DisplayNameStyle?
-    public init(id: String, name: String, avatar: Avatar, status: PresenceStatus? = .offline, serverTag: String? = nil, activity: String? = nil, displayNameStyle: DisplayNameStyle? = nil) {
+    /// Both zero/false while the DM is muted (the engine zeroes them).
+    public var unread: Bool
+    public var mentionCount: Int
+    public init(id: String, name: String, avatar: Avatar, status: PresenceStatus? = .offline, serverTag: String? = nil, activity: String? = nil, displayNameStyle: DisplayNameStyle? = nil, unread: Bool = false, mentionCount: Int = 0) {
         self.id = id; self.name = name; self.avatar = avatar; self.status = status
         self.serverTag = serverTag; self.activity = activity; self.displayNameStyle = displayNameStyle
+        self.unread = unread; self.mentionCount = mentionCount
     }
 }
 

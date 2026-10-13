@@ -5,6 +5,9 @@ use tokio::runtime::{Builder, Runtime};
 use tokio::task::JoinHandle;
 use velella_core::{Session, SessionEvent, Token};
 
+mod decorations;
+pub use decorations::{SidebarOccupant, SidebarStatus, SidebarThread};
+
 uniffi::setup_scaffolding!();
 
 /// The one process-wide runtime. Exported async fns spawn onto it and await the
@@ -139,9 +142,12 @@ impl SessionHandle {
 
     pub fn subscribe_dms(&self, listener: Arc<dyn DmsListener>) -> Arc<SidebarSubscription> {
         let _context = runtime().enter();
-        sidebar(self.0.subscribe(velella_core::dm_list, move |dms| {
-            listener.on_dms(dms.into_iter().map(Into::into).collect())
-        }))
+        sidebar(self.0.subscribe(
+            |state| (velella_core::dm_list(state), state.friends_pending()),
+            move |(dms, friends_pending)| {
+                listener.on_dms(dms.into_iter().map(Into::into).collect(), friends_pending)
+            },
+        ))
     }
 }
 
@@ -166,7 +172,8 @@ pub trait ChannelsListener: Send + Sync {
 
 #[uniffi::export(with_foreign)]
 pub trait DmsListener: Send + Sync {
-    fn on_dms(&self, dms: Vec<SidebarDm>);
+    /// `friends_pending`: incoming friend requests, for the Friends row badge.
+    fn on_dms(&self, dms: Vec<SidebarDm>, friends_pending: u32);
 }
 
 #[derive(uniffi::Record)]
@@ -174,6 +181,9 @@ pub struct SidebarGuild {
     pub id: u64,
     pub name: String,
     pub icon_url: Option<String>,
+    pub unread: bool,
+    pub mention_count: u32,
+    pub muted: bool,
 }
 
 #[derive(uniffi::Enum)]
@@ -192,6 +202,12 @@ pub struct SidebarChannel {
     pub id: u64,
     pub kind: u8,
     pub name: String,
+    pub unread: bool,
+    pub mention_count: u32,
+    pub muted: bool,
+    pub private: bool,
+    pub occupants: Vec<SidebarOccupant>,
+    pub threads: Vec<SidebarThread>,
 }
 
 #[derive(uniffi::Record)]
@@ -206,6 +222,9 @@ pub struct SidebarDm {
     pub id: u64,
     pub name: String,
     pub icon_url: Option<String>,
+    pub unread: bool,
+    pub mention_count: u32,
+    pub status: Option<SidebarStatus>,
 }
 
 impl From<velella_core::SidebarGuild> for SidebarGuild {
@@ -214,6 +233,9 @@ impl From<velella_core::SidebarGuild> for SidebarGuild {
             id: g.id,
             name: g.name,
             icon_url: g.icon_url,
+            unread: g.unread,
+            mention_count: g.mention_count,
+            muted: g.muted,
         }
     }
 }
@@ -249,6 +271,12 @@ impl From<velella_core::SidebarCategory> for SidebarCategory {
                     id: c.id,
                     kind: c.kind,
                     name: c.name,
+                    unread: c.unread,
+                    mention_count: c.mention_count,
+                    muted: c.muted,
+                    private: c.private,
+                    occupants: c.occupants.into_iter().map(Into::into).collect(),
+                    threads: c.threads.into_iter().map(Into::into).collect(),
                 })
                 .collect(),
         }
@@ -261,6 +289,9 @@ impl From<velella_core::SidebarDm> for SidebarDm {
             id: d.id,
             name: d.name,
             icon_url: d.icon_url,
+            unread: d.unread,
+            mention_count: d.mention_count,
+            status: d.status.map(Into::into),
         }
     }
 }
@@ -365,6 +396,9 @@ mod tests {
             id: 1,
             name: "g".into(),
             icon_url: Some("u".into()),
+            unread: true,
+            mention_count: 4,
+            muted: false,
         };
         let folder = velella_core::SidebarEntry::Folder {
             id: Some(7),
@@ -386,7 +420,13 @@ mod tests {
         }
         assert!(matches!(
             SidebarEntry::from(velella_core::SidebarEntry::Guild(guild)),
-            SidebarEntry::Guild(SidebarGuild { id: 1, .. })
+            SidebarEntry::Guild(SidebarGuild {
+                id: 1,
+                unread: true,
+                mention_count: 4,
+                muted: false,
+                ..
+            })
         ));
         let category = SidebarCategory::from(velella_core::SidebarCategory {
             id: None,
@@ -395,16 +435,46 @@ mod tests {
                 id: 2,
                 kind: 13,
                 name: "c".into(),
+                unread: true,
+                mention_count: 3,
+                muted: true,
+                private: true,
+                occupants: vec![velella_core::SidebarOccupant {
+                    id: 9,
+                    name: "o".into(),
+                    icon_url: None,
+                }],
+                threads: vec![velella_core::SidebarThread {
+                    id: 8,
+                    name: "t".into(),
+                    unread: true,
+                    mention_count: 1,
+                    muted: false,
+                }],
             }],
         });
+        let c = &category.channels[0];
         assert_eq!(
-            (
-                category.id,
-                category.channels[0].kind,
-                &*category.channels[0].name
-            ),
-            (None, 13, "c")
+            (category.id, c.kind, &*c.name, c.unread, c.mention_count),
+            (None, 13, "c", true, 3)
         );
+        assert!(c.muted && c.private);
+        assert_eq!((c.occupants[0].id, &*c.occupants[0].name), (9, "o"));
+        assert_eq!((c.threads[0].id, c.threads[0].mention_count), (8, 1));
+    }
+
+    #[test]
+    fn core_dm_converts_field_for_field() {
+        let dm = SidebarDm::from(velella_core::SidebarDm {
+            id: 5,
+            name: "d".into(),
+            icon_url: None,
+            unread: true,
+            mention_count: 2,
+            status: Some(velella_core::PresenceStatus::DoNotDisturb),
+        });
+        assert_eq!((dm.id, dm.unread, dm.mention_count), (5, true, 2));
+        assert!(matches!(dm.status, Some(SidebarStatus::DoNotDisturb)));
     }
 
     #[test]

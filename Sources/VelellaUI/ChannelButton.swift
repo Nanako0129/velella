@@ -21,6 +21,7 @@ struct ChannelButton: View {
     @State private var hovered = false
 
     private var showsUnreadDot: Bool { channel.isUnread && !channel.isMuted }
+    private var showsMentions: Bool { channel.mentionCount > 0 && !channel.isMuted }
 
     var body: some View {
         Button(action: onSelect) {
@@ -45,7 +46,10 @@ struct ChannelButton: View {
 
                 Spacer(minLength: 0)
 
-                if showsUnreadDot {
+                if showsMentions {
+                    MentionBadge(count: channel.mentionCount)
+                        .padding(.leading, T.Size.channelBadgeGap)
+                } else if showsUnreadDot {
                     Circle().fill(T.Palette.unread)
                         .frame(width: T.Size.channelUnreadDot, height: T.Size.channelUnreadDot)
                         .padding(.leading, T.Size.channelBadgeGap)
@@ -137,7 +141,7 @@ struct DiscordChannelButton: ButtonStyle {
 
 #Preview("Channel buttons") {
     VStack(spacing: 0) {
-        ChannelButton(channel: ChannelItem(id: "1", name: "general", isUnread: true), isSelected: false) {}
+        ChannelButton(channel: ChannelItem(id: "1", name: "general", isUnread: true, mentionCount: 3), isSelected: false) {}
         ChannelButton(channel: ChannelItem(id: "2", name: "random"), isSelected: true) {}
         ChannelButton(channel: ChannelItem(id: "3", name: "noise", isMuted: true), isSelected: false) {}
         ChannelButton(channel: ChannelItem(id: "4", name: "mods", isPrivate: true), isSelected: false) {}

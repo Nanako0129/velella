@@ -24,10 +24,7 @@ struct ServerRail: View {
                         ) { selection = dm.id }
                         Divider().frame(width: T.Size.railDivider)
                     case .guild(let guild):
-                        ServerButton(
-                            selected: selection == guild.id, name: guild.name, icon: guild.icon,
-                            hasUnread: guild.hasUnread, mentionCount: guild.mentionCount
-                        ) { selection = guild.id }
+                        ServerButton(guild: guild, selected: selection == guild.id) { selection = guild.id }
                     case .folder(let folder):
                         ServerFolder(folder: folder, selectedID: $selection)
                     }

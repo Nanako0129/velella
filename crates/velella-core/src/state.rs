@@ -2,7 +2,13 @@
 //! Concord's parsers (refs/concord/src/discord/gateway/parser/{ready,guilds,channels,
 //! user_settings}.rs and state.rs `ready_users`, GPL-3.0-only; see THIRD_PARTY_NOTICES.md).
 //! Parsing is deliberately lenient: a malformed or unknown piece is skipped, never fatal.
+use crate::guild_settings::NotifySettings;
 use crate::permissions;
+use crate::presence::Presence;
+use crate::read_state::ReadStates;
+use crate::relationships::Relationships;
+use crate::threads::Threads;
+use crate::voice::VoiceStates;
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -109,18 +115,26 @@ pub struct State {
     pub guild_folders: Option<Vec<GuildFolder>>,
     /// Written by `SessionHandle::set_member_subscription` under the state lock; kept across READY.
     pub member_sub: Option<MemberSub>,
+    /// Slice D: unread and mention state, mutes, voice occupants, DM presence, pending friend
+    /// requests and joined threads. All rebuilt by READY.
+    pub read: ReadStates,
+    pub settings: NotifySettings,
+    pub voice: VoiceStates,
+    pub presence: Presence,
+    pub relationships: Relationships,
+    pub threads: Threads,
 }
 
-fn id(v: &Value) -> Option<u64> {
+pub(crate) fn id(v: &Value) -> Option<u64> {
     v.as_str()
         .and_then(|s| s.parse().ok())
         .or_else(|| v.as_u64())
         .filter(|n| *n != 0)
 }
-fn get_id(d: &Value, key: &str) -> Option<u64> {
+pub(crate) fn get_id(d: &Value, key: &str) -> Option<u64> {
     d.get(key).and_then(id)
 }
-fn get_str(d: &Value, key: &str) -> Option<String> {
+pub(crate) fn get_str(d: &Value, key: &str) -> Option<String> {
     d.get(key).and_then(Value::as_str).map(str::to_owned)
 }
 /// Permission bitfields are strings on the wire; numbers are accepted too.
@@ -129,7 +143,7 @@ fn bits(v: &Value) -> Option<u64> {
         .and_then(|s| s.parse().ok())
         .or_else(|| v.as_u64())
 }
-fn ids(v: Option<&Value>) -> Vec<u64> {
+pub(crate) fn ids(v: Option<&Value>) -> Vec<u64> {
     v.and_then(Value::as_array)
         .map(|a| a.iter().filter_map(id).collect())
         .unwrap_or_default()
@@ -140,7 +154,7 @@ fn guild_field<'a>(d: &'a Value, key: &str) -> Option<&'a Value> {
         .or_else(|| d.get("properties").and_then(|p| p.get(key)))
 }
 
-fn parse_user(v: &Value) -> Option<User> {
+pub(crate) fn parse_user(v: &Value) -> Option<User> {
     Some(User {
         id: get_id(v, "id")?,
         username: get_str(v, "username").unwrap_or_default(),
@@ -343,6 +357,19 @@ impl State {
             "GUILD_ROLE_CREATE" | "GUILD_ROLE_UPDATE" => self.role_upsert(d),
             "GUILD_ROLE_DELETE" => self.role_delete(d),
             "GUILD_MEMBER_UPDATE" => self.self_member_update(d),
+            "MESSAGE_CREATE" => self.message_create(d),
+            "MESSAGE_ACK" => self.message_ack(d),
+            "CHANNEL_UNREAD_UPDATE" => self.channel_unread_update(d),
+            "USER_GUILD_SETTINGS_UPDATE" => self.settings.update(d),
+            "VOICE_STATE_UPDATE" => self.voice_update(d, None),
+            "PRESENCE_UPDATE" => self.presence_update(d),
+            "RELATIONSHIP_ADD" => self.relationships.add(d),
+            "RELATIONSHIP_REMOVE" => self.relationships.remove(d),
+            "THREAD_CREATE" | "THREAD_UPDATE" => self.threads.upsert_event(d),
+            "THREAD_DELETE" => self.threads.delete(d),
+            "THREAD_LIST_SYNC" => self.threads.list_sync(d),
+            "THREAD_MEMBER_UPDATE" => self.threads.member_update(d, self.user_id),
+            "THREAD_MEMBERS_UPDATE" => self.threads.members_update(d, self.user_id),
             _ => false,
         };
         if changed {
@@ -397,7 +424,9 @@ impl State {
             {
                 guild.member_roles = Some(roles);
             }
+            let gid = guild.id;
             self.guilds.push(guild);
+            self.guild_extras(raw, gid, false);
         }
         for raw in d
             .get("private_channels")
@@ -407,6 +436,9 @@ impl State {
         {
             self.upsert_private(raw);
         }
+        self.read.sync(d);
+        self.settings.sync(d);
+        self.relationships.sync(d);
         self.guild_folders = parse_folders(d);
         if self.guild_folders.is_none() {
             tracing::warn!("READY carried no user_settings.guild_folders; guild order falls back to READY order");
@@ -443,6 +475,18 @@ impl State {
                 changed = true;
             }
         }
+        // Voice occupants (and threads, when present) per guild; the roles loop above skips a guild
+        // without a usable merged member, so this walks the guilds again on their own.
+        for raw in d
+            .get("guilds")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(gid) = get_id(raw, "id") {
+                changed |= self.guild_extras(raw, gid, false);
+            }
+        }
         for raw in d
             .get("lazy_private_channels")
             .and_then(Value::as_array)
@@ -450,6 +494,29 @@ impl State {
             .flatten()
         {
             changed |= self.upsert_private(raw);
+        }
+        // After the private channels: presences are kept only for people the sidebar can show.
+        changed |= self.merged_presences(d);
+        changed
+    }
+
+    /// Voice states and threads carried by a guild object (READY, READY_SUPPLEMENTAL,
+    /// GUILD_CREATE). `replace` makes the payload the guild's whole truth (GUILD_CREATE).
+    fn guild_extras(&mut self, raw: &Value, gid: u64, replace: bool) -> bool {
+        let mut changed = false;
+        if replace {
+            changed |= self.voice.clear_guild(gid);
+        }
+        for v in raw
+            .get("voice_states")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            changed |= self.voice_update(v, Some(gid));
+        }
+        if let Some(threads) = raw.get("threads").and_then(Value::as_array) {
+            changed |= self.threads.guild_payload(gid, threads, replace);
         }
         changed
     }
@@ -466,7 +533,14 @@ impl State {
             .iter_mut()
             .find(|c| c.id == channel.id)
         {
-            Some(slot) => *slot = channel,
+            Some(slot) => {
+                // A payload without `last_message_id` must not forget what MESSAGE_CREATE raised.
+                let last = channel.last_message_id.max(slot.last_message_id);
+                *slot = PrivateChannel {
+                    last_message_id: last,
+                    ..channel
+                };
+            }
             None => self.private_channels.push(channel),
         }
         true
@@ -476,6 +550,7 @@ impl State {
         let Some(mut guild) = parse_guild(d, self.user_id) else {
             return false;
         };
+        let gid = guild.id;
         match self.guilds.iter_mut().find(|g| g.id == guild.id) {
             Some(slot) => {
                 // Same position and origin as before; keep a known own-member if this lacks one.
@@ -488,6 +563,7 @@ impl State {
                 self.guilds.push(guild);
             }
         }
+        self.guild_extras(d, gid, true);
         true
     }
 
@@ -525,6 +601,8 @@ impl State {
                 .map(|g| g.unavailable = true)
                 .is_some();
         }
+        self.voice.clear_guild(gid);
+        self.threads.remove_guild(gid);
         let before = self.guilds.len();
         self.guilds.retain(|g| g.id != gid);
         self.guilds.len() != before
@@ -541,7 +619,13 @@ impl State {
             return false;
         };
         match guild.channels.iter_mut().find(|c| c.id == channel.id) {
-            Some(slot) => *slot = channel,
+            Some(slot) => {
+                let last = channel.last_message_id.max(slot.last_message_id);
+                *slot = Channel {
+                    last_message_id: last,
+                    ..channel
+                };
+            }
             None => guild.channels.push(channel),
         }
         true

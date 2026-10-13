@@ -25,18 +25,22 @@ struct ServerFolder: View {
             }
             .buttonStyle(ServerFolderButtonStyle(
                 open: open, color: Color(folder.color),
-                guilds: Array(folder.children.prefix(4)), hovered: hovered
+                guilds: Array(folder.children.prefix(4)), hovered: hovered,
+                mentionCount: folder.mentionCount
             ))
             .onHover { hovered = $0 }
             .help(folder.name ?? "Folder")
             .frame(width: T.Size.railWidth)
+            // A closed folder summarises its servers: their mentions summed, and the unread dot.
+            .overlay(alignment: .leading) {
+                RailIndicator(height: T.Size.indicatorRestHeight, visible: !open && folder.hasUnread)
+            }
+            .accessibilityLabel(!open && folder.mentionCount > 0
+                ? "\(folder.name ?? "Folder"), \(folder.mentionCount) mentions" : (folder.name ?? "Folder"))
 
             if open {
                 ForEach(folder.children) { guild in
-                    ServerButton(
-                        selected: selectedID == guild.id, name: guild.name, icon: guild.icon,
-                        hasUnread: guild.hasUnread, mentionCount: guild.mentionCount
-                    ) { selectedID = guild.id }
+                    ServerButton(guild: guild, selected: selectedID == guild.id) { selectedID = guild.id }
                     .transition(.move(edge: .top).combined(with: .opacity))
                 }
             }
@@ -59,6 +63,7 @@ struct ServerFolderButtonStyle: ButtonStyle {
     let color: Color
     let guilds: [RailGuild]
     let hovered: Bool
+    var mentionCount = 0
 
     func makeBody(configuration: Configuration) -> some View {
         ZStack {
@@ -89,6 +94,7 @@ struct ServerFolderButtonStyle: ButtonStyle {
             : color.opacity(hovered ? T.Palette.folderTintHover : T.Palette.folderTintIdle)
         )
         .clipShape(RoundedRectangle(cornerRadius: T.Radius.railIcon, style: .continuous))
+        .mentionBadge(open ? 0 : mentionCount)
         .offset(y: configuration.isPressed ? 1 : 0)
         .animation(.none, value: configuration.isPressed)
         .animation(T.Motion.railSpring, value: hovered)

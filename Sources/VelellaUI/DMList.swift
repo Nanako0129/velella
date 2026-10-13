@@ -58,6 +58,7 @@ struct DMRow: View {
                 VStack(alignment: .leading, spacing: 0) {
                     HStack(spacing: T.Spacing.xs) {
                         Text(dm.name).displayNameStyle(dm.displayNameStyle).lineLimit(1)
+                            .fontWeight(dm.unread ? .semibold : nil)
                         if let tag = dm.serverTag {
                             Text(tag)
                                 .font(T.Typography.dmTag)
@@ -71,8 +72,14 @@ struct DMRow: View {
                     }
                 }
                 Spacer(minLength: 0)
+                if dm.mentionCount > 0 {
+                    MentionBadge(count: dm.mentionCount)
+                } else if dm.unread {
+                    Circle().fill(T.Palette.unread)
+                        .frame(width: T.Size.channelUnreadDot, height: T.Size.channelUnreadDot)
+                }
             }
-            .foregroundStyle(isSelected ? T.Palette.unread : T.Palette.readChannel)
+            .foregroundStyle(isSelected || dm.unread ? T.Palette.unread : T.Palette.readChannel)
             .padding(.leading, T.Size.dmAvatarLeading)
             .padding(.trailing, T.Size.channelTrailing)
             .frame(height: T.Size.dmRowHeight)
