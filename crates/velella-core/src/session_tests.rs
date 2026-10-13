@@ -1229,13 +1229,21 @@ mod messages_live {
 
     async fn open_general(
         rig: &mut Rig,
-    ) -> (Conn, mpsc::UnboundedReceiver<MessagesSnapshot>, MessageSubscription) {
+    ) -> (
+        Conn,
+        mpsc::UnboundedReceiver<MessagesSnapshot>,
+        MessageSubscription,
+    ) {
         let mut conn = rig.ready(30_000, "wss://gateway-resume.discord.gg/").await;
-        conn.send(dispatch(2, "GUILD_CREATE", json!({
-            "id": "10", "name": "g", "owner_id": "1",
-            "roles": [{"id": "10", "permissions": "1024", "position": 0}],
-            "channels": [{"id": "20", "type": 0, "name": "general"}],
-        })))
+        conn.send(dispatch(
+            2,
+            "GUILD_CREATE",
+            json!({
+                "id": "10", "name": "g", "owner_id": "1",
+                "roles": [{"id": "10", "permissions": "1024", "position": 0}],
+                "channels": [{"id": "20", "type": 0, "name": "general"}],
+            }),
+        ))
         .await;
         let mut revision = rig.handle.state();
         timeout(WAIT, revision.wait_for(|r| *r >= 2))
@@ -1263,7 +1271,11 @@ mod messages_live {
             .unwrap();
         let s = until(&mut rx, |s| s.rows.last().is_some_and(|r| !r.pending)).await;
         assert_eq!(s.rows.last().unwrap().failure, Some("Not sent"));
-        let posts = mock.requests().into_iter().filter(|r| r.starts_with("POST")).count();
+        let posts = mock
+            .requests()
+            .into_iter()
+            .filter(|r| r.starts_with("POST"))
+            .count();
         assert_eq!(posts, 1, "the POST was retried");
     }
 

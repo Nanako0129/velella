@@ -351,7 +351,9 @@ fn dm_order_names_and_icons() {
         // These DMs have a last_message_id (or none) and no read state: unread; 1:1 DMs offline.
         unread: ![502, 505].contains(&id),
         mention_count: 0,
-        status: [500, 503, 504].contains(&id).then_some(crate::PresenceStatus::Offline),
+        status: [500, 503, 504]
+            .contains(&id)
+            .then_some(crate::PresenceStatus::Offline),
     };
     assert_eq!(
         dm_list(&s),

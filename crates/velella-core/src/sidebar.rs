@@ -261,9 +261,8 @@ fn sidebar_channel(state: &State, guild: &Guild, c: &Channel, now: i64) -> Sideb
                         .or_else(|| u.map(display_name))
                         .unwrap_or("Unknown user")
                         .to_owned(),
-                    icon_url: u.map(|u| {
-                        avatar_url(u.id, u.avatar.as_deref(), u.discriminator.as_deref())
-                    }),
+                    icon_url: u
+                        .map(|u| avatar_url(u.id, u.avatar.as_deref(), u.discriminator.as_deref())),
                 }
             })
             .collect(),

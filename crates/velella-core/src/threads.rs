@@ -39,7 +39,10 @@ fn parse(v: &Value, default_guild: Option<u64>) -> Option<Thread> {
             .and_then(Value::as_bool)
             .unwrap_or(false),
         last_message_id: get_id(v, "last_message_id"),
-        joined: v.get("member").or_else(|| v.get("thread_member")).is_some_and(Value::is_object),
+        joined: v
+            .get("member")
+            .or_else(|| v.get("thread_member"))
+            .is_some_and(Value::is_object),
     })
 }
 
@@ -135,11 +138,15 @@ impl Threads {
             .get("channel_ids")
             .and_then(Value::as_array)
             .map(|a| a.iter().filter_map(id).collect());
-        let members: Option<Vec<u64>> = d
-            .get("members")
-            .and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(|m| get_id(m, "id").or_else(|| get_id(m, "thread_id"))).collect());
-        let threads: Vec<Thread> = listed.iter().filter_map(|v| parse(v, Some(guild))).collect();
+        let members: Option<Vec<u64>> = d.get("members").and_then(Value::as_array).map(|a| {
+            a.iter()
+                .filter_map(|m| get_id(m, "id").or_else(|| get_id(m, "thread_id")))
+                .collect()
+        });
+        let threads: Vec<Thread> = listed
+            .iter()
+            .filter_map(|v| parse(v, Some(guild)))
+            .collect();
         let mut changed = false;
         let before = self.0.len();
         self.0.retain(|t| {

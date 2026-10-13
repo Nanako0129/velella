@@ -70,8 +70,11 @@ impl State {
             return false;
         };
         let member = v.get("member");
-        let user = get_id(v, "user_id")
-            .or_else(|| member.and_then(|m| m.get("user")).and_then(|u| get_id(u, "id")));
+        let user = get_id(v, "user_id").or_else(|| {
+            member
+                .and_then(|m| m.get("user"))
+                .and_then(|u| get_id(u, "id"))
+        });
         let Some(user) = user else {
             return false;
         };

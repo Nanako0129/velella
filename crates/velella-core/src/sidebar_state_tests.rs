@@ -371,13 +371,20 @@ fn supplemental_voice() -> Value {
 }
 
 fn occupants(s: &State) -> Vec<(u64, String)> {
-    item(s, 12).occupants.into_iter().map(|o| (o.id, o.name)).collect()
+    item(s, 12)
+        .occupants
+        .into_iter()
+        .map(|o| (o.id, o.name))
+        .collect()
 }
 
 #[test]
 fn occupants_come_from_ready_supplemental_only() {
     let mut s = world(json!({}));
-    assert!(occupants(&s).is_empty(), "READY carries no voice states here");
+    assert!(
+        occupants(&s).is_empty(),
+        "READY carries no voice states here"
+    );
     assert!(s.apply("READY_SUPPLEMENTAL", &supplemental_voice()));
     // Nickname first, then the user directory.
     assert_eq!(occupants(&s), vec![(2, "Alicia".into()), (3, "bob".into())]);
@@ -392,7 +399,10 @@ fn voice_join_and_leave() {
     let leave = json!({"guild_id": "100", "user_id": "3", "channel_id": null});
     assert!(s.apply("VOICE_STATE_UPDATE", &leave));
     assert_eq!(occupants(&s), vec![(2, "Alicia".into())]);
-    assert!(!s.apply("VOICE_STATE_UPDATE", &leave), "leaving twice changes nothing");
+    assert!(
+        !s.apply("VOICE_STATE_UPDATE", &leave),
+        "leaving twice changes nothing"
+    );
     let join = json!({"guild_id": "100", "user_id": "1", "channel_id": "12",
         "member": {"nick": null, "user": {"id": "1", "username": "me"}}});
     assert!(s.apply("VOICE_STATE_UPDATE", &join));
@@ -428,10 +438,17 @@ fn threads_show_only_when_active_joined_and_visible() {
         &json!({"guild_id": "100", "threads": [
             thread(20, 10, false), thread(30, 10, false), thread(31, 10, false)]}),
     );
-    assert_eq!(threads(&s, 10), vec![20], "an absent members array keeps what READY said");
+    assert_eq!(
+        threads(&s, 10),
+        vec![20],
+        "an absent members array keeps what READY said"
+    );
     // A sync lists the guild's whole active set, so a joined thread it omits is gone.
     s.apply("THREAD_CREATE", &thread(32, 10, false));
-    s.apply("THREAD_MEMBER_UPDATE", &json!({"id": "32", "guild_id": "100"}));
+    s.apply(
+        "THREAD_MEMBER_UPDATE",
+        &json!({"id": "32", "guild_id": "100"}),
+    );
     assert_eq!(threads(&s, 10), vec![32, 20]);
     s.apply(
         "THREAD_LIST_SYNC",
@@ -440,7 +457,10 @@ fn threads_show_only_when_active_joined_and_visible() {
     );
     assert_eq!(threads(&s, 10), vec![20], "thread 32 left the active set");
     // THREAD_MEMBER_UPDATE adds the user.
-    assert!(s.apply("THREAD_MEMBER_UPDATE", &json!({"id": "30", "guild_id": "100", "user_id": "1"})));
+    assert!(s.apply(
+        "THREAD_MEMBER_UPDATE",
+        &json!({"id": "30", "guild_id": "100", "user_id": "1"})
+    ));
     assert_eq!(threads(&s, 10), vec![30, 20], "most recent activity first");
     // THREAD_MEMBERS_UPDATE adds and removes the user too.
     s.apply(
@@ -465,8 +485,15 @@ fn threads_show_only_when_active_joined_and_visible() {
     s.apply("THREAD_UPDATE", &thread(30, 10, true));
     assert!(threads(&s, 10).is_empty());
     s.apply("THREAD_UPDATE", &thread(30, 10, false));
-    assert_eq!(threads(&s, 10), vec![30], "THREAD_UPDATE keeps the joined flag");
-    s.apply("THREAD_DELETE", &json!({"id": "30", "guild_id": "100", "parent_id": "10"}));
+    assert_eq!(
+        threads(&s, 10),
+        vec![30],
+        "THREAD_UPDATE keeps the joined flag"
+    );
+    s.apply(
+        "THREAD_DELETE",
+        &json!({"id": "30", "guild_id": "100", "parent_id": "10"}),
+    );
     assert!(threads(&s, 10).is_empty());
 }
 
@@ -501,7 +528,11 @@ fn thread_unread_follows_the_same_rules() {
 #[test]
 fn presence_comes_from_ready_supplemental_then_presence_update() {
     let mut s = world(json!({}));
-    assert_eq!(dm(&s, 500).status, Some(PresenceStatus::Offline), "none known yet");
+    assert_eq!(
+        dm(&s, 500).status,
+        Some(PresenceStatus::Offline),
+        "none known yet"
+    );
     assert_eq!(dm(&s, 501).status, None, "group DMs carry none");
     assert!(s.apply(
         "READY_SUPPLEMENTAL",
@@ -516,10 +547,16 @@ fn presence_comes_from_ready_supplemental_then_presence_update() {
         &json!({"user": {"id": "2"}, "status": "dnd", "guild_id": "100"})
     ));
     assert_eq!(dm(&s, 500).status, Some(PresenceStatus::DoNotDisturb));
-    s.apply("PRESENCE_UPDATE", &json!({"user": {"id": "2"}, "status": "invisible"}));
+    s.apply(
+        "PRESENCE_UPDATE",
+        &json!({"user": {"id": "2"}, "status": "invisible"}),
+    );
     assert_eq!(dm(&s, 500).status, Some(PresenceStatus::Offline));
     // Guild members who are not DM recipients are not tracked.
-    assert!(!s.apply("PRESENCE_UPDATE", &json!({"user": {"id": "77"}, "status": "online"})));
+    assert!(!s.apply(
+        "PRESENCE_UPDATE",
+        &json!({"user": {"id": "77"}, "status": "online"})
+    ));
 }
 
 #[test]
@@ -527,7 +564,10 @@ fn friends_count_adds_and_removes() {
     let mut s = world(json!({"relationships": [
         {"id": "7", "type": 3}, {"id": "8", "type": 1}, {"user": {"id": "9"}, "type": 3}]}));
     assert_eq!(s.friends_pending(), 2);
-    assert!(s.apply("RELATIONSHIP_ADD", &json!({"id": "10", "type": 3, "user": {"id": "10"}})));
+    assert!(s.apply(
+        "RELATIONSHIP_ADD",
+        &json!({"id": "10", "type": 3, "user": {"id": "10"}})
+    ));
     assert_eq!(s.friends_pending(), 3);
     assert!(s.apply("RELATIONSHIP_REMOVE", &json!({"id": "7", "type": 3})));
     assert_eq!(s.friends_pending(), 2);
@@ -550,12 +590,24 @@ fn muted_group_dm_plain_message_adds_none_and_a_direct_mention_still_counts() {
     s.apply("MESSAGE_CREATE", &msg(310, 501, None, 2));
     let d = dm(&s, 501);
     assert!(!d.unread && d.mention_count == 0, "muted: no badge");
-    assert_eq!(s.read.status(501, Some(310)), (true, 0), "and none recorded");
+    assert_eq!(
+        s.read.status(501, Some(310)),
+        (true, 0),
+        "and none recorded"
+    );
     let mut direct = msg(311, 501, None, 3);
     direct["mentions"] = json!([{"id": "1"}]);
     s.apply("MESSAGE_CREATE", &direct);
-    assert_eq!(s.read.status(501, Some(311)), (true, 1), "a direct mention still counts");
-    assert_eq!(dm(&s, 501).mention_count, 0, "though a muted DM shows nothing");
+    assert_eq!(
+        s.read.status(501, Some(311)),
+        (true, 1),
+        "a direct mention still counts"
+    );
+    assert_eq!(
+        dm(&s, 501).mention_count,
+        0,
+        "though a muted DM shows nothing"
+    );
     // The unmuted DM still counts a plain message.
     s.apply("MESSAGE_CREATE", &msg(312, 500, None, 2));
     assert_eq!(dm(&s, 500).mention_count, 1);
@@ -581,7 +633,9 @@ fn muted_dm_is_excluded_from_the_rail_dm_sum() {
         "USER_GUILD_SETTINGS_UPDATE",
         &json!({"guild_id": "@me", "muted": true, "channel_overrides": [], "version": 4}),
     );
-    assert!(dm_list(&s).iter().all(|d| !d.unread && d.mention_count == 0));
+    assert!(dm_list(&s)
+        .iter()
+        .all(|d| !d.unread && d.mention_count == 0));
 }
 
 #[test]
@@ -598,7 +652,10 @@ fn channel_upsert_keeps_the_newest_message_id() {
     let mut s = world(all_read());
     s.apply("MESSAGE_CREATE", &msg(260, 11, Some(100), 2));
     // A CHANNEL_UPDATE without last_message_id must not forget it.
-    s.apply("CHANNEL_UPDATE", &ch(11, 0, "random", 1, None).tap_guild(100));
+    s.apply(
+        "CHANNEL_UPDATE",
+        &ch(11, 0, "random", 1, None).tap_guild(100),
+    );
     assert!(item(&s, 11).unread);
 }
 
@@ -620,13 +677,22 @@ fn only_an_everyone_deny_makes_a_lock() {
             "permission_overwrites": overwrites})
     };
     // A role the user lacks denying VIEW_CHANNEL is not a lock.
-    s.apply("CHANNEL_UPDATE", &with(json!([{"id": "777", "type": 0, "allow": "0", "deny": VIEW}])));
+    s.apply(
+        "CHANNEL_UPDATE",
+        &with(json!([{"id": "777", "type": 0, "allow": "0", "deny": VIEW}])),
+    );
     assert!(!item(&s, 11).private, "role deny");
     // @everyone explicitly allowed is not a lock.
-    s.apply("CHANNEL_UPDATE", &with(json!([{"id": "100", "type": 0, "allow": VIEW, "deny": "0"}])));
+    s.apply(
+        "CHANNEL_UPDATE",
+        &with(json!([{"id": "100", "type": 0, "allow": VIEW, "deny": "0"}])),
+    );
     assert!(!item(&s, 11).private, "everyone allow");
     // A member overwrite whose id happens to equal the guild id is not the @everyone role.
-    s.apply("CHANNEL_UPDATE", &with(json!([{"id": "100", "type": 1, "allow": "0", "deny": VIEW}])));
+    s.apply(
+        "CHANNEL_UPDATE",
+        &with(json!([{"id": "100", "type": 1, "allow": "0", "deny": VIEW}])),
+    );
     assert!(!item(&s, 11).private, "member overwrite");
 }
 
@@ -636,7 +702,10 @@ fn a_dm_update_without_last_message_id_keeps_it() {
     s.apply("MESSAGE_CREATE", &msg(310, 500, None, 2));
     assert!(dm(&s, 500).unread);
     // A private CHANNEL_UPDATE that omits last_message_id must not forget the newer one.
-    s.apply("CHANNEL_UPDATE", &json!({"id": "500", "type": 1, "recipient_ids": ["2"]}));
+    s.apply(
+        "CHANNEL_UPDATE",
+        &json!({"id": "500", "type": 1, "recipient_ids": ["2"]}),
+    );
     assert!(dm(&s, 500).unread);
 }
 

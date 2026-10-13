@@ -39,11 +39,11 @@ pub use member_list::{member_sections, MemberListEntry, MemberListSection, Membe
 pub use messages::{
     LoadState, MessageImage, MessageReply, MessageRow, MessageSubscription, MessagesSnapshot,
 };
-pub use session::{Session, SessionEvent, SessionHandle, Subscription};
 pub use presence::PresenceStatus;
+pub use session::{Session, SessionEvent, SessionHandle, Subscription};
 pub use sidebar::{
-    channel_categories, dm_list, guild_entries, SidebarCategory, SidebarChannel,
-    SidebarDm, SidebarEntry, SidebarGuild, SidebarOccupant, SidebarThread,
+    channel_categories, dm_list, guild_entries, SidebarCategory, SidebarChannel, SidebarDm,
+    SidebarEntry, SidebarGuild, SidebarOccupant, SidebarThread,
 };
 pub use state::{
     Channel, Guild, GuildFolder, MemberSub, Overwrite, PrivateChannel, Role, State, User,

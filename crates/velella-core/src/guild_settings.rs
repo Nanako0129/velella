@@ -162,7 +162,9 @@ fn parse_rfc3339_ms(s: &str) -> Option<i64> {
     let mut frac_ms = 0;
     if b.get(i) == Some(&b'.') {
         let digits = b[i + 1..].iter().take_while(|c| c.is_ascii_digit()).count();
-        frac_ms = format!("{:0<3}", &s[i + 1..i + 1 + digits.min(3)]).parse().ok()?;
+        frac_ms = format!("{:0<3}", &s[i + 1..i + 1 + digits.min(3)])
+            .parse()
+            .ok()?;
         i += 1 + digits;
     }
     let offset_s = match b.get(i)? {
@@ -217,8 +219,14 @@ mod tests {
         // 2000-03-01 is day 11017 since the epoch (a leap-year boundary).
         let utc = parse_rfc3339_ms("2000-03-01T00:00:00.000000+00:00");
         assert_eq!(utc, Some(951_868_800_000));
-        assert_eq!(parse_rfc3339_ms("2000-03-01T01:00:00.5+01:00"), Some(951_868_800_500));
-        assert_eq!(parse_rfc3339_ms("2000-02-29T23:00:00-01:00"), Some(951_868_800_000));
+        assert_eq!(
+            parse_rfc3339_ms("2000-03-01T01:00:00.5+01:00"),
+            Some(951_868_800_500)
+        );
+        assert_eq!(
+            parse_rfc3339_ms("2000-02-29T23:00:00-01:00"),
+            Some(951_868_800_000)
+        );
         assert_eq!(parse_rfc3339_ms("not a time"), None);
     }
 }
