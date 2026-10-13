@@ -442,3 +442,171 @@ async fn wss_dial_builds_the_tls_stack_and_fails_cleanly_against_a_non_tls_peer(
     .await;
     assert!(matches!(dialed, Ok(Err(_))), "expected a handshake error");
 }
+
+// ---- Sidebar subscriptions (through the same mock gateway) ----
+
+mod subscriptions {
+    use super::*;
+    use crate::sidebar_tests::{ch, guild, hidden, ready as world};
+    use crate::{channel_categories, guild_entries, SidebarEntry, Subscription};
+
+    const SETTLE: Duration = Duration::from_millis(300);
+
+    /// Subscribes `compute`, forwarding every delivery to the returned channel.
+    fn watch<T: PartialEq + Clone + Send + 'static>(
+        rig: &Rig,
+        compute: impl Fn(&crate::State) -> T + Send + 'static,
+    ) -> (Subscription, mpsc::UnboundedReceiver<T>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let sub = rig.handle.subscribe(compute, move |v| {
+            let _ = tx.send(v);
+        });
+        (sub, rx)
+    }
+
+    async fn next<T>(rx: &mut mpsc::UnboundedReceiver<T>) -> T {
+        timeout(WAIT, rx.recv())
+            .await
+            .expect("no delivery")
+            .expect("subscription ended")
+    }
+
+    async fn silent<T>(rx: &mut mpsc::UnboundedReceiver<T>) -> bool {
+        timeout(SETTLE, rx.recv()).await.is_err()
+    }
+
+    /// Accepts the connection, answers HELLO and IDENTIFY, and sends this READY.
+    async fn send_ready(rig: &mut Rig, d: Value) -> Conn {
+        let mut conn = Conn::accept(&rig.initial).await;
+        conn.hello(30_000).await;
+        assert_eq!(conn.recv().await["op"], 2);
+        conn.send(json!({"op": 0, "t": "READY", "s": 1, "d": d}))
+            .await;
+        assert!(matches!(rig.event().await, SessionEvent::Ready { .. }));
+        conn
+    }
+
+    fn dispatch(seq: u64, t: &str, d: Value) -> Value {
+        json!({"op": 0, "t": t, "s": seq, "d": d})
+    }
+
+    fn in_guild(mut channel: Value, guild_id: u64) -> Value {
+        channel["guild_id"] = json!(guild_id.to_string());
+        channel
+    }
+
+    fn two_guilds() -> Value {
+        world(
+            vec![
+                guild(
+                    10,
+                    vec![ch(20, 0, "general", 0, None), ch(21, 0, "extra", 1, None)],
+                ),
+                guild(11, vec![ch(30, 0, "other", 0, None)]),
+            ],
+            Value::Null,
+            json!([]),
+            vec![],
+        )
+    }
+
+    fn names(cats: &[crate::SidebarCategory]) -> Vec<String> {
+        cats.iter()
+            .flat_map(|c| c.channels.iter().map(|c| c.name.clone()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn subscribing_before_ready_gets_the_empty_snapshot_then_the_ready_one() {
+        let mut rig = Rig::start().await;
+        let (_sub, mut rx) = watch(&rig, guild_entries);
+        assert_eq!(next(&mut rx).await, vec![]);
+        let _conn = send_ready(&mut rig, two_guilds()).await;
+        let after = next(&mut rx).await;
+        assert_eq!(after.len(), 2);
+        assert!(matches!(&after[0], SidebarEntry::Guild(g) if g.id == 10));
+    }
+
+    #[tokio::test]
+    async fn subscribing_after_ready_gets_the_current_snapshot_immediately() {
+        let mut rig = Rig::start().await;
+        let _conn = send_ready(&mut rig, two_guilds()).await;
+        let (_sub, mut rx) = watch(&rig, |s| channel_categories(s, 10));
+        assert_eq!(names(&next(&mut rx).await), vec!["general", "extra"]);
+        assert!(silent(&mut rx).await, "no repeat delivery");
+    }
+
+    #[tokio::test]
+    async fn an_overwrite_that_hides_a_channel_emits_a_snapshot_without_it() {
+        let mut rig = Rig::start().await;
+        let mut conn = send_ready(&mut rig, two_guilds()).await;
+        let (_sub, mut rx) = watch(&rig, |s| channel_categories(s, 10));
+        assert_eq!(names(&next(&mut rx).await), vec!["general", "extra"]);
+        let hide = in_guild(hidden(ch(21, 0, "extra", 1, None), 10), 10);
+        conn.send(dispatch(2, "CHANNEL_UPDATE", hide)).await;
+        assert_eq!(names(&next(&mut rx).await), vec!["general"]);
+    }
+
+    #[tokio::test]
+    async fn a_channel_create_in_another_guild_does_not_fire_and_one_here_does() {
+        let mut rig = Rig::start().await;
+        let mut conn = send_ready(&mut rig, two_guilds()).await;
+        let (_sub, mut rx) = watch(&rig, |s| channel_categories(s, 10));
+        next(&mut rx).await;
+        let mut revision = rig.handle.state();
+        let before = *revision.borrow_and_update();
+        let other = in_guild(ch(31, 0, "new-elsewhere", 5, None), 11);
+        conn.send(dispatch(2, "CHANNEL_CREATE", other)).await;
+        timeout(WAIT, revision.changed()).await.unwrap().unwrap();
+        assert!(*revision.borrow() > before, "the revision did move");
+        assert!(
+            silent(&mut rx).await,
+            "another guild's channel fired this subscription"
+        );
+        let mine = in_guild(ch(22, 0, "new-here", 5, None), 10);
+        conn.send(dispatch(3, "CHANNEL_CREATE", mine)).await;
+        assert_eq!(
+            names(&next(&mut rx).await),
+            vec!["general", "extra", "new-here"]
+        );
+    }
+
+    #[tokio::test]
+    async fn guild_delete_gives_an_empty_snapshot() {
+        let mut rig = Rig::start().await;
+        let mut conn = send_ready(&mut rig, two_guilds()).await;
+        let (_sub, mut rx) = watch(&rig, |s| channel_categories(s, 10));
+        assert!(!next(&mut rx).await.is_empty());
+        conn.send(dispatch(2, "GUILD_DELETE", json!({"id": "10"})))
+            .await;
+        assert!(next(&mut rx).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_dropped_subscription_stops_delivery() {
+        let mut rig = Rig::start().await;
+        let mut conn = send_ready(&mut rig, two_guilds()).await;
+        let (sub, mut rx) = watch(&rig, |s| channel_categories(s, 10));
+        next(&mut rx).await;
+        drop(sub);
+        let mut revision = rig.handle.state();
+        revision.borrow_and_update();
+        let mine = in_guild(ch(22, 0, "after-drop", 5, None), 10);
+        conn.send(dispatch(2, "CHANNEL_CREATE", mine)).await;
+        timeout(WAIT, revision.changed()).await.unwrap().unwrap();
+        // Aborting the task drops its deliver closure, which closes the channel: nothing arrives.
+        assert_eq!(timeout(WAIT, rx.recv()).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_subscription_ends_with_the_session() {
+        let mut rig = Rig::start().await;
+        let _conn = send_ready(&mut rig, two_guilds()).await;
+        let (_sub, mut rx) = watch(&rig, guild_entries);
+        next(&mut rx).await;
+        rig.handle.disconnect();
+        assert!(matches!(rig.event().await, SessionEvent::Closed { .. }));
+        // The handle is still alive, yet the driver has returned and dropped its closure.
+        assert_eq!(timeout(WAIT, rx.recv()).await.unwrap(), None);
+    }
+}

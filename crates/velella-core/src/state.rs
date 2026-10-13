@@ -78,6 +78,8 @@ pub struct PrivateChannel {
 pub struct GuildFolder {
     pub id: Option<u64>,
     pub name: Option<String>,
+    /// RGB integer (0xRRGGBB); `None` when null or absent.
+    pub color: Option<u32>,
     pub guild_ids: Vec<u64>,
 }
 
@@ -258,6 +260,10 @@ fn parse_folders(d: &Value) -> Option<Vec<GuildFolder>> {
                 (!guild_ids.is_empty()).then(|| GuildFolder {
                     id: get_id(f, "id"),
                     name: get_str(f, "name").filter(|n| !n.is_empty()),
+                    color: f
+                        .get("color")
+                        .and_then(Value::as_u64)
+                        .and_then(|c| u32::try_from(c).ok()),
                     guild_ids,
                 })
             })

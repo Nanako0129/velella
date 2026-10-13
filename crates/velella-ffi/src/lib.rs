@@ -104,6 +104,161 @@ impl SessionHandle {
     pub fn generation(&self) -> u64 {
         self.0.generation()
     }
+
+    /// Rail entries (guilds and folders in display order): the current snapshot at once, then
+    /// again whenever it changes. Dropping the returned object stops the deliveries.
+    pub fn subscribe_guilds(&self, listener: Arc<dyn GuildsListener>) -> Arc<SidebarSubscription> {
+        let _context = runtime().enter();
+        sidebar(
+            self.0
+                .subscribe(velella_core::guild_entries, move |entries| {
+                    listener.on_guilds(entries.into_iter().map(Into::into).collect())
+                }),
+        )
+    }
+
+    /// The channel list of one guild (empty while the guild is unknown or after it is deleted).
+    /// Every delivery names `guild_id`, so a late one from a dropped subscription can be told apart.
+    pub fn subscribe_channels(
+        &self,
+        guild_id: u64,
+        listener: Arc<dyn ChannelsListener>,
+    ) -> Arc<SidebarSubscription> {
+        let _context = runtime().enter();
+        sidebar(self.0.subscribe(
+            move |state| velella_core::channel_categories(state, guild_id),
+            move |categories| {
+                listener.on_channels(guild_id, categories.into_iter().map(Into::into).collect())
+            },
+        ))
+    }
+
+    pub fn subscribe_dms(&self, listener: Arc<dyn DmsListener>) -> Arc<SidebarSubscription> {
+        let _context = runtime().enter();
+        sidebar(self.0.subscribe(velella_core::dm_list, move |dms| {
+            listener.on_dms(dms.into_iter().map(Into::into).collect())
+        }))
+    }
+}
+
+/// Holds a core subscription; dropping it stops the deliveries.
+#[derive(uniffi::Object)]
+pub struct SidebarSubscription(#[allow(dead_code)] velella_core::Subscription);
+
+fn sidebar(subscription: velella_core::Subscription) -> Arc<SidebarSubscription> {
+    Arc::new(SidebarSubscription(subscription))
+}
+
+/// Sidebar callbacks run on a `velella-rt` thread and must not block.
+#[uniffi::export(with_foreign)]
+pub trait GuildsListener: Send + Sync {
+    fn on_guilds(&self, entries: Vec<SidebarEntry>);
+}
+
+#[uniffi::export(with_foreign)]
+pub trait ChannelsListener: Send + Sync {
+    fn on_channels(&self, guild_id: u64, categories: Vec<SidebarCategory>);
+}
+
+#[uniffi::export(with_foreign)]
+pub trait DmsListener: Send + Sync {
+    fn on_dms(&self, dms: Vec<SidebarDm>);
+}
+
+#[derive(uniffi::Record)]
+pub struct SidebarGuild {
+    pub id: u64,
+    pub name: String,
+    pub icon_url: Option<String>,
+}
+
+#[derive(uniffi::Enum)]
+pub enum SidebarEntry {
+    Guild(SidebarGuild),
+    Folder {
+        id: Option<u64>,
+        name: Option<String>,
+        color: Option<u32>,
+        guilds: Vec<SidebarGuild>,
+    },
+}
+
+#[derive(uniffi::Record)]
+pub struct SidebarChannel {
+    pub id: u64,
+    pub kind: u8,
+    pub name: String,
+}
+
+#[derive(uniffi::Record)]
+pub struct SidebarCategory {
+    pub id: Option<u64>,
+    pub name: Option<String>,
+    pub channels: Vec<SidebarChannel>,
+}
+
+#[derive(uniffi::Record)]
+pub struct SidebarDm {
+    pub id: u64,
+    pub name: String,
+    pub icon_url: Option<String>,
+}
+
+impl From<velella_core::SidebarGuild> for SidebarGuild {
+    fn from(g: velella_core::SidebarGuild) -> Self {
+        Self {
+            id: g.id,
+            name: g.name,
+            icon_url: g.icon_url,
+        }
+    }
+}
+
+impl From<velella_core::SidebarEntry> for SidebarEntry {
+    fn from(e: velella_core::SidebarEntry) -> Self {
+        match e {
+            velella_core::SidebarEntry::Guild(g) => Self::Guild(g.into()),
+            velella_core::SidebarEntry::Folder {
+                id,
+                name,
+                color,
+                guilds,
+            } => Self::Folder {
+                id,
+                name,
+                color,
+                guilds: guilds.into_iter().map(Into::into).collect(),
+            },
+        }
+    }
+}
+
+impl From<velella_core::SidebarCategory> for SidebarCategory {
+    fn from(c: velella_core::SidebarCategory) -> Self {
+        Self {
+            id: c.id,
+            name: c.name,
+            channels: c
+                .channels
+                .into_iter()
+                .map(|c| SidebarChannel {
+                    id: c.id,
+                    kind: c.kind,
+                    name: c.name,
+                })
+                .collect(),
+        }
+    }
+}
+
+impl From<velella_core::SidebarDm> for SidebarDm {
+    fn from(d: velella_core::SidebarDm) -> Self {
+        Self {
+            id: d.id,
+            name: d.name,
+            icon_url: d.icon_url,
+        }
+    }
 }
 
 /// Fixed text only: never carries (any part of) the rejected token.
@@ -194,6 +349,56 @@ mod tests {
             assert_eq!(err.to_string(), "invalid token");
             assert!(!format!("{err} {err:?}").contains("SYNTH"));
         }
+    }
+
+    /// Subscriptions need a live session, which needs a valid token (a real gateway dial), so
+    /// only the core-to-record conversion is exercised here; the driver is tested in velella-core.
+    #[test]
+    fn core_entries_convert_field_for_field() {
+        let guild = velella_core::SidebarGuild {
+            id: 1,
+            name: "g".into(),
+            icon_url: Some("u".into()),
+        };
+        let folder = velella_core::SidebarEntry::Folder {
+            id: Some(7),
+            name: None,
+            color: Some(0xff0000),
+            guilds: vec![guild.clone()],
+        };
+        match SidebarEntry::from(folder) {
+            SidebarEntry::Folder {
+                id: Some(7),
+                name: None,
+                color: Some(0xff0000),
+                guilds,
+            } => assert_eq!(
+                (guilds[0].id, guilds[0].icon_url.as_deref()),
+                (1, Some("u"))
+            ),
+            _ => panic!("folder did not convert"),
+        }
+        assert!(matches!(
+            SidebarEntry::from(velella_core::SidebarEntry::Guild(guild)),
+            SidebarEntry::Guild(SidebarGuild { id: 1, .. })
+        ));
+        let category = SidebarCategory::from(velella_core::SidebarCategory {
+            id: None,
+            name: None,
+            channels: vec![velella_core::SidebarChannel {
+                id: 2,
+                kind: 13,
+                name: "c".into(),
+            }],
+        });
+        assert_eq!(
+            (
+                category.id,
+                category.channels[0].kind,
+                &*category.channels[0].name
+            ),
+            (None, 13, "c")
+        );
     }
 
     #[test]

@@ -241,13 +241,14 @@ public struct DMEntry: Identifiable, Hashable, Sendable {
     public var id: String
     public var name: String
     public var avatar: Avatar
-    public var status: PresenceStatus
+    /// nil draws no presence dot (live DMs: presence is not wired yet).
+    public var status: PresenceStatus?
     /// Server-tag pill next to the name, e.g. "DEV".
     public var serverTag: String?
     /// Activity subtitle under the name, e.g. "Playing Placeholder Quest".
     public var activity: String?
     public var displayNameStyle: DisplayNameStyle?
-    public init(id: String, name: String, avatar: Avatar, status: PresenceStatus = .offline, serverTag: String? = nil, activity: String? = nil, displayNameStyle: DisplayNameStyle? = nil) {
+    public init(id: String, name: String, avatar: Avatar, status: PresenceStatus? = .offline, serverTag: String? = nil, activity: String? = nil, displayNameStyle: DisplayNameStyle? = nil) {
         self.id = id; self.name = name; self.avatar = avatar; self.status = status
         self.serverTag = serverTag; self.activity = activity; self.displayNameStyle = displayNameStyle
     }

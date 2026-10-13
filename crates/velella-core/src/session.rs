@@ -62,6 +62,8 @@ static GENERATION: AtomicU64 = AtomicU64::new(0);
 struct Shared {
     state: Mutex<Arc<State>>,
     revision: watch::Sender<u64>,
+    /// Set once the session task has returned (Closed or AuthFailed): no further mutations.
+    ended: watch::Sender<bool>,
 }
 
 impl Shared {
@@ -108,6 +110,46 @@ impl SessionHandle {
     pub fn snapshot(&self) -> Arc<State> {
         self.shared.snapshot()
     }
+
+    /// Runs `compute` on the current state now and after every revision change, calling `deliver`
+    /// with each result that differs from the last one delivered (the first always goes out, so
+    /// an empty pre-READY state is delivered too). Stops when the returned `Subscription` is
+    /// dropped or the session ends. Must be called inside a runtime context; `compute` and
+    /// `deliver` run on a runtime thread and must not block.
+    pub fn subscribe<T: PartialEq + Clone + Send + 'static>(
+        &self,
+        compute: impl Fn(&State) -> T + Send + 'static,
+        deliver: impl Fn(T) + Send + 'static,
+    ) -> Subscription {
+        let shared = self.shared.clone();
+        Subscription(tokio::spawn(async move {
+            let mut revision = shared.revision.subscribe();
+            let mut ended = shared.ended.subscribe();
+            let mut last: Option<T> = None;
+            loop {
+                // Mark the revision seen before reading, so a change in between is not lost.
+                revision.borrow_and_update();
+                let value = compute(&shared.snapshot());
+                if last.as_ref() != Some(&value) {
+                    last = Some(value.clone());
+                    deliver(value);
+                }
+                tokio::select! {
+                    changed = revision.changed() => if changed.is_err() { return },
+                    _ = ended.wait_for(|e| *e) => return,
+                }
+            }
+        }))
+    }
+}
+
+/// A running `SessionHandle::subscribe`; dropping it stops the delivery.
+pub struct Subscription(tokio::task::JoinHandle<()>);
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 impl Drop for SessionHandle {
@@ -137,6 +179,7 @@ impl Session {
         let shared = Arc::new(Shared {
             state: Mutex::new(Arc::new(State::default())),
             revision: watch::channel(0).0,
+            ended: watch::channel(false).0,
         });
         let stop = Arc::new(Notify::new());
         let task = Task {
@@ -151,7 +194,11 @@ impl Session {
             #[cfg(test)]
             test_endpoints: test_support::TEST_ENDPOINTS.with(|e| e.borrow().clone()),
         };
-        tokio::spawn(task.run());
+        let ended = shared.clone();
+        tokio::spawn(async move {
+            task.run().await;
+            ended.ended.send_replace(true);
+        });
         SessionHandle {
             generation,
             shared,

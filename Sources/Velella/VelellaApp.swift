@@ -45,6 +45,7 @@ private struct MainWindow: View {
 
     var body: some View {
         ShellView(state: $model.shell, onSignIn: model.isDemo ? nil : { openWindow(id: LoginWindow.id) })
+            .onChange(of: model.shell.selectedRailID) { model.syncSelection() }
             .alert(model.notice ?? "", isPresented: Binding(
                 get: { model.notice != nil }, set: { if !$0 { model.notice = nil } }
             )) {
