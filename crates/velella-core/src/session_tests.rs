@@ -1292,4 +1292,44 @@ mod messages_live {
         assert!(rig.handle.send_message(20, "hi".into()).is_none());
         assert_eq!(mock.count(), 1, "only the history GET");
     }
+
+    /// D and M both read MESSAGE_CREATE: the state (unread, mentions) and the message buffer.
+    #[tokio::test]
+    async fn one_message_create_reaches_both_the_sidebar_state_and_the_buffer() {
+        let mock = MockHttp::start(vec![ok(json!([]))]).await;
+        mock.install();
+        let mut rig = Rig::start().await;
+        let (mut conn, mut rx, _sub) = open_general(&mut rig).await;
+        until(&mut rx, |s| s.load == LoadState::Loaded).await;
+        let mentions = |rig: &Rig| {
+            crate::channel_categories(&rig.handle.snapshot(), 10)
+                .iter()
+                .flat_map(|c| &c.channels)
+                .find(|c| c.id == 20)
+                .map(|c| c.mention_count)
+        };
+        assert_eq!(mentions(&rig), Some(0));
+
+        conn.send(dispatch(
+            3,
+            "MESSAGE_CREATE",
+            json!({
+                "id": "30", "channel_id": "20", "guild_id": "10", "content": "hi <@1>",
+                "author": {"id": "9", "username": "u9"},
+                "mentions": [{"id": "1", "username": "synthetic", "global_name": "Syn"}],
+            }),
+        ))
+        .await;
+        // The store observes a dispatch after `State::apply`, so once the row shows, the state
+        // has applied the same event.
+        let s = until(&mut rx, |s| !s.rows.is_empty()).await;
+        assert_eq!(
+            s.rows
+                .iter()
+                .map(|r| (r.id, r.content.as_str()))
+                .collect::<Vec<_>>(),
+            [(30, "hi @Syn")]
+        );
+        assert_eq!(mentions(&rig), Some(1));
+    }
 }
