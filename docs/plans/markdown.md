@@ -520,3 +520,23 @@ A fresh verifier CONFIRMED T1 (every value against the CSS; 13 mutants killed). 
 | 7-minute group window, divider label text | Provisional, check live |
 
 These are deferred to a T1 follow-up after K6, ordered by the user's live comparison.
+
+## P1 — Polish from the first live look (user, 2026-10-14)
+
+**Owner:** pilotfish:executor (UI and wiring; no risk trigger), in parallel with K6 under the additive-edit rule. **Files:**
+- `ParagraphView.swift`: the tooltip;
+- `MarkdownText.swift`: the trailing break, render side only;
+- `MessageArea.swift`: the header time tooltip only;
+- `ShellState.swift`/`ShellView.swift`: the locale default;
+- `Sources/Velella/AppModel.swift`: remove the locale subscription;
+- `crates/velella-ffi/src/lib.rs`: remove `subscribe_locale`/`LocaleListener`;
+- `crates/velella-core`: remove the now-unused account-locale tracking (`State.locale`, `valid_locale`, `locale_update`, and their tests);
+- tests.
+
+| Part | Contract |
+|---|---|
+| Tooltip | The timestamp tooltip follows Swiftcord v2's `DiscordUITooltips` (`TooltipPresenter`: `sourceRect` + `spacing`; `TooltipSurface`), read from the binary with REA: position relative to the hovered run's frame (centred above it, v2's spacing), the surface (material/glass, corner radius, padding, font, colours) and the show and hide timing. Values go into named constants citing the v2 addresses; facts go into refs/swiftcord-v2-teardown.md (git-excluded, never decompiled code). Message header times use the same tooltip instead of `.help`. |
+| Locale | Times use the macOS preferred language, `Locale.preferredLanguages.first`, through `Locale(identifier:)` without the user's overrides. The user's capture showed velella reading `en-GB` from READY's legacy `user_settings.locale` while the official client showed zh-TW, so the legacy field is stale. The Discord account-locale route (K4 and K5) is deleted, not left unused. Q2 is superseded. |
+| Trailing break | A paragraph's final `LineBreak` is not rendered: HTML shows nothing for a lone trailing `<br>` in a block, and the official client renders `> 單行引用` on one line (user's capture). Two trailing breaks render one empty line. Only the rendering changes; the core AST and the oracle comparison are untouched. |
+| Tests | Tooltip placement: centred above a run's frame at v2's spacing, clamped inside the view. The locale default follows the preferred language (injectable). A quote of one line has the height of one line, two trailing breaks give one empty line, and a single trailing break in a top-level paragraph is dropped. |
+| Acceptance | `make build`, `swift test`, `cargo test`, clippy and fmt pass; a fresh verifier. **Live:** hover a timestamp pill and a header time, and compare with the v2 capture; `> 單行引用` is one line; times show zh-TW formats. |
