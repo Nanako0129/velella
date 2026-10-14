@@ -421,14 +421,14 @@ Header names come only from this table, never from the fence text (shown with `T
 
 | # | Finding | Disposition |
 |---|---|---|
-| P1-K6-1 | Highlight cost unbounded, under the store lock | FIX: 1024-byte line cap, 25 ms per-message budget, `history()` before the lock, warm-up off the lock, measured release bounds |
+| P1-K6-1 | Highlight cost unbounded, under the store lock | Rev 2's fix (line cap, 25 ms in-lock budget) failed its release bounds. **Now FIX by isolation (rev 3.1):** no syntect on the session task or under the store lock; one worker thread per store computes, and the session path only flags messages and applies finished results (see "K6 revision 3.1") |
 | P2-K6-2 | The JSONC theme would fail and silently disable highlighting | FIX: strict JSON vendored with SHA-256; string-or-array scopes; colours from `colors`; `OnceLock`; build test |
 | P2-K6-3 | An index side table could attach a hidden block's spans to a visible one | FIX: highlights travel on their own `CodeBlock` node; the concatenation property in core; the equality check in Swift; spoiler-order test |
 | P3-K6-4 | Panic handling conditions | FIX: Panics row |
 | P3-K6-5 | Output size and view count | FIX: 4096-span cap; line-number layout only up to 2000 lines |
 | P3-K6-6 | Copy and invisible control characters | FIX: exact code copied, escapes for display, no Copy while covered |
 | P3-K6-7 | Supply chain | FIX: Dependency row (calls allowed, checks, notices, lockfile) |
-| P4 | Header name source; first-use cost; test timing | FIX: names from the table; `warm()`; release timing tests |
+| P4 | Header name source; first-use cost; test timing | FIX: names from the table; `warm()` (rev 3.1: runs first on the worker thread, never at store creation); release timing tests |
 | P4 | Grammar recursion, deep nesting | REJECT: trusted bundled grammars; syntect caps the stack at 100 |
 
 ### Plan review dispositions (plan review of K5/K6 at f05eec6)
@@ -454,7 +454,7 @@ Header names come only from this table, never from the fence text (shown with `T
 | `MarkdownView.swift` | Q5 clause, marker comment | code-block view |
 | `DiscordTime.swift` | R, today header | — |
 | `Cargo.toml`/`Cargo.lock`, `highlight.rs`, `highlight_tests.rs`, `assets/` (main vendors) | — | yes |
-| `messages.rs` | — | in-place fill at the three assignments, `history()` order |
+| `messages.rs` | — | rev 2: in-place fill at the three assignments; **replaced in rev 3.1** by its ownership table |
 | FFI `markdown.rs`, AppModel mapping | — | `highlight` on `CodeBlock` |
 | `THIRD_PARTY_NOTICES.md` | — | rows above |
 
@@ -520,3 +520,196 @@ A fresh verifier CONFIRMED T1 (every value against the CSS; 13 mutants killed). 
 | 7-minute group window, divider label text | Provisional, check live |
 
 These are deferred to a T1 follow-up after K6, ordered by the user's live comparison.
+
+## P1 — Polish from the first live look (user, 2026-10-14)
+
+**Owner:** pilotfish:executor (UI and wiring; no risk trigger), in parallel with K6 under the additive-edit rule. **Files:**
+- `ParagraphView.swift`: the tooltip;
+- `MarkdownText.swift`: the trailing break, render side only;
+- `MessageArea.swift`: the header time tooltip only;
+- `ShellState.swift`/`ShellView.swift`: the locale default;
+- `Sources/Velella/AppModel.swift`: remove the locale subscription;
+- `crates/velella-ffi/src/lib.rs`: remove `subscribe_locale`/`LocaleListener`;
+- `crates/velella-core`: remove the now-unused account-locale tracking (`State.locale`, `valid_locale`, `locale_update`, and their tests);
+- tests.
+
+| Part | Contract |
+|---|---|
+| Tooltip | The timestamp tooltip follows Swiftcord v2's `DiscordUITooltips` (`TooltipPresenter`: `sourceRect` + `spacing`; `TooltipSurface`), read from the binary with REA: position relative to the hovered run's frame (centred above it, v2's spacing), the surface (material/glass, corner radius, padding, font, colours) and the show and hide timing. Values go into named constants citing the v2 addresses; facts go into refs/swiftcord-v2-teardown.md (git-excluded, never decompiled code). Message header times use the same tooltip instead of `.help`. |
+| Locale | Times use the macOS preferred language, `Locale.preferredLanguages.first`, through `Locale(identifier:)` without the user's overrides. The user's capture showed velella reading `en-GB` from READY's legacy `user_settings.locale` while the official client showed zh-TW, so the legacy field is stale. The Discord account-locale route (K4 and K5) is deleted, not left unused. Q2 is superseded. |
+| Trailing break | A paragraph's final `LineBreak` is not rendered: HTML shows nothing for a lone trailing `<br>` in a block, and the official client renders `> 單行引用` on one line (user's capture). Two trailing breaks render one empty line. Only the rendering changes; the core AST and the oracle comparison are untouched. |
+| Tests | Tooltip placement: centred above a run's frame at v2's spacing, clamped inside the view. The locale default follows the preferred language (injectable). A quote of one line has the height of one line, two trailing breaks give one empty line, and a single trailing break in a top-level paragraph is dropped. |
+| Acceptance | `make build`, `swift test`, `cargo test`, clippy and fmt pass; a fresh verifier. **Live:** hover a timestamp pill and a header time, and compare with the v2 capture; `> 單行引用` is one line; times show zh-TW formats. |
+
+## K6 revision 3.1 — highlighting off the session task (user, 2026-10-14: "移到背景 worker")
+
+The K6 implementation (uncommitted, worktree `agent-a0bc5870b5bbfffa8`, on 2d08b4e) failed its release timing acceptance. Measured on a loaded machine:
+- the worst 1024-byte line took 320-341 ms (C#), against ≤ 10 ms;
+- JavaScript took 151 ms and Scala 92 ms;
+- 20 maximum-cost blocks took 959 ms, against < 40 ms.
+
+Lowering the line cap does not fix it. Markdown's `\\` runs cost 12-25 ms at every length, and Makefile costs 20-90 ms from 64 bytes up. The cause is fancy-regex's 1,000,000-step backtrack limit per search, which syntect gives no way to change; one line runs many searches. So P1-K6-1 cannot be closed while highlighting runs in `observe()` under the store lock. The user chose to move highlighting to a background worker.
+
+Revision 3 put jobs on a bounded push queue. Its plan review (7 blockers) and security review (P2-R3-1 … P4-R3-8) both found gaps, so revision 3.1 replaces it with a pull model: the store is the queue. Messages carry a `pending` flag, and one worker thread per store takes the newest pending message, computes off the lock, and applies the result if the message is still the same. Rev 3.1 supersedes rev 2's **Computing** row (with its carrier text) and **Limits** row, and the rev 2 test, mutant and ownership items mapped below. Rev 2's language table, Dependency, Theme, Panics, Swift view and Copy rows stand, except where a row below changes them.
+
+### Contract
+
+| Part | Contract |
+|---|---|
+| Session path | On the session task and under the store lock, the only highlighting code reached is the pure table lookup over the `LANGUAGES` const (the existing private `highlight::language`, and a new public `highlight::header(language: Option<&str>) -> Option<&'static str>` for the FFI). It touches no `OnceLock` static and no syntect. This covers `observe`, `history`, `parse`, `merge`, `begin_send`, `finish_send`, `snapshot` and `row`. `warm`, `compute` and the statics are reached only from the worker thread and from tests. Rev 2's `std::thread::spawn(highlight::warm)` in `MessageStore::new` is deleted, and `fill`/`fill_with` no longer exist as session-path entry points. |
+| Carrier | `Block::CodeBlock.highlight: Option<Arc<Highlighted>>`; the parser sets `None`. `row()` clones the `Arc`, never the spans. The FFI conversion copies the spans after `snapshot()` returned, off the lock. `Highlighted.name` is removed: the header comes from the table (Header row). |
+| Pending flag | `Stored` gains `pending: bool`, set to true exactly when a body is assigned to a message that goes into `open.messages` and at least one of its code blocks' fences maps in the language table: `parse(v, false)` (reaching the store through `observe` MESSAGE_CREATE, `history`, and `finish_send` Ok), and `merge` when `content` changed. A nested `referenced_message` (`parse(v, true)`) and an echo (`begin_send`) are never pending. The worker never reads `open.echoes`. `Open::insert` with `replace` keeps the existing copy's `body` and `pending` when the new copy's `content` is equal, so a re-delivered CREATE, or the gateway copy after `finish_send`, does not drop colours already shown (the body is a function of `content` alone). |
+| Worker | `MessageStore::new(rest) -> Arc<MessageStore>`. Session.rs's `get_or_init` drops its `Arc::new`; that one line is K6's. `new` creates `sync_channel::<()>(1)`, keeps the sender as `wake: Option<SyncSender<()>>`, and starts one thread with `std::thread::Builder::new().name("velella-highlight").spawn(...)`. A spawn error leaves `wake: None`: highlighting is off for that store, and nothing panics. The thread holds only a `Weak<MessageStore>` and the receiver, and runs `run(weak, receiver, compute_job)`:<br>1. `warm()`; if it returns `None`, the thread ends.<br>2. `recv()`; an error (the store and its sender were dropped) ends the thread.<br>3. Loop: upgrade the `Weak` (failure ends the thread); `next_job()`, and on `None` go back to 2; drop the `Arc`; compute; upgrade again (failure ends the thread); `apply`.<br>`bump()` calls `wake()`, which is `try_send(())` ignoring `Full` (a wake is already pending) and `Disconnected` (the worker is gone). Every change, including the worker's own `apply`, therefore leads to a recheck for pending messages, and no enqueue site can be missed. |
+| `next_job` | `fn next_job(&self) -> Option<Job>`, with `Job { id: u64, blocks: Vec<(Option<String>, String)> }` holding each code block's (fence, code) in walk order, mapped or not. Under the lock: take the newest message in the open channel with `pending` set, clear its flag, and copy its blocks. |
+| Walk order | Checking for a mapped fence, collecting a job's blocks, and applying results all use one visitor over `&mut [Block]` (rev 2's `each_code_block`, which descends into quotes, list items and `Inline::Block`). So the order is the same by construction. |
+| Computing and limits | `compute_job(&Job) -> Vec<Option<Arc<Highlighted>>>`, one entry per block, on the worker. Per block, as rev 2: a line over 1024 bytes, more than 2000 lines, or an unmapped fence gives `None`; `catch_unwind` wraps each block. Per job (one message): one 250 ms budget, checked before each line, and one allowance of 4096 spans. A block that would take the message past 4096 spans gets `None`, and so does every later block in that message. Once the budget is spent, every remaining block is `None`. A single line can overrun the budget, since fancy-regex cannot be interrupted; that costs only the worker's time. |
+| `apply` | `fn apply(&self, job: &Job, results: Vec<Option<Arc<Highlighted>>>)`. Under the lock, with no syntect:<br>• message `job.id` must be in the open channel's `open.messages` (echoes are not searched);<br>• its code blocks must equal `job.blocks` in count and in each (fence, code), byte for byte.<br>Otherwise nothing is applied. An edited message is already pending again and gets its own job. Each block then takes its result only when the result's spans join to exactly that block's code; otherwise it stays `None`. `apply` bumps once if anything changed. There is no content fingerprint and no hash, so no crate is added. There is no epoch check either: id plus exact (fence, code) equality plus the join check already make any applied result that block's own highlight, so a result landing after the channel was closed and reopened is still correct (closing review, blocker 4). |
+| Header | FFI `MdBlock::CodeBlock` gains `header: Option<String>`, set in the `From` conversion by `highlight::header(language)`, the same pure lookup. Swift's `MarkdownBlock.codeBlock` carries it. `CodeBlockModel` shows the header from that field whether or not a highlight is present, so a block's layout does not change when its colours arrive. `MdHighlighted.name` and `CodeHighlight.name` are removed. |
+| Dead worker | Not restarted. A panic outside the per-block `catch_unwind` (in `warm`, `next_job` or `apply`) ends the thread. The store's mutex poison is already recovered (`lock()`), a partly applied body is still valid (each block was checked on its own), and `wake()` ignores `Disconnected`. That session's code blocks then stay plain. A deterministic failure would repeat on every restart; the end-to-end test catches a worker that never colours anything. |
+| Thread QoS | DEFER: std's default. Utility QoS through `pthread_set_qos_class_self_np` waits for a flood test showing UI contention. |
+
+### Tests
+
+**Seam.** `MessageStore::with_wake(rest, wake: Option<SyncSender<()>>) -> Arc<MessageStore>` builds a store with no thread; `new` is a channel, `with_wake`, and the spawn. `run` takes the compute function as a parameter. Deterministic tests call `next_job`, `compute_job` and `apply` themselves.
+
+| Test (core, deterministic) | Checks |
+|---|---|
+| Pending sites | One test per site: MESSAGE_CREATE, `history` Ok, `finish_send` Ok, and `merge` with changed content each make `next_job` return that id. `merge` with equal content, an echo with a `py` block, a reply whose only `py` block is in its `referenced_message`, and a body whose only fence is unmapped (`swift`) make it return `None`. After each, every `CodeBlock.highlight` in the snapshot is `None`: nothing was computed on the path. |
+| Newest first | With two pending messages, `next_job` returns the newer. |
+| Channel switch | Take a job in channel A; open B; `apply(A's job)` changes nothing; `next_job` returns only B's messages. Then close B and reopen A with the same message: `apply(A's old job)` colours it: the result is still that block's own. |
+| History insert | `history` inserts a message with a mapped block, and `next_job` returns it. The ordering itself is structural, not tested: `pending` is assigned only inside `parse` and `merge`, before the `Stored` reaches `insert`, so no thread can see the message without its flag. |
+| Edited during compute | Take a job; a MESSAGE_UPDATE changes the code; `apply` changes nothing; `next_job` returns the edited message. The same holds for a fence-only edit (`py` → `rb`, same code). |
+| Evicted | Take a job; delete the message (and, separately, push it out past `CAP`); `apply` changes nothing and does not panic. |
+| Join mismatch | `apply` with a result whose spans do not join to the block's code leaves `None`. |
+| Replaced copy | A highlighted message, then a CREATE with equal content: still highlighted, with the same `Arc`. With different content: `None`, and pending. |
+| Spoiler order | A hidden-spoiler block before a visible one: after `apply`, through the FFI conversion, each `MdBlock::CodeBlock`'s spans join to its own code (rev 2's test, run through `apply`). |
+| Shared snapshot | Two snapshots with no change between them hold `Arc::ptr_eq` highlights. |
+| Per-job caps | Two blocks of about 3000 spans each: the first gets colours and the second `None`. Two slow blocks share the 250 ms budget (injected clock, as rev 2). |
+| Undrained wake | `with_wake(Some(tx))` with the receiver never read: 10,000 CREATEs, each with a mapped block, all return; the store holds at most `CAP` (200) messages, so at most 200 pending; memory is bounded by `CAP` alone. |
+| Dead worker | `with_wake` whose receiver was dropped: `observe` neither blocks nor panics. |
+| End to end | `new()` with the real thread: a CREATE with a `py` block gets colours in a snapshot within 5 s (polled). Dropping every `Arc` ends the thread within 5 s (`JoinHandle::is_finished`, from a test-only variant of `new` that returns the handle). With a compute function that blocks until the test drops the store, `Weak::strong_count` is 0 while compute runs, and the thread ends without applying. |
+
+| Test (Swift) | Checks |
+|---|---|
+| Header without colours | A `py` block with `highlight: nil` shows "Python"; a `swift` block shows no header. Adding the highlight does not change the block's height. |
+| Kept from rev 2 | line numbers 1…n; wrapping; escapes shown; Copy writes the exact code, cools down, and is absent while covered; the hidden-spoiler order test. |
+
+Release tests are `#[ignore]`d. The verifier runs each one alone, so the statics start cold:
+
+```bash
+cargo test --release -p velella-core -- --ignored --exact <name> --test-threads=1
+```
+
+| Release test | Bound |
+|---|---|
+| Cold observe | Fresh process. `new()` starts the warm-up; then 10 MESSAGE_CREATEs, each holding 15 code blocks with the fence `cs` and one line of 1024 `(` characters (15,525 bytes, under the parser's `MAX_INPUT` of 16,384). **Precondition, asserted before the timing is trusted:** each stored body has 15 `CodeBlock`s with fence `cs`, and the message is pending. The worst single `observe` call (measured with `Instant`) is ≤ 5 ms. |
+| Contended observe | A store of 200 messages, each holding one block with 4096 spans (applied through `apply`, synthetic spans), and a thread looping `snapshot()`. Over 100 `observe` calls, the worst is ≤ 5 ms. The longest `snapshot()` lock hold is recorded, with a bound of ≤ 5 ms. |
+| Corpus | Rev 2's adversarial corpus plus backref grammars: heredoc `<<EOF` in bash, Ruby, Perl and PHP; Lua `[==[`; C# raw strings; Markdown fences. Each syntax's worst line is recorded in this plan; there is no bound. The `MAX_LINE_BYTES` comment is corrected: the cap limits a line's length, not its cost. |
+
+### Verifier mutants (rev 3.1)
+
+| Mutant | Expected killer |
+|---|---|
+| syntect (`compute`/`warm`) called from `parse`, `merge`, `observe`, `history` or `finish_send` | Cold observe; pending-site snapshot `None` checks |
+| `pending` not set at one site (each site separately) | Pending sites |
+| `history` inserting with `pending: false` | History insert |
+| `next_job`/`apply` also searching `open.echoes` | Pending sites (echo case) |
+| a message pending because its `referenced_message` has a mapped fence | Pending sites (a nested-reply case where only the referenced message has a `py` block) |
+| `apply` comparing code without the fence | Edited during compute (fence-only edit) |
+| `apply` without the join check | Join mismatch |
+| an `Arc<MessageStore>` held across compute | End to end (`strong_count`) |
+| `MAX_SPANS` counted per block again | Per-job caps |
+| `row()` deep-cloning `highlight` | Shared snapshot |
+| `wake()` with a blocking `send` | Undrained wake (the test hangs, so the harness times out) |
+| `next_job` oldest first | Newest first |
+| `insert` replace dropping the body for equal content | Replaced copy |
+| the header taken from the highlight again | Header without colours |
+
+### Rev 2 items
+
+| Rev 2 item | Disposition |
+|---|---|
+| Tests: alias table; theme build; Dark+ Python colours; concatenation property; 1025-byte line; 2001 lines; injected panic; all-syntaxes sweep | keep |
+| Test: 4097 spans | replaced by per-job caps (per message) |
+| Test: two slow blocks sharing one budget (25 ms) | replaced by per-job caps (250 ms) |
+| Test: "highlights computed at the three assignments and not in `row()`" (`messages_tests.rs:695` in the worktree) | replaced by pending sites and shared snapshot |
+| Test: release timing corpus with a ≤ 10 ms per-line bound | replaced by the release Corpus test (recorded, no bound) |
+| Swift: header only with a language | replaced by header without colours |
+| Swift: line numbers, wrapping, escapes, Copy, spoiler order | keep |
+| Mutants: no line cap; per-block instead of per-message budget; no `catch_unwind`; Swift index without the equality check; Copy while covered | keep |
+| `std::thread::spawn(highlight::warm)` at `MessageStore::new` (`messages.rs:681`) | drop (the worker warms) |
+| `history()` highlighting before the lock | drop (nothing to highlight on the path) |
+| Ownership: `messages.rs` "in-place fill at the three assignments" | replaced by the ownership table below |
+
+### Files and order
+
+| File | K6 rev 3.1 owns |
+|---|---|
+| `Cargo.toml`, `Cargo.lock` | syntect in velella-core only (rev 2); nothing added in rev 3.1 |
+| core `lib.rs` | `mod highlight` |
+| core `highlight.rs`, `highlight_tests.rs` | table lookups, `compute_job`, per-job caps, comment fix, corpus |
+| core `markdown.rs`, `markdown_tests.rs` | `CodeBlock.highlight: Option<Arc<Highlighted>>` and its literals |
+| core `messages.rs`, `messages_tests.rs` | `pending`, `insert` body keep, `wake`, `with_wake`/`new`, `run`, `next_job`, `apply`, tests |
+| core `session.rs` | the one `get_or_init` line |
+| assets `vscode-dark-plus/` | read-only (main vendored them) |
+| FFI `markdown.rs` | `header`, `highlight` conversion, spoiler-order test |
+| `MarkdownText.swift` | the `codeBlock` case (with `header`) and its matches |
+| `Fixtures.swift` | `codeBlock` literals |
+| `AppModel.swift` | the `codeBlock` mapping |
+| `MarkdownView.swift` | the code-block view |
+| Swift tests (`CodeBlockTests.swift`, `MarkdownBlockTests.swift`, `MarkdownTests.swift`) | code-block tests |
+| `THIRD_PARTY_NOTICES.md` | rev 2's rows |
+
+`state.rs`, FFI `lib.rs`, `session_tests.rs` and `fixture_tests.rs` are not K6's. P1 changed them, and P1 is merged (06ca89d).
+
+**Order.** P1 merged first. The K6 executor:
+1. commits its rev 2 work-in-progress on `worktree-agent-a0bc5870b5bbfffa8`;
+2. merges `m1` (06ca89d) into that branch, resolving the two overlapping files by keeping both sides:
+   - `AppModel.swift`: P1's removal of the locale subscription and K6's `codeBlock` mapping;
+   - `MarkdownText.swift`: P1's trailing break and K6's `codeBlock` case;
+3. makes the rev 3.1 changes on top.
+
+Main reads the merge commit's conflict hunks at integration.
+
+### Acceptance
+
+`make build`, `swift test`, `cargo test`, clippy and fmt pass. `cargo tree -p velella-core` shows no crate beyond rev 2's record. A fresh pilotfish:verifier runs the release tests and the mutants above. **Live:** sample 2's Python block against Vencord's look; a message with code blocks shows its header at once and gains colours without moving.
+
+### K6 rev 3 security dispositions (security review of rev 3, 2026-10-14)
+
+| # | Finding | Disposition |
+|---|---|---|
+| P2-R3-1 | The bounded push queue loses colours: a fast job reaches `apply` before `history`'s insert; a channel switch fills the queue with stale jobs; a replaced copy loses its colours with no retry | FIX: pull model (`pending`, `next_job`, wake channel of 1); `insert` keeps the body for equal content; tests: channel switch, history race, replaced copy |
+| P2-R3-2 | Highlight data cloned under the store lock on every snapshot; span cap per block | FIX: `Option<Arc<Highlighted>>`, FFI conversion off the lock, 4096 spans per message; contended-observe and lock-hold release measurements |
+| P3-R3-3 | A per-process worker holding `Arc<MessageStore>` keeps a signed-out session's token and message text alive; cross-session results | FIX: one worker per store holding only `Weak`, no `Arc` across compute, ends when the store drops; end-to-end drop test |
+| P3-R3-4 | One line's worker cost is not bounded (backref patterns are not cached); the cap comment overstates it | FIX: backref grammars in the release corpus, worst line recorded per syntax, comment corrected. REJECT a per-sender cap and process isolation (cosmetic only) |
+| P3-R3-5 | `warm()`'s `OnceLock`s would block any session-path caller for the whole warm-up; `finish_send` was missing from the list | FIX: Session path row (only the pure table lookup; `finish_send` listed); the cold-observe release test runs in a fresh process during warm-up |
+| P4-R3-6 | Fingerprint choice | FIX: no hash; exact (fence, code) equality in `apply`, one visitor for the walk order |
+| P4-R3-7 | Panics outside `catch_unwind` kill the worker | FIX: Dead worker row (no restart), dead-worker test |
+| P4-R3-8 | The Rendering row promised a header that the Swift view only shows with a highlight | FIX: Header row (option a, from the table through the FFI, no syntect) |
+| P4 | Timing side channel, logging | ACCEPT: highlighting makes no network request and logs nothing |
+| P4 (main) | The FFI conversion copies up to 200 × 4096 spans per snapshot, off the lock, on a tokio thread | DEFER: unmeasured; measure if a live flood shows lag |
+
+### Plan review dispositions (plan review of rev 3)
+
+| # | Blocker | Disposition |
+|---|---|---|
+| 1 | No rev 3 security review; P1-K6-1's row described rev 2 | FIX: the table above; P1-K6-1's row now cites isolation |
+| 2 | Routing, enqueue sites, echoes, apply method, `Disconnected` | FIX: one worker per store holding `Weak`; enqueue is the `pending` flag at the listed sites, and every `bump` wakes; echoes neither highlighted nor searched; `next_job`/`apply` signatures; `Disconnected` ignored and no restart (the security review rejected restart: a deterministic failure repeats), with the end-to-end and dead-worker tests |
+| 3 | Fingerprint left open; a SHA-256 crate | FIX: no fingerprint; (fence, code) equality; no crate |
+| 4 | Header promised for `None` | FIX: option (a), `header` through the FFI from the table |
+| 5 | Rev 2 items unmapped; no rev 3 mutants | FIX: Rev 2 items table; Verifier mutants table |
+| 6 | Timing and flood checks not falsifiable | FIX: exact payload (20 × one 1024-byte `cs` line of `(`), run command, worst-of-N measurement; the `with_wake` seam; the 64/9,936 overflow count no longer applies (there is no job queue), replaced by the undrained-wake test (10,000 CREATEs return, at most `CAP` pending) |
+| 7 | No Files line or ownership; merge order with P1 | FIX: Files and order (P1 first, the executor merges m1 and resolves the two files) |
+
+### Closing review dispositions (closing review of rev 3.1, 3373286)
+
+All four blockers were test falsifiability; the design stands. The user chose to fix them and start without another review round (2026-10-14: "修正後直接開工").
+
+| # | Blocker | Disposition |
+|---|---|---|
+| 1 | Cold observe's 20 × 1035-byte payload exceeds `MAX_INPUT` (16,384), so it parses as plain text and the bound proves nothing | FIX: 15 blocks (15,525 bytes) plus a precondition assertion (15 `cs` `CodeBlock`s, pending) |
+| 2 | "`pending` set after the insert is visible" cannot be killed by a sequential test | FIX: the ordering is stated as structural (assigned only in `parse`/`merge`, before `insert`); the mutant is replaced by "`history` inserting with `pending: false`" |
+| 3 | "`pending` set for an echo or a nested reply" is an equivalent mutant | FIX: replaced by "`next_job`/`apply` also search echoes" and "pending because the referenced message has a mapped fence", each with a killing Pending sites case |
+| 4 | The Channel switch test does not kill "`apply` without the epoch check" | FIX: the epoch check is deleted as a redundant guard (id + exact (fence, code) + join already decide correctness); its mutant is gone; the Channel switch test adds the reopen case showing the late result is applied and correct |
+

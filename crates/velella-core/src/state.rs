@@ -113,9 +113,6 @@ pub struct State {
     pub private_channels: Vec<PrivateChannel>,
     /// `None` when READY carried no `user_settings.guild_folders`.
     pub guild_folders: Option<Vec<GuildFolder>>,
-    /// The account's locale (legacy `user_settings.locale`, kept current by USER_SETTINGS_UPDATE);
-    /// `None` until a valid tag arrives.
-    pub locale: Option<String>,
     /// Written by `SessionHandle::set_member_subscription` under the state lock; kept across READY.
     pub member_sub: Option<MemberSub>,
     /// Slice D: unread and mention state, mutes, voice occupants, DM presence, pending friend
@@ -310,15 +307,6 @@ fn parse_folders(d: &Value) -> Option<Vec<GuildFolder>> {
     )
 }
 
-/// A BCP-47-ish tag: ASCII letters, digits and '-', at most 35 characters, starting with a letter.
-fn valid_locale(v: &Value) -> Option<String> {
-    let tag = v.as_str()?;
-    (tag.len() <= 35
-        && tag.starts_with(|c: char| c.is_ascii_alphabetic())
-        && tag.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
-    .then(|| tag.to_owned())
-}
-
 impl State {
     pub fn guild(&self, id: u64) -> Option<&Guild> {
         self.guilds.iter().find(|g| g.id == id)
@@ -385,7 +373,6 @@ impl State {
             "THREAD_MEMBER_UPDATE" => self.threads.member_update(d, self.user_id),
             "THREAD_MEMBERS_UPDATE" => self.threads.members_update(d, self.user_id),
             "GUILD_MEMBER_LIST_UPDATE" => self.member_list_update(d),
-            "USER_SETTINGS_UPDATE" => self.locale_update(d),
             _ => false,
         };
         if changed {
@@ -455,26 +442,11 @@ impl State {
         self.read.sync(d);
         self.settings.sync(d);
         self.relationships.sync(d);
-        self.locale = d
-            .get("user_settings")
-            .and_then(|u| u.get("locale"))
-            .and_then(valid_locale);
         self.guild_folders = parse_folders(d);
         if self.guild_folders.is_none() {
             tracing::warn!("READY carried no user_settings.guild_folders; guild order falls back to READY order");
         }
         true
-    }
-
-    /// USER_SETTINGS_UPDATE carries only the changed fields; an invalid `locale` is ignored.
-    fn locale_update(&mut self, d: &Value) -> bool {
-        match d.get("locale").and_then(valid_locale) {
-            Some(tag) if self.locale.as_deref() != Some(&tag) => {
-                self.locale = Some(tag);
-                true
-            }
-            _ => false,
-        }
     }
 
     fn merged_roles(&self, members: &Value) -> Option<Vec<u64>> {

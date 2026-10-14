@@ -378,9 +378,10 @@ public struct ShellState: Equatable, Sendable {
     public var messageLoad: MessageLoad = .idle
     /// Unsent composer text per conversation (`openTarget`), as the official client keeps it.
     public var drafts: [String: String] = [:]
-    /// The Discord account's locale (BCP 47), for message times; ShellView puts it in the
-    /// environment as `discordLocale`.
-    public var locale = "en-US"
+    /// The macOS preferred language (BCP 47), for message times; ShellView puts it in the
+    /// environment as `discordLocale`. Not the Discord account's: READY's legacy
+    /// `user_settings.locale` was stale against the official client (P1).
+    public var locale: String
 
     public init(
         rail: [RailItem] = [], selectedRailID: String? = nil, serverName: String? = nil,
@@ -388,8 +389,10 @@ public struct ShellState: Equatable, Sendable {
         messages: [MessageItem] = [], memberSections: [MemberSection] = [],
         currentUser: CurrentUser? = nil,
         dmTopRows: [DMTopRow] = [], dms: [DMEntry] = [], selectedDMID: String? = nil,
-        reply: ReplyPreview? = nil
+        reply: ReplyPreview? = nil,
+        preferredLanguages: [String] = Locale.preferredLanguages
     ) {
+        self.locale = preferredLanguages.first ?? "en-US"
         self.rail = rail; self.selectedRailID = selectedRailID; self.serverName = serverName
         self.categories = categories; self.selectedChannelID = selectedChannelID
         self.messages = messages; self.memberSections = memberSections; self.currentUser = currentUser

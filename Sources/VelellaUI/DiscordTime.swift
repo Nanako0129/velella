@@ -1,7 +1,7 @@
 import Foundation
 
 /// Discord-localised times (docs/plans/markdown.md, K4). ICU through `DateFormatter` and
-/// `RelativeDateTimeFormatter` with `Locale(identifier:)`: the account's locale, none of the
+/// `RelativeDateTimeFormatter` with `Locale(identifier:)`: the macOS preferred language, none of the
 /// macOS user overrides (12/24-hour, date order). Styles whose official output differs from ICU
 /// get an explicit pattern once K0 records it.
 enum DiscordTime {
@@ -9,7 +9,7 @@ enum DiscordTime {
     /// reaches a formatter is out of Foundation's `Date` range, and no `Int` conversion happens.
     static let unixLimit: Int64 = 8_640_000_000_000
 
-    /// `R` is English whatever the account locale: the official client shows "5 years ago" in
+    /// `R` is English whatever the locale: the official client shows "5 years ago" in
     /// zh-TW (K0, `refs/discord-ground-truth/captures/k0-times-markdown.png`). Singular and "now"
     /// wording stay ICU's until a capture shows Discord's.
     static let relativeLocale = Locale(identifier: "en-US")
