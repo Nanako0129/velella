@@ -10,8 +10,10 @@ pub use decorations::{SidebarOccupant, SidebarStatus, SidebarThread};
 
 uniffi::setup_scaffolding!();
 
+mod markdown;
 mod members;
 mod messages;
+pub use markdown::*;
 pub use messages::*;
 
 /// The one process-wide runtime. Exported async fns spawn onto it and await the

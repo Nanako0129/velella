@@ -1092,7 +1092,7 @@ mod messages_live {
     async fn history_live_events_and_a_send_flow_through_the_session() {
         let history = json!([
             {"id": "11", "channel_id": "20", "content": "second", "author": {"id": "9", "username": "u9", "global_name": "Nine"}},
-            {"id": "10", "channel_id": "20", "content": "first <#20>", "author": {"id": "9", "username": "u9"}},
+            {"id": "10", "channel_id": "20", "content": "first <#100000000000000022>", "author": {"id": "9", "username": "u9"}},
         ]);
         let sent = json!({"id": "14", "channel_id": "20", "content": "out",
             "author": {"id": "1", "username": "synthetic", "global_name": "Syn"}});
@@ -1103,8 +1103,9 @@ mod messages_live {
         conn.send(dispatch(2, "GUILD_CREATE", json!({
             "id": "10", "name": "g", "owner_id": "1",
             "roles": [{"id": "10", "permissions": "1024", "position": 0},
-                      {"id": "77", "permissions": "0", "position": 3, "name": "mods", "color": 0x112233}],
-            "channels": [{"id": "20", "type": 0, "name": "general"}],
+                      {"id": "100000000000000077", "permissions": "0", "position": 3, "name": "mods", "color": 0x112233}],
+            "channels": [{"id": "20", "type": 0, "name": "general"},
+                         {"id": "100000000000000022", "type": 0, "name": "lounge"}],
         })))
         .await;
         let mut revision = rig.handle.state();
@@ -1123,14 +1124,22 @@ mod messages_live {
                 .iter()
                 .map(|r| (r.id, r.content.as_str()))
                 .collect::<Vec<_>>(),
-            [(10, "first #general"), (11, "second")]
+            [(10, "first <#100000000000000022>"), (11, "second")]
         );
+        // Mentions resolve against the state into side data.
+        let channel = crate::ResolvedMention {
+            kind: crate::MentionKind::Channel,
+            id: 100_000_000_000_000_022,
+            name: Some("lounge".into()),
+            color: 0,
+        };
+        assert_eq!(s.rows[0].mentions, [channel]);
 
         // Live: a create with a member (nick, role colour), one for another channel (ignored),
         // then an update and a delete.
         conn.send(dispatch(3, "MESSAGE_CREATE", json!({
-            "id": "12", "channel_id": "20", "content": "hey <@&77>",
-            "author": {"id": "9", "username": "u9"}, "member": {"nick": "Niner", "roles": ["77"]},
+            "id": "12", "channel_id": "20", "content": "hey <@&100000000000000077>",
+            "author": {"id": "9", "username": "u9"}, "member": {"nick": "Niner", "roles": ["100000000000000077"]},
         })))
         .await;
         conn.send(dispatch(4, "MESSAGE_CREATE", json!({
@@ -1140,13 +1149,16 @@ mod messages_live {
         let s = until(&mut rx, |s| s.rows.len() == 3).await;
         let live = &s.rows[2];
         assert_eq!(
-            (
-                live.author_name.as_str(),
-                live.author_color,
-                live.content.as_str()
-            ),
-            ("Niner", Some(0x112233), "hey @mods")
+            (live.author_name.as_str(), live.author_color),
+            ("Niner", Some(0x112233))
         );
+        let role = crate::ResolvedMention {
+            kind: crate::MentionKind::Role,
+            id: 100_000_000_000_000_077,
+            name: Some("mods".into()),
+            color: 0x112233,
+        };
+        assert_eq!(live.mentions, std::slice::from_ref(&role));
         conn.send(dispatch(5, "MESSAGE_UPDATE", json!({"id": "11", "channel_id": "20", "content": "edited", "edited_timestamp": "2026-10-14T00:00:00+00:00"}))).await;
         conn.send(dispatch(
             6,
@@ -1160,8 +1172,9 @@ mod messages_live {
                 .iter()
                 .map(|r| (r.id, r.content.as_str()))
                 .collect::<Vec<_>>(),
-            [(11, "edited"), (12, "hey @mods")]
+            [(11, "edited"), (12, "hey <@&100000000000000077>")]
         );
+        assert_eq!(s.rows[1].mentions, [role]);
 
         // Send: only to the open channel, never for blank text; the gateway echo reconciles.
         assert!(rig
@@ -1328,7 +1341,7 @@ mod messages_live {
                 .iter()
                 .map(|r| (r.id, r.content.as_str()))
                 .collect::<Vec<_>>(),
-            [(30, "hi @Syn")]
+            [(30, "hi <@1>")]
         );
         assert_eq!(mentions(&rig), Some(1));
     }

@@ -10,17 +10,21 @@
 //!   refs/concord/src/discord/gateway/parser/messages.rs:943-1021; see THIRD_PARTY_NOTICES.md).
 //! - Sends go only to the open channel; the local echo is reconciled on nonce and self author.
 //! - Every failure is fixed text (`&'static str`): no REST error, body or header reaches a row.
-//! - Mentions are resolved in one pass over the content; replacement names are never rescanned.
+//! - The body is parsed once, when content arrives or changes (K1); `row()` never re-parses.
+//!   Mentions are resolved by walking that AST into side data, so a resolved name is never parsed.
+//! - A reply preview is flattened from the replied message's AST: a spoiler and everything in it
+//!   become one placeholder, so a preview never shows spoiler text.
 use crate::{
-    markdown,
+    markdown::{self, Block, Inline, NavTarget, TimestampStyle},
     rest::{Rest, RestError},
     session::{SessionHandle, Subscription},
-    sidebar::avatar_url,
+    sidebar::{avatar_url, CDN},
     state::{Role, State, User},
 };
 use serde_json::Value;
 use std::{
     cmp::Reverse,
+    collections::HashSet,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
@@ -33,6 +37,12 @@ use tokio::{sync::watch, task::AbortHandle, task::JoinHandle};
 const CAP: usize = 200;
 const DISCORD_EPOCH_MS: u64 = 1_420_070_400_000;
 const CAPTCHA_TEXT: &str = "Discord asked for a captcha; send this from the official app";
+/// What a spoiler shows as in a reply preview. Provisional: K0 has not captured Discord's yet.
+const SPOILER_PLACEHOLDER: &str = "\u{2592}\u{2592}\u{2592}";
+/// Reply previews are cut to this many characters.
+const PREVIEW_CHARS: usize = 200;
+/// Distinct custom-emoji images per row (plan P3-4); further ones render as `:name:`.
+const MAX_EMOJI_IMAGES: usize = 64;
 
 /// Load state of the open channel; failures carry fixed text only.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -54,7 +64,34 @@ pub struct MessageImage {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MessageReply {
     pub author_name: String,
+    /// One line of at most `PREVIEW_CHARS` characters flattened from the replied message's body.
     pub content: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MentionKind {
+    User,
+    Role,
+    Channel,
+}
+
+/// A mention in a row's body, resolved against the payload's `mentions` (users) or the guild
+/// (roles, channels). `name` is `None` for an unknown user or channel or a deleted role; `color`
+/// is the role's colour (0 for none, and always for users and channels).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedMention {
+    pub kind: MentionKind,
+    pub id: u64,
+    pub name: Option<String>,
+    pub color: u32,
+}
+
+/// A custom emoji's image; `url` comes from `emoji_url`, never from the message text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EmojiImage {
+    pub id: u64,
+    pub animated: bool,
+    pub url: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -66,8 +103,14 @@ pub struct MessageRow {
     pub author_avatar_url: String,
     /// Highest coloured role (0xRRGGBB); `None` without a member or a coloured role.
     pub author_color: Option<u32>,
-    /// Mentions resolved; otherwise verbatim (no Markdown, no links).
+    /// The raw content, unresolved; `body` is its parse.
     pub content: String,
+    pub body: Vec<Block>,
+    /// Every distinct user, role and channel mention in `body`, in document order.
+    pub mentions: Vec<ResolvedMention>,
+    /// Image URLs of the first `MAX_EMOJI_IMAGES` distinct custom emoji in `body`; an emoji not
+    /// listed renders as `:name:`.
+    pub emoji: Vec<EmojiImage>,
     /// Creation time from the snowflake id, in Unix milliseconds.
     pub timestamp_ms: u64,
     pub edited: bool,
@@ -181,8 +224,6 @@ struct Stored {
     roles: Vec<u64>,
     content: String,
     /// `content` parsed once, when it arrives or changes (never per snapshot).
-    // ponytail: read by row() once slice K2 lands; until then only the tests read it.
-    #[cfg_attr(not(test), allow(dead_code))]
     body: Vec<markdown::Block>,
     edited: bool,
     attachments: Vec<Attachment>,
@@ -282,71 +323,216 @@ fn colour(roles: &[u64], ctx: &Context) -> Option<u32> {
         .map(|r| r.color)
 }
 
-enum Mention {
-    User(u64),
-    Channel(u64),
-    Role(u64),
+/// A custom emoji's CDN image, built from the parsed id (never from the message text).
+pub(crate) fn emoji_url(id: u64, animated: bool) -> String {
+    let ext = if animated { "gif" } else { "webp" };
+    format!("{CDN}/emojis/{id}.{ext}?size=48")
 }
 
-/// `<@id>`, `<@!id>`, `<#id>` or `<@&id>` at the start of `s`, with its byte length.
-fn mention_at(s: &str) -> Option<(Mention, usize)> {
-    let end = s.find('>')?;
-    let inner = &s[1..end];
-    let (kind, digits): (fn(u64) -> Mention, &str) = if let Some(d) = inner.strip_prefix("@&") {
-        (Mention::Role, d)
-    } else if let Some(d) = inner.strip_prefix("@!").or_else(|| inner.strip_prefix('@')) {
-        (Mention::User, d)
-    } else {
-        (Mention::Channel, inner.strip_prefix('#')?)
-    };
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    Some((kind(digits.parse().ok()?), end + 1))
-}
-
-/// One left-to-right pass: each token is replaced once and the output is never rescanned, so a
-/// name that itself contains `<@&id>` stays literal.
-fn resolve(content: &str, mentioned: &[(u64, String)], ctx: &Context) -> String {
-    let mut out = String::with_capacity(content.len());
-    let mut rest = content;
-    while let Some(start) = rest.find('<') {
-        out.push_str(&rest[..start]);
-        rest = &rest[start..];
-        let Some((mention, len)) = mention_at(rest) else {
-            out.push('<');
-            rest = &rest[1..];
-            continue;
-        };
-        match mention {
-            Mention::User(id) => match mentioned.iter().find(|(m, _)| *m == id) {
-                Some((_, name)) => {
-                    out.push('@');
-                    out.push_str(name);
-                }
-                None => out.push_str("@unknown-user"),
-            },
-            Mention::Channel(id) => match ctx.channels.iter().find(|(c, _)| *c == id) {
-                Some((_, name)) => {
-                    out.push('#');
-                    out.push_str(name);
-                }
-                None => out.push_str("#unknown"),
-            },
-            Mention::Role(id) => match ctx.roles.iter().find(|r| r.id == id) {
-                Some(Role {
-                    name: Some(name), ..
-                }) => {
-                    out.push('@');
-                    out.push_str(name);
-                }
-                _ => out.push_str("@deleted-role"),
-            },
+/// Calls `f` on every inline of `blocks` in document order, descending into containers, link
+/// labels and blocks inside inlines. Depth is bounded by the parser's nesting limit.
+fn each_inline(blocks: &[Block], f: &mut impl FnMut(&Inline)) {
+    for b in blocks {
+        match b {
+            Block::Paragraph(c) | Block::Subtext(c) | Block::Heading { content: c, .. } => {
+                each_in(c, f)
+            }
+            Block::Quote(inner) => each_inline(inner, f),
+            Block::List { items, .. } => items.iter().for_each(|i| each_inline(i, f)),
+            Block::CodeBlock { .. } => {}
         }
-        rest = &rest[len..];
     }
-    out.push_str(rest);
+}
+
+fn each_in(inlines: &[Inline], f: &mut impl FnMut(&Inline)) {
+    for i in inlines {
+        f(i);
+        match i {
+            Inline::Bold(c)
+            | Inline::Italic(c)
+            | Inline::Underline(c)
+            | Inline::Strike(c)
+            | Inline::Spoiler(c)
+            | Inline::Link { label: c, .. } => each_in(c, f),
+            Inline::Block(b) => each_inline(std::slice::from_ref(b), f),
+            _ => {}
+        }
+    }
+}
+
+fn mention_of(i: &Inline) -> Option<(MentionKind, u64)> {
+    match *i {
+        Inline::UserMention(id) => Some((MentionKind::User, id)),
+        Inline::RoleMention(id) => Some((MentionKind::Role, id)),
+        Inline::ChannelMention(id) => Some((MentionKind::Channel, id)),
+        _ => None,
+    }
+}
+
+/// One mention's name, `None` when unknown (or a role without a name).
+fn mention_name(
+    kind: MentionKind,
+    id: u64,
+    mentioned: &[(u64, String)],
+    ctx: &Context,
+) -> Option<String> {
+    match kind {
+        MentionKind::User => mentioned.iter().find(|(m, _)| *m == id).map(|(_, n)| n),
+        MentionKind::Channel => ctx.channels.iter().find(|(c, _)| *c == id).map(|(_, n)| n),
+        MentionKind::Role => ctx.roles.iter().find(|r| r.id == id)?.name.as_ref(),
+    }
+    .cloned()
+}
+
+/// Side data for every distinct mention in `m.body`; names are copied, never parsed.
+fn resolve_mentions(m: &Stored, ctx: &Context) -> Vec<ResolvedMention> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    each_inline(&m.body, &mut |i| {
+        let Some((kind, id)) = mention_of(i).filter(|k| seen.insert(*k)) else {
+            return;
+        };
+        let color = match kind {
+            MentionKind::Role => ctx.roles.iter().find(|r| r.id == id).map_or(0, |r| r.color),
+            _ => 0,
+        };
+        out.push(ResolvedMention {
+            kind,
+            id,
+            name: mention_name(kind, id, &m.mentions, ctx),
+            color,
+        });
+    });
     out
+}
+
+/// The first `MAX_EMOJI_IMAGES` distinct custom emoji of `body`, with their CDN URLs.
+fn emoji_images(body: &[Block]) -> Vec<EmojiImage> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    each_inline(body, &mut |i| {
+        if let Inline::CustomEmoji { id, animated, .. } = *i {
+            if out.len() < MAX_EMOJI_IMAGES && seen.insert((id, animated)) {
+                out.push(EmojiImage {
+                    id,
+                    animated,
+                    url: emoji_url(id, animated),
+                });
+            }
+        }
+    });
+    out
+}
+
+/// Wraps a substituted name in FSI…PDI, so bidi controls in it cannot reorder the line around it.
+/// Inside, a PDI with no isolate of the name's own to close is dropped (it would close the FSI
+/// early), and every isolate the name leaves open is closed, so the final PDI always closes the
+/// FSI (K2 verification F1). Embeddings and overrides end at that PDI (UAX #9).
+fn isolate(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 6);
+    out.push('\u{2068}');
+    let mut open = 0usize;
+    for c in s.chars() {
+        match c {
+            '\u{2066}'..='\u{2068}' => open += 1,
+            '\u{2069}' if open == 0 => continue,
+            '\u{2069}' => open -= 1,
+            _ => {}
+        }
+        out.push(c);
+    }
+    out.extend(std::iter::repeat_n('\u{2069}', open + 1));
+    out
+}
+
+/// What a guild-navigation token shows as (Discord's labels).
+fn nav_label(target: NavTarget) -> &'static str {
+    match target {
+        NavTarget::Customize => "Channels & Roles",
+        NavTarget::Browse => "Browse Channels",
+        NavTarget::Guide => "Server Guide",
+        NavTarget::LinkedRoles(_) => "Linked Roles",
+    }
+}
+
+fn style_letter(style: TimestampStyle) -> char {
+    match style {
+        TimestampStyle::ShortTime => 't',
+        TimestampStyle::MediumTime => 'T',
+        TimestampStyle::ShortDate => 'd',
+        TimestampStyle::LongDate => 'D',
+        TimestampStyle::LongDateShortTime => 'f',
+        TimestampStyle::FullDateShortTime => 'F',
+        TimestampStyle::ShortDateShortTime => 's',
+        TimestampStyle::ShortDateMediumTime => 'S',
+        TimestampStyle::Relative => 'R',
+    }
+}
+
+/// Reply preview: one line of at most `PREVIEW_CHARS` characters. A spoiler becomes the
+/// placeholder together with everything inside it; code keeps its text; line breaks, blocks and
+/// whitespace runs become single spaces; emoji `:name:`; mentions their resolved names, isolated.
+fn preview(m: &Stored, ctx: &Context) -> String {
+    let mut out = String::new();
+    flatten_blocks(&m.body, m, ctx, &mut out);
+    let line = out.split_whitespace().collect::<Vec<_>>().join(" ");
+    line.chars().take(PREVIEW_CHARS).collect()
+}
+
+fn flatten_blocks(blocks: &[Block], m: &Stored, ctx: &Context, out: &mut String) {
+    for b in blocks {
+        match b {
+            Block::Paragraph(c) | Block::Subtext(c) | Block::Heading { content: c, .. } => {
+                flatten(c, m, ctx, out)
+            }
+            Block::Quote(inner) => flatten_blocks(inner, m, ctx, out),
+            Block::List { items, .. } => items.iter().for_each(|i| flatten_blocks(i, m, ctx, out)),
+            Block::CodeBlock { code, .. } => out.push_str(code),
+        }
+        out.push(' ');
+    }
+}
+
+fn flatten(inlines: &[Inline], m: &Stored, ctx: &Context, out: &mut String) {
+    for i in inlines {
+        if let Some((kind, id)) = mention_of(i) {
+            let (sigil, unknown) = match kind {
+                MentionKind::User => ('@', "unknown-user"),
+                MentionKind::Role => ('@', "deleted-role"),
+                MentionKind::Channel => ('#', "unknown"),
+            };
+            let name = mention_name(kind, id, &m.mentions, ctx);
+            out.push_str(&isolate(&format!(
+                "{sigil}{}",
+                name.as_deref().unwrap_or(unknown)
+            )));
+            continue;
+        }
+        match i {
+            Inline::Text(t) | Inline::Code(t) => out.push_str(t),
+            Inline::Bold(c)
+            | Inline::Italic(c)
+            | Inline::Underline(c)
+            | Inline::Strike(c)
+            | Inline::Link { label: c, .. } => flatten(c, m, ctx, out),
+            Inline::Spoiler(_) => out.push_str(SPOILER_PLACEHOLDER),
+            Inline::Everyone => out.push_str("@everyone"),
+            Inline::Here => out.push_str("@here"),
+            Inline::CustomEmoji { name, .. } => out.push_str(&format!(":{name}:")),
+            // ponytail: the token itself; a localised date needs K4's formatter, which core lacks.
+            Inline::Timestamp { unix, style } => {
+                out.push_str(&format!("<t:{unix}:{}>", style_letter(*style)))
+            }
+            Inline::SlashCommand { name, .. } => out.push_str(&isolate(&format!("/{name}"))),
+            Inline::GuildNavigation { target, .. } => out.push_str(nav_label(*target)),
+            Inline::LineBreak => out.push(' '),
+            Inline::Block(b) => {
+                out.push(' ');
+                flatten_blocks(std::slice::from_ref(b), m, ctx, out);
+            }
+            Inline::UserMention(_) | Inline::RoleMention(_) | Inline::ChannelMention(_) => {}
+        }
+    }
 }
 
 fn row(m: &Stored, ctx: &Context, pending: bool, failure: Option<&'static str>) -> MessageRow {
@@ -370,14 +556,17 @@ fn row(m: &Stored, ctx: &Context, pending: bool, failure: Option<&'static str>) 
             m.author.discriminator.as_deref(),
         ),
         author_color: colour(&m.roles, ctx),
-        content: resolve(&m.content, &m.mentions, ctx),
+        content: m.content.clone(),
+        body: m.body.clone(),
+        mentions: resolve_mentions(m, ctx),
+        emoji: emoji_images(&m.body),
         timestamp_ms: (m.id >> 22) + DISCORD_EPOCH_MS,
         edited: m.edited,
         images,
         files,
         reply: m.reply.as_ref().map(|r| MessageReply {
             author_name: r.name(),
-            content: resolve(&r.content, &r.mentions, ctx),
+            content: preview(r, ctx),
         }),
         pending,
         failure,

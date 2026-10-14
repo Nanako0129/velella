@@ -98,15 +98,38 @@ public enum Fixtures {
         ]
         return (0..<36).map { index in
             let author = authors[(index * 5 + index / 3) % authors.count]
+            let markdown = index == 6
             return MessageItem(
                 id: "m\(index)", authorName: author.0, authorColor: author.1,
                 avatar: .initials(String(author.0.prefix(2)).uppercased()),
                 timestamp: baseTime.addingTimeInterval(Double(index) * 240),
-                text: images[index] != nil ? lines[8] : lines[index % 8],
+                text: markdown ? markdownSource : images[index] != nil ? lines[8] : lines[index % 8],
+                body: markdown ? markdownBody : nil,
                 images: images[index].map { [$0] } ?? []
             )
         }
     }()
+
+    /// One row of inline markdown: styles, a mention, a spoiler, a masked link (confirms before
+    /// opening), a timestamp with its hover tip, and a code block under a spoiler.
+    private static let markdownSource =
+        "**Bold**, *italic*, __underline__, ~~strike~~, `code`, <@1>, ||a spoiler||, [a masked link](https://example.com) and <t:1618953630:f>\n||```\nhidden block\n```||"
+
+    private static let markdownBody = MessageBody(
+        blocks: [
+            .paragraph([
+                .bold([.text("Bold")]), .text(", "), .italic([.text("italic")]), .text(", "),
+                .underline([.text("underline")]), .text(", "), .strike([.text("strike")]), .text(", "),
+                .code("code"), .text(", "), .userMention(1), .text(", "), .spoiler(id: 0, [.text("a spoiler")]),
+                .text(", "),
+                .link(id: 0, url: "https://example.com/", host: "example.com", label: [.text("a masked link")], masked: true),
+                .text(" and "), .timestamp(unix: 1_618_953_630, style: .longDateShortTime), .lineBreak,
+                // K1 keeps this break (it is not beside the block itself); the split drops it.
+                .spoiler(id: 0, [.block(.codeBlock(language: nil, code: "hidden block"))]),
+            ]),
+        ],
+        mentions: [ResolvedMention(kind: .user, id: 1, name: "Bob Example")]
+    )
 
     private static func member(_ id: String, _ name: String, _ color: RGB?, _ status: PresenceStatus = .online, _ custom: String? = nil) -> MemberRow {
         MemberRow(id: id, name: name, avatar: .initials(String(name.prefix(2)).uppercased()), roleColor: color, status: status, customStatus: custom)

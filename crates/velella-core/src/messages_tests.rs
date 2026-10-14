@@ -252,29 +252,201 @@ async fn only_the_open_channel_is_buffered() {
     assert!(now(&store, next).rows.is_empty());
 }
 
-#[test]
-fn mentions_resolve_in_one_pass_and_a_nickname_holding_a_role_token_stays_literal() {
-    let ctx = Context {
+/// A snowflake-length id (the parser takes 17-20 digits) ending in `n`.
+const fn sf(n: u64) -> u64 {
+    100_000_000_000_000_000 + n
+}
+
+/// `s` with each `{n}` replaced by `sf(n)`, so mention tokens stay readable.
+fn snow(s: &str) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(open) = rest.find('{') {
+        let close = open + rest[open..].find('}').unwrap();
+        out.push_str(&rest[..open]);
+        out.push_str(&sf(rest[open + 1..close].parse().unwrap()).to_string());
+        rest = &rest[close + 1..];
+    }
+    out + rest
+}
+
+/// Role {5} "mods" (coloured) and channel {7} "general".
+fn guild_ctx() -> Context {
+    Context {
         roles: vec![Role {
-            id: 5,
+            id: sf(5),
             permissions: 0,
             position: 1,
             name: Some("mods".into()),
-            color: 0,
+            color: 0xAA0000,
         }],
-        channels: vec![(7, "general".into())],
-    };
-    let mentioned = vec![(1, "<@&5>".to_owned()), (2, "Two".to_owned())];
-    let content = "hi <@1> <@!2> <#7> <@&5> <@3> <#8> <@&6> <@x> <@> <<@2> <a>";
-    assert_eq!(
-        resolve(content, &mentioned, &ctx),
-        "hi @<@&5> @Two #general @mods @unknown-user #unknown @deleted-role <@x> <@> <@Two <a>"
+        channels: vec![(sf(7), "general".into())],
+    }
+}
+
+fn mention(kind: MentionKind, n: u64, name: Option<&str>, color: u32) -> ResolvedMention {
+    ResolvedMention {
+        kind,
+        id: sf(n),
+        name: name.map(str::to_owned),
+        color,
+    }
+}
+
+/// Resolution walks the stored AST (never the text), once per distinct mention, and a name is
+/// side data: a nickname holding `**x** <@&{5}>` is neither parsed nor expanded (M2's rule).
+#[test]
+fn mentions_resolve_from_the_body_and_a_nickname_holding_markup_stays_literal() {
+    let nick = snow("**x** <@&{5}>");
+    let mut m = msg(
+        10,
+        5,
+        &snow(
+            "hi <@{1}> <@!{2}> <#{7}> <@&{5}> <@{3}> <#{8}> <@&{6}> <@{1}> ||<@{2}>|| **<#{7}>** \
+             <@x> `<@{4}>` <@1>",
+        ),
     );
-    // The same through a parsed message: the nickname comes from the payload's `mentions`.
-    let mut m = msg(10, 5, "<@1> and <@&5>");
-    m["mentions"] = json!([{"id": "1", "username": "u1", "member": {"nick": "<@&5>"}}]);
-    let r = row(&parse(&m, false).unwrap(), &ctx, false, None);
-    assert_eq!(r.content, "@<@&5> and @mods");
+    m["mentions"] = json!([
+        {"id": sf(1).to_string(), "username": "u1", "member": {"nick": nick}},
+        {"id": sf(2).to_string(), "username": "u2", "global_name": "Two"},
+    ]);
+    let stored = parse(&m, false).unwrap();
+    let r = row(&stored, &guild_ctx(), false, None);
+    use MentionKind::*;
+    assert_eq!(
+        r.mentions,
+        [
+            mention(User, 1, Some(&nick), 0),
+            mention(User, 2, Some("Two"), 0),
+            mention(Channel, 7, Some("general"), 0),
+            mention(Role, 5, Some("mods"), 0xAA0000),
+            mention(User, 3, None, 0),
+            mention(Channel, 8, None, 0),
+            mention(Role, 6, None, 0),
+        ]
+    );
+    // The row carries the stored parse and the raw content.
+    assert_eq!(r.body, stored.body);
+    assert_eq!(r.content, m["content"].as_str().unwrap());
+}
+
+/// The replied message as a row's reply preview, with users {2} ("Two") and {9} mentioned.
+fn preview_of(content: &str, nick9: &str) -> String {
+    let mut m = msg(20, 5, "answer");
+    m["referenced_message"] = json!({
+        "id": "8", "content": snow(content),
+        "author": {"id": "2", "username": "u2"},
+        "mentions": [
+            {"id": sf(2).to_string(), "username": "u2", "global_name": "Two"},
+            {"id": sf(9).to_string(), "username": "u9", "member": {"nick": nick9}},
+        ],
+    });
+    row(&parse(&m, false).unwrap(), &guild_ctx(), false, None)
+        .reply
+        .unwrap()
+        .content
+}
+
+#[test]
+fn a_reply_preview_never_shows_spoiler_text() {
+    assert_eq!(
+        preview_of("a ||secret|| b", "n"),
+        "a \u{2592}\u{2592}\u{2592} b"
+    );
+    assert_eq!(
+        preview_of("||```secret```||", "n"),
+        "\u{2592}\u{2592}\u{2592}"
+    );
+    for content in [
+        "||**secret** <@{2}> [x](https://secret.example)||",
+        "x ||> secret||",
+        "||# secret||",
+        "- ||```secret```||",
+        "> a ||b\n> secret||",
+    ] {
+        let p = preview_of(content, "n");
+        assert!(
+            !p.contains("secret") && p.contains('\u{2592}'),
+            "{content:?} → {p:?}"
+        );
+    }
+}
+
+#[test]
+fn a_reply_preview_flattens_the_body_to_one_line() {
+    let fsi = |s: &str| format!("\u{2068}{s}\u{2069}");
+    let nick = snow("**x** <@&{5}>");
+    assert_eq!(
+        preview_of(
+            "**b** `co  de`\nline <:cat:{123}> <@{2}> <#{7}> <@&{5}> <@{9}> <@{3}> <#{8}> <@&{6}> \
+             @everyone @here </cmd sub:{5}> <{10}:guide> <t:1:R> [lab](https://x.y) https://a.b",
+            &nick,
+        ),
+        format!(
+            "b co de line :cat: {} {} {} {} {} {} {} @everyone @here {} Server Guide <t:1:R> lab \
+             https://a.b",
+            fsi("@Two"),
+            fsi("#general"),
+            fsi("@mods"),
+            fsi(&format!("@{nick}")),
+            fsi("@unknown-user"),
+            fsi("#unknown"),
+            fsi("@deleted-role"),
+            fsi("/cmd sub"),
+        )
+    );
+    assert_eq!(preview_of("# h\n```\nx\n\ny\n```\n> q", "n"), "h x y q");
+    // A bidi override in a name stays inside its isolate.
+    assert_eq!(
+        preview_of("<@{9}> xyz", "\u{202E}abc"),
+        "\u{2068}@\u{202E}abc\u{2069} xyz"
+    );
+    // At most 200 characters (not bytes).
+    let long = "字".repeat(300);
+    assert_eq!(preview_of(&long, "n").chars().count(), 200);
+}
+
+#[test]
+fn emoji_urls_come_from_the_parsed_id_on_the_cdn() {
+    assert_eq!(
+        emoji_url(123, false),
+        "https://cdn.discordapp.com/emojis/123.webp?size=48"
+    );
+    assert_eq!(
+        emoji_url(u64::MAX, true),
+        "https://cdn.discordapp.com/emojis/18446744073709551615.gif?size=48"
+    );
+}
+
+/// Per row: distinct (id, animated) pairs in document order, spoilers included, at most 64.
+#[test]
+fn a_row_lists_at_most_64_distinct_emoji_images() {
+    let mut content = snow("<:aa:{7}> <a:aa:{7}> <:bb:{7}> ||<:cc:{8}>||");
+    for n in 100..200 {
+        content.push_str(&snow(&format!(" <:ee:{{{n}}}>")));
+    }
+    let r = row(
+        &parse(&msg(10, 5, &content), false).unwrap(),
+        &Context::default(),
+        false,
+        None,
+    );
+    assert_eq!(r.emoji.len(), 64);
+    let image = |n, animated| EmojiImage {
+        id: sf(n),
+        animated,
+        url: emoji_url(sf(n), animated),
+    };
+    assert_eq!(
+        r.emoji[..4],
+        [
+            image(7, false),
+            image(7, true),
+            image(8, false),
+            image(100, false)
+        ]
+    );
+    assert_eq!(r.emoji[63], image(160, false));
 }
 
 #[test]
@@ -365,16 +537,16 @@ fn a_reply_shows_the_referenced_author_and_text() {
     // Discord's documented example snowflake: created 2016-04-30 11:18:25.796 UTC.
     let mut m = msg(175_928_847_299_117_063, 5, "answer");
     m["referenced_message"] = json!({
-        "id": "8", "content": "question <@2>",
-        "author": {"id": "2", "username": "u2", "global_name": "Asker"},
-        "mentions": [{"id": "2", "username": "u2", "global_name": "Asker"}],
+        "id": "8", "content": snow("question <@{2}>"),
+        "author": {"id": sf(2).to_string(), "username": "u2", "global_name": "Asker"},
+        "mentions": [{"id": sf(2).to_string(), "username": "u2", "global_name": "Asker"}],
     });
     let r = row(&parse(&m, false).unwrap(), &Context::default(), false, None);
     assert_eq!(
         r.reply,
         Some(MessageReply {
             author_name: "Asker".into(),
-            content: "question @Asker".into()
+            content: "question \u{2068}@Asker\u{2069}".into()
         })
     );
     assert_eq!(r.timestamp_ms, 1_462_015_105_796);
@@ -604,4 +776,24 @@ async fn a_late_result_from_a_left_channel_is_dropped() {
         (s.channel_id, s.load, s.rows.len()),
         (6, LoadState::Loading, 0)
     );
+}
+
+/// K2 verification F1: a name holding its own PDI or isolate initiators can neither close the
+/// FSI early nor leave it open, so the author's text after it keeps its direction.
+#[test]
+fn a_name_cannot_close_or_hold_open_its_isolate_in_a_preview() {
+    for (nick, want) in [
+        ("\u{2069}\u{202E}abc", "\u{2068}@\u{202E}abc\u{2069} xyz"),
+        ("\u{2067}abc", "\u{2068}@\u{2067}abc\u{2069}\u{2069} xyz"),
+        (
+            "\u{2066}\u{2068}abc",
+            "\u{2068}@\u{2066}\u{2068}abc\u{2069}\u{2069}\u{2069} xyz",
+        ),
+        (
+            "a\u{2066}b\u{2069}c",
+            "\u{2068}@a\u{2066}b\u{2069}c\u{2069} xyz",
+        ),
+    ] {
+        assert_eq!(preview_of("<@{9}> xyz", nick), want, "nick {nick:?}");
+    }
 }

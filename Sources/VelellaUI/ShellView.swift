@@ -102,6 +102,7 @@ public struct ShellView: View {
         // the member list, so no divider position can push the window wider.
         .frame(minWidth: T.Size.windowMinWidth, minHeight: T.Size.windowMinHeight)
         .containerBackground(T.Palette.windowMaterial, for: .window)
+        .environment(\.discordLocale, Locale(identifier: state.locale))
     }
 
     /// DM mode: search; a server: its menu, whose "⌄" is the native toolbar menu indicator
