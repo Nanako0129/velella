@@ -175,6 +175,8 @@ public struct MessageItem: Identifiable, Hashable, Sendable {
     }
 
     public var id: String
+    /// Who wrote it: consecutive rows of one author group under one header (T1).
+    public var authorId: String
     public var authorName: String
     public var authorColor: RGB?
     public var avatar: Avatar
@@ -190,14 +192,15 @@ public struct MessageItem: Identifiable, Hashable, Sendable {
     public var reply: ReplyPreview?
     public var edited: Bool
     public var delivery: Delivery
-    /// Without a `body`, `text` shows as one plain paragraph.
+    /// Without a `body`, `text` shows as one plain paragraph. Without an `authorId` (fixtures,
+    /// previews) the name stands in for it.
     public init(
-        id: String, authorName: String, authorColor: RGB? = nil, avatar: Avatar, timestamp: Date, text: String,
+        id: String, authorId: String? = nil, authorName: String, authorColor: RGB? = nil, avatar: Avatar, timestamp: Date, text: String,
         body: MessageBody? = nil,
         displayNameStyle: DisplayNameStyle? = nil, images: [ImageAttachment] = [], files: [String] = [],
         reply: ReplyPreview? = nil, edited: Bool = false, delivery: Delivery = .sent
     ) {
-        self.id = id; self.authorName = authorName; self.authorColor = authorColor
+        self.id = id; self.authorId = authorId ?? authorName; self.authorName = authorName; self.authorColor = authorColor
         self.avatar = avatar; self.timestamp = timestamp; self.text = text
         self.body = body ?? MessageBody(text: text)
         self.displayNameStyle = displayNameStyle; self.images = images; self.files = files
@@ -224,12 +227,12 @@ public extension MessageItem {
     /// One engine row, passed as plain values (VelellaUI sees no FFI types; the app maps core's
     /// AST onto `body`). Text is kept as is.
     static func live(
-        id: UInt64, authorName: String, authorColor: UInt32?, avatarURL: String, timestampMs: UInt64,
+        id: UInt64, authorId: UInt64, authorName: String, authorColor: UInt32?, avatarURL: String, timestampMs: UInt64,
         content: String, body: MessageBody, edited: Bool, images: [(url: String, width: UInt32, height: UInt32)],
         files: [String], replyAuthor: String?, replyContent: String?, pending: Bool, failure: String?
     ) -> MessageItem {
         MessageItem(
-            id: String(id), authorName: authorName, authorColor: authorColor.map { RGB(rgb: $0) },
+            id: String(id), authorId: String(authorId), authorName: authorName, authorColor: authorColor.map { RGB(rgb: $0) },
             avatar: URL(string: avatarURL).map(Avatar.url) ?? .initials(initials(of: authorName)),
             timestamp: Date(timeIntervalSince1970: Double(timestampMs) / 1000), text: content, body: body,
             images: images.compactMap { image in
