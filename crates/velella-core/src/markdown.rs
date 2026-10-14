@@ -520,7 +520,7 @@ fn rule(
     if blocks_ok
         && st.quote_start
         && !st.in_heading
-        && matches!(c, b' ' | b'-' | b'*' | b'+' | b'0'..=b'9')
+        && matches!(c, b' ' | b'-' | b'*' | b'0'..=b'9')
     {
         if let Some(list) = list(s, pos) {
             tick(list.end - pos);
@@ -849,28 +849,38 @@ struct Marker {
     content: usize,
 }
 
-/// A list item line: up to 11 spaces, `-`, `*`, `+` or 1-9 digits and `.`, then at least one
-/// space.
+/// Largest ordered-list number: the official client shows `1234567890.` as `1000000000.` (K0,
+/// `refs/discord-ground-truth/captures/k0-edge.png`), and `start` plus any item count fits `u32`.
+const MAX_LIST_NUMBER: u32 = 1_000_000_000;
+
+/// A list item line: up to 11 spaces, `-`, `*` or one or more digits and `.`, then at least one
+/// space (`+` is text in the official client, K0). The number saturates; leading zeros count.
 fn list_marker(line: &[u8]) -> Option<Marker> {
     let indent = line.iter().take_while(|&&x| x == b' ').count();
+    tick(indent + 1);
     if indent > 11 {
         return None;
     }
     let rest = &line[indent..];
     let (ordered, number, len) = match rest.first()? {
-        b'-' | b'*' | b'+' => (false, 0, 1),
+        b'-' | b'*' => (false, 0, 1),
         _ => {
             let digits = rest.iter().take_while(|x| x.is_ascii_digit()).count();
-            if !(1..=9).contains(&digits) || rest.get(digits) != Some(&b'.') {
+            tick(digits);
+            if digits == 0 || rest.get(digits) != Some(&b'.') {
                 return None;
             }
             let number = rest[..digits]
                 .iter()
-                .fold(0u32, |n, d| n * 10 + u32::from(d - b'0'));
+                .fold(0u32, |n, d| {
+                    n.saturating_mul(10).saturating_add(u32::from(d - b'0'))
+                })
+                .min(MAX_LIST_NUMBER);
             (true, number, digits + 1)
         }
     };
     let spaces = rest[len..].iter().take_while(|&&x| x == b' ').count();
+    tick(spaces);
     (spaces > 0).then_some(Marker {
         indent,
         ordered,
@@ -880,15 +890,18 @@ fn list_marker(line: &[u8]) -> Option<Marker> {
 }
 
 /// The list grammar (plan D1). Items continue on lines indented to their content column or
-/// holding a deeper marker; a marker at the list's indent starts the next item; a blank line or
-/// any other line ends the list.
+/// holding a deeper marker; a marker at the list's indent starts the next item, of either kind
+/// (the list keeps its first item's kind: the official client continues `- b` with `1. a` as
+/// bullets, K0); a blank line or any other line ends the list.
 fn list(s: &str, pos: usize) -> Option<ListMatch> {
     let b = s.as_bytes();
     let line_end = |from: usize| {
-        b[from..]
+        let end = b[from..]
             .iter()
             .position(|&x| x == b'\n')
-            .map_or(b.len(), |n| from + n)
+            .map_or(b.len(), |n| from + n);
+        tick(end - from + 1);
+        end
     };
     let mut eol = line_end(pos);
     let first = list_marker(&b[pos..eol])?;
@@ -908,9 +921,6 @@ fn list(s: &str, pos: usize) -> Option<ListMatch> {
         let indent = line.iter().take_while(|&&x| x == b' ').count();
         if let Some(m) = list_marker(line) {
             if m.indent == first.indent {
-                if m.ordered != first.ordered {
-                    break eol + 1;
-                }
                 items.push(std::mem::take(&mut item));
                 item.push_str(&s[next + m.content..next_eol]);
                 column = m.content;

@@ -185,8 +185,9 @@ fn oracle_depth(nodes: &Value) -> usize {
         .unwrap_or(0)
 }
 
-/// D1: a list marker and a space anywhere a line could start, after nothing but ASCII
-/// punctuation and spaces on its line (generous: containers may open before a list).
+/// D1: a list marker (`-`, `*`, or one or more digits and `.`; K5 dropped `+` and the nine-digit
+/// cap) and a space anywhere a line could start, after nothing but ASCII punctuation and spaces
+/// on its line (generous: containers may open before a list). Reads the input text only.
 fn d1_lists(input: &str) -> bool {
     // As the oracle's preprocess sees it (written out here, not velella's function).
     let input = input
@@ -203,8 +204,7 @@ fn d1_lists(input: &str) -> bool {
                 let digits = rest.iter().take_while(|x| x.is_ascii_digit()).count();
                 rest.starts_with(b"- ")
                     || rest.starts_with(b"* ")
-                    || rest.starts_with(b"+ ")
-                    || ((1..=9).contains(&digits) && rest[digits..].starts_with(b". "))
+                    || (digits > 0 && rest[digits..].starts_with(b". "))
             })
     })
 }
@@ -375,7 +375,8 @@ fn the_pre_grouping_stream_matches_the_oracle_fixture_outside_d1_to_d7() {
 #[test]
 fn the_deviation_predicates_catch_their_cases_and_spare_plain_ones() {
     assert!(d1_lists("- a") && d1_lists("x\n  * a") && d1_lists("**1. a**"));
-    assert!(!d1_lists("x - a") && !d1_lists("1234567890. a") && !d1_lists("-a"));
+    assert!(d1_lists("1234567890. a") && d1_lists("00000000000001. a"));
+    assert!(!d1_lists("x - a") && !d1_lists("-a") && !d1_lists("+ a") && !d1_lists("1) a"));
     assert!(d2_ids("<@00000000000000000>") && d2_ids("<@18446744073709551616>"));
     assert!(d2_ids("</:12345678901234567>") && !d2_ids("<@18446744073709551615>"));
     assert!(d3_timestamps("<t:99999999999999999:f>") && d3_timestamps("<t:-8640000000001>"));
@@ -512,6 +513,23 @@ fn autolinks_and_plain_urls_are_canonical_unmasked_links() {
             t(").")
         ])
     );
+    // The inputs of the Swift test `plainLinksShowTheirCanonicalURL`: the label stays as typed
+    // (the oracle compares it literally); the views show `url`.
+    for (typed, url, host) in [
+        ("https://a.b", "https://a.b/", "a.b"),
+        ("https://a.b/ñ", "https://a.b/%C3%B1", "a.b"),
+        (
+            "https://例え.jp",
+            "https://xn--r8jz45g.jp/",
+            "xn--r8jz45g.jp",
+        ),
+    ] {
+        assert_eq!(
+            parse(typed),
+            one(vec![link(url, host, vec![t(typed)], false)]),
+            "{typed}"
+        );
+    }
 }
 
 #[test]
@@ -836,22 +854,40 @@ fn item(s: &str) -> Vec<Block> {
     vec![para(vec![t(s)])]
 }
 
+/// K0 (`refs/discord-ground-truth/captures/k0-edge.png`): the official client shows
+/// `1234567890. 十位數編號` as item `1000000000.` and `+ 加號清單` as text.
 #[test]
-fn list_markers_are_dash_star_plus_or_up_to_nine_digits_and_a_dot() {
-    for marker in ["- a", "* a", "+ a"] {
+fn list_markers_are_dash_star_or_digits_and_a_dot() {
+    for marker in ["- a", "* a"] {
         assert_eq!(
             parse(marker),
             vec![list(false, 0, vec![item("a")])],
             "{marker}"
         );
     }
+    assert_eq!(parse("+ a"), one(vec![t("+ a")]));
+    assert_eq!(parse("  + a"), one(vec![t("  + a")]));
     assert_eq!(parse("3. a"), vec![list(true, 3, vec![item("a")])]);
     assert_eq!(
         parse("999999999. a"),
         vec![list(true, 999_999_999, vec![item("a")])]
     );
-    assert_eq!(parse("1234567890. a"), one(vec![t("1234567890. a")]));
-    assert_eq!(parse("4294967295. a"), one(vec![t("4294967295. a")]));
+    let capped = vec![list(true, 1_000_000_000, vec![item("a")])];
+    assert_eq!(parse("1234567890. a"), capped);
+    assert_eq!(parse("4294967295. a"), capped);
+    // Wraps to 5 without saturation.
+    assert_eq!(parse("4294967301. a"), capped);
+    // Leading zeros count, as in JS `parseInt`.
+    assert_eq!(
+        parse("00000000000001. a"),
+        vec![list(true, 1, vec![item("a")])]
+    );
+    assert_eq!(parse("0. a"), vec![list(true, 0, vec![item("a")])]);
+    // 16 KiB in all (the input limit), nearly all digits: saturates, never traps.
+    let long = format!("{}. a", "9".repeat(MAX_INPUT - 3));
+    assert_eq!(long.len(), MAX_INPUT);
+    assert_eq!(parse(&long), capped);
+    assert_eq!(parse("1) a"), one(vec![t("1) a")]));
 }
 
 #[test]
@@ -961,11 +997,6 @@ fn list_cases_the_grammar_table_leaves_open() {
         "bullets may differ"
     );
     assert_eq!(
-        parse("- a\n1. b"),
-        vec![ul(vec![item("a")]), list(true, 1, vec![item("b")])],
-        "an ordered marker ends a bullet list"
-    );
-    assert_eq!(
         parse("  - a\n- b"),
         vec![ul(vec![item("a")]), ul(vec![item("b")])],
         "a shallower marker ends the list"
@@ -989,6 +1020,24 @@ fn list_cases_the_grammar_table_leaves_open() {
         one(vec![Inline::Spoiler(vec![Inline::Block(Box::new(ul(
             vec![item("a")]
         )))])])
+    );
+}
+
+/// K0 (findings table, "`1. a` right after `- b`"): a marker of the other kind continues the list,
+/// which keeps its first item's kind.
+#[test]
+fn a_marker_of_the_other_kind_continues_the_list() {
+    assert_eq!(
+        parse("- b\n1. a"),
+        vec![list(false, 0, vec![item("b"), item("a")])]
+    );
+    assert_eq!(
+        parse("1. a\n- b"),
+        vec![list(true, 1, vec![item("a"), item("b")])]
+    );
+    assert_eq!(
+        parse("3. a\n- b\n7. c"),
+        vec![list(true, 3, vec![item("a"), item("b"), item("c")])]
     );
 }
 
@@ -1311,6 +1360,12 @@ fn step_patterns(n: usize) -> Vec<(String, String)> {
         }
         patterns.push((name.into(), lines));
     }
+    // K5: ordered markers of any length; mixed kinds make one long list.
+    patterns.push((
+        "digit run, then `. a`".into(),
+        format!("{}. a", "1".repeat(n)),
+    ));
+    patterns.push(("alternating - a / 1. a".into(), repeat_to("- a\n1. a\n", n)));
     patterns.push((
         "unclosed fence".into(),
         format!("```\n{}", repeat_to("a\n", n)),

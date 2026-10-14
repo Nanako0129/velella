@@ -148,8 +148,11 @@ private struct Numbering {
             return .spoiler(id: id, inlines(c))
         case .link(_, let url, let host, let label, let masked):
             let id = links.count
-            links.append(LinkTarget(url: url, host: host, masked: masked, visibleText: MarkdownText.plainText(label)))
-            return .link(id: id, url: url, host: host, label: inlines(label), masked: masked)
+            // A plain link shows its canonical URL, as the official client does (K0); the one
+            // label feeds both what is drawn and the confirmation rule.
+            let shown = masked ? inlines(label) : [.text(url)]
+            links.append(LinkTarget(url: url, host: host, masked: masked, visibleText: MarkdownText.plainText(shown)))
+            return .link(id: id, url: url, host: host, label: shown, masked: masked)
         case .block(let b): return .block(block(b))
         default: return inline
         }

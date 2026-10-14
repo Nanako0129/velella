@@ -22,6 +22,8 @@ final class AppModel {
     // Sidebar subscriptions. Dropping a SidebarSubscription stops its deliveries on the Rust side.
     @ObservationIgnored private var guildsSub: SidebarSubscription?
     @ObservationIgnored private var dmsSub: SidebarSubscription?
+    /// The account's locale: READY, then every USER_SETTINGS_UPDATE that changes it (no reconnect).
+    @ObservationIgnored private var localeSub: SidebarSubscription?
     @ObservationIgnored private var channelsSub: SidebarSubscription?
     /// Guild of the live `channelsSub`; the only guild whose channel snapshots may be applied.
     @ObservationIgnored private var channelsGuild: UInt64?
@@ -99,7 +101,6 @@ final class AppModel {
             shell.currentUser = CurrentUser(
                 displayName: username, username: username, avatar: .initials(String(username.prefix(1)).uppercased())
             )
-            shell.locale = handle?.locale() ?? "en-US"
             subscribeSidebar(generation: gen)
             let token = pending?.token
             pending = nil
@@ -145,12 +146,14 @@ final class AppModel {
         shell.rail = [.dm(.directMessages)]
         guildsSub = handle.subscribeGuilds(listener: GuildsSnapshots(model: self, generation: gen))
         dmsSub = handle.subscribeDms(listener: DMSnapshots(model: self, generation: gen))
+        localeSub = handle.subscribeLocale(listener: LocaleUpdates(model: self, generation: gen))
         if shell.selectedRailID == nil { shell.selectedRailID = Self.dmRailID }
     }
 
     private func dropSubscriptions() {
         guildsSub = nil
         dmsSub = nil
+        localeSub = nil
         channelsSub = nil
         channelsGuild = nil
         guildNames = [:]
@@ -356,6 +359,11 @@ final class AppModel {
         }
     }
 
+    fileprivate func apply(locale: String?, generation gen: UInt64) {
+        guard gen == generation else { return }
+        shell.locale = locale ?? "en-US"
+    }
+
     fileprivate func apply(dms: [SidebarDm], friendsPending: UInt32, generation gen: UInt64) {
         guard gen == generation else { return }
         shell.applyDMs(dms.map(Self.dmEntry), friendsPending: Int(friendsPending))
@@ -510,6 +518,16 @@ private final class MessageSnapshots: MessagesListener {
         DispatchQueue.main.async { [model, generation, open] in
             model.apply(messages: snapshot, open: open, generation: generation)
         }
+    }
+}
+
+private final class LocaleUpdates: LocaleListener {
+    let model: AppModel
+    let generation: UInt64
+    init(model: AppModel, generation: UInt64) { self.model = model; self.generation = generation }
+
+    func onLocale(locale: String?) {
+        DispatchQueue.main.async { [model, generation] in model.apply(locale: locale, generation: generation) }
     }
 }
 

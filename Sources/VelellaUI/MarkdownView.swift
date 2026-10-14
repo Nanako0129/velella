@@ -57,7 +57,8 @@ struct LinkRouter {
     }
 
     /// Rebuilt from core's canonical URL and re-checked: http(s), core's host, no userinfo. Masked
-    /// links, `xn--` hosts and text that is not the URL confirm first (Q5); plain links open.
+    /// links, `xn--` hosts and text that is not the URL confirm first (Q5); plain links, which
+    /// show their canonical URL (`Numbering`), open.
     private func follow(_ link: LinkTarget) {
         guard let target = URL(string: link.url),
               let scheme = target.scheme?.lowercased(), scheme == "http" || scheme == "https",
@@ -67,9 +68,7 @@ struct LinkRouter {
     }
 
     static func needsConfirmation(_ link: LinkTarget) -> Bool {
-        // WHATWG adds the "/" of an empty path: `https://a.b` shows as typed, canonical `https://a.b/`.
-        let showsURL = link.visibleText == link.url || link.visibleText + "/" == link.url
-        return link.masked || !showsURL || link.host.split(separator: ".").contains { $0.lowercased().hasPrefix("xn--") }
+        link.masked || link.visibleText != link.url || link.host.split(separator: ".").contains { $0.lowercased().hasPrefix("xn--") }
     }
 }
 
@@ -177,8 +176,8 @@ enum BlockModel: Equatable {
         }
     }
 
-    /// Numbers are computed in `Int`: `start` is at most 999_999_999 (K1) and a `UInt32` plus any
-    /// item index cannot overflow it. Bullets step through `bullets` by nesting depth.
+    /// Numbers are computed in `Int`: core caps `start` at 1_000_000_000 (K5), and any `UInt32`
+    /// plus an item index cannot overflow it. Bullets step through `bullets` by nesting depth.
     static func markers(ordered: Bool, start: UInt32, count: Int, depth: Int) -> [String] {
         if ordered { return (0..<count).map { "\(Int(start) + $0)." } }
         let bullets = MarkdownBlockStyle.bullets

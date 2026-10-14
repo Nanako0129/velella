@@ -279,6 +279,46 @@ private func linkBody(_ url: String, host: String, label: String, masked: Bool =
     #expect(recorder.confirmations.isEmpty)
 }
 
+/// K5 plain links: what core produces for a typed URL (canonical `url`, typed label) shows the
+/// canonical URL, as the official client does (K0: `https://discord.com/`), and the confirmation
+/// rule sees the same text. Each case: (typed, url, host, shown, confirms).
+@Test func plainLinksShowTheirCanonicalURL() {
+    let cases: [(typed: String, url: String, host: String, shown: String, confirms: Bool)] = [
+        ("https://a.b", "https://a.b/", "a.b", "https://a.b/", false),
+        ("https://a.b/ñ", "https://a.b/%C3%B1", "a.b", "https://a.b/%C3%B1", false),
+        ("https://例え.jp", "https://xn--r8jz45g.jp/", "xn--r8jz45g.jp", "https://xn--r8jz45g.jp/", true),
+    ]
+    for c in cases {
+        let s = segments([.link(id: 0, url: c.url, host: c.host, label: [.text(c.typed)], masked: false)])
+        #expect(plain(s) == c.shown, "\(c.typed)")
+        #expect(links(s) == [MarkdownText.linkURL(0)])
+        let recorder = Recorder()
+        let body = MessageBody(blocks: [.paragraph([.link(id: 0, url: c.url, host: c.host, label: [.text(c.typed)], masked: false)])])
+        #expect(body.links.map(\.visibleText) == [c.shown])
+        _ = recorder.router(body).handle(MarkdownText.linkURL(0))
+        #expect(recorder.confirmations.count == (c.confirms ? 1 : 0), "\(c.typed)")
+        #expect(recorder.opened == (c.confirms ? [] : [URL(string: c.url)!]), "\(c.typed)")
+    }
+    // A masked link keeps its label and still confirms.
+    let masked = MessageBody(blocks: [.paragraph([.link(id: 0, url: "https://a.b/", host: "a.b", label: [.text("看這裡")], masked: true)])])
+    guard case .paragraph(let inlines) = masked.blocks[0] else { Issue.record("not a paragraph"); return }
+    #expect(plain(MarkdownText(body: masked).segments(inlines, context: context)) == "看這裡")
+    let recorder = Recorder()
+    _ = recorder.router(masked).handle(MarkdownText.linkURL(0))
+    #expect(recorder.confirmations.count == 1 && recorder.opened.isEmpty)
+}
+
+/// K2 verification S12: the handler answers `.handled` for every URL, so nothing reaches the
+/// system's own URL handling.
+@Test func theLinkHandlerAlwaysHandles() {
+    let router = Recorder().router(linkBody("https://example.com/", host: "example.com", label: "https://example.com"))
+    let handled = String(describing: OpenURLAction.Result.handled)
+    for raw in ["velella-spoiler:0", "velella-link:0", "velella-link:9", "https://example.com/", "file:///etc/passwd", "garbage:", "x"] {
+        #expect(String(describing: router.handle(URL(string: raw)!)) == handled, "\(raw)")
+    }
+    #expect(String(describing: OpenURLAction.Result.systemAction) != handled)
+}
+
 @Test func aSpoilerURLRevealsAndNeverOpens() {
     let recorder = Recorder()
     let router = recorder.router(linkBody("https://example.com/", host: "example.com", label: "https://example.com"))
@@ -317,7 +357,7 @@ private func linkBody(_ url: String, host: String, label: String, masked: Bool =
         linkBody("https://example.com/", host: "example.com", label: "click", masked: true),
         linkBody("https://example.com/", host: "example.com", label: "https://example.com", masked: true),
         linkBody("https://xn--80ak6aa92e.com/", host: "xn--80ak6aa92e.com", label: "https://xn--80ak6aa92e.com"),
-        linkBody("https://example.com/", host: "example.com", label: "HTTPS://EXAMPLE.COM"),
+        linkBody("https://example.com/", host: "example.com", label: "https://example.com/", masked: true),
     ]
     for body in cases {
         let recorder = Recorder()
@@ -349,9 +389,9 @@ private func linkBody(_ url: String, host: String, label: String, masked: Bool =
         .list(ordered: false, start: 1, items: [[.paragraph([.bold([.spoiler(id: 7, [.block(.paragraph([.link(id: 7, url: "https://e.f/", host: "e.f", label: [.text("e")], masked: true)]))])])])]]),
     ])
     #expect(body.links.map(\.url) == ["https://a.b/", "https://c.d/", "https://e.f/"])
-    #expect(body.links.map(\.visibleText) == ["a", "https://c.d", "e"])
+    #expect(body.links.map(\.visibleText) == ["a", "https://c.d/", "e"])
     #expect(body.spoilerCount == 4)
-    #expect(body.blocks[1] == .quote([.paragraph([.spoiler(id: 1, [.spoiler(id: 2, [.text("x")])]), .link(id: 1, url: "https://c.d/", host: "c.d", label: [.text("https://c.d")], masked: false)])]))
+    #expect(body.blocks[1] == .quote([.paragraph([.spoiler(id: 1, [.spoiler(id: 2, [.text("x")])]), .link(id: 1, url: "https://c.d/", host: "c.d", label: [.text("https://c.d/")], masked: false)])]))
 }
 
 // MARK: The paragraph host
@@ -432,6 +472,33 @@ private func linkBody(_ url: String, host: String, label: String, masked: Bool =
     #expect(spoken == "a Spoiler b")
     let shown = segments([.spoiler(id: 0, [.text("secret")])], revealed: [0])
     #expect(ParagraphView.spoken(shown) == "secret")
+}
+
+/// The accessibility labels and values under `element`. SwiftUI's nodes answer the
+/// `NSAccessibility` selectors without declaring the protocol to Swift, so they are sent as messages.
+@MainActor private func spokenTexts(_ element: Any) -> [String] {
+    guard let object = element as? NSObject else { return [] }
+    func send(_ name: String) -> Any? {
+        let selector = NSSelectorFromString(name)
+        return object.responds(to: selector) ? object.perform(selector)?.takeUnretainedValue() : nil
+    }
+    let own = [send("accessibilityLabel"), send("accessibilityValue")].compactMap { $0 as? String }.filter { !$0.isEmpty }
+    return own + ((send("accessibilityChildren") as? [Any]) ?? []).flatMap(spokenTexts)
+}
+
+/// K2 verification A-2: the spoken label is attached to the drawn paragraph, so VoiceOver reads
+/// "Spoiler" in place of hidden text. Offscreen: the window is never ordered in.
+@MainActor @Test func theDrawnParagraphSpeaksItsLabelNotHiddenText() {
+    let s = segments([.text("a "), .spoiler(id: 0, [.text("secret")]), .text(" b")])
+    let host = NSHostingView(rootView: ParagraphView { _ in s }.frame(width: 320))
+    let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 320, height: 80), styleMask: .borderless, backing: .buffered, defer: true)
+    window.contentView = host
+    // What an assistive app sets on the application; SwiftUI builds no accessibility nodes before.
+    NSApplication.shared.accessibilitySetValue(true, forAttribute: NSAccessibility.Attribute(rawValue: "AXEnhancedUserInterface"))
+    host.layoutSubtreeIfNeeded()
+    let spoken = spokenTexts(host)
+    #expect(spoken.contains("a Spoiler b"), "\(spoken)")
+    #expect(!spoken.contains { $0.contains("secret") }, "\(spoken)")
 }
 
 /// P2-4/N3: only https on Discord's emoji CDN is ever fetched.
