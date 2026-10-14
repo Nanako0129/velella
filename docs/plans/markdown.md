@@ -340,9 +340,12 @@ The user chose Vencord's ShikiCodeblocks look as the default and `syntect` as th
 - `Cargo.toml` and `Cargo.lock` (velella-core only);
 - `crates/velella-core/src/highlight.rs` and `highlight_tests.rs` (new);
 - `crates/velella-core/assets/vscode-dark-plus/` (main vendors it; read-only to the executor);
-- `messages.rs`: `Stored.highlights` at the three body assignments, `history()` parsing before the lock, `row()` attaching highlights to nodes;
-- FFI `markdown.rs`: `MdBlock::CodeBlock` gains `highlight`;
-- `AppModel.swift` mapping;
+- core `markdown.rs`: `Block::CodeBlock` gains `highlight: Option<Highlighted>` (the parser sets `None`), plus the `CodeBlock` literals in `markdown_tests.rs`;
+- `messages.rs`: the three body assignments fill each `CodeBlock`'s `highlight` in place; `history()` parses before the lock;
+- FFI `markdown.rs`: `MdBlock::CodeBlock` gains `highlight`, converted with the node;
+- `MarkdownText.swift`: the `MarkdownBlock.codeBlock` case and its matches only;
+- `Fixtures.swift`: `codeBlock` literals;
+- `AppModel.swift`: the mapping of the new field;
 - `MarkdownView.swift`: the code-block view only;
 - `THIRD_PARTY_NOTICES.md`.
 
@@ -407,7 +410,7 @@ Header names come only from this table, never from the fence text (shown with `T
 |---|---|
 | Dependency | `syntect = { version = "=5.3.0", default-features = false, features = ["parsing", "default-syntaxes", "regex-fancy"] }` in velella-core only, with `Cargo.lock` committed. Only `SyntaxSet::load_defaults_newlines()` is called: no `from_dump_file`, `from_binary`, `load_from_folder`, `ThemeSet` loading or `find_syntax_by_first_line`. Only the fence selects the grammar. Recorded checks: `cargo tree -p velella-core -e features -i syntect`; `cargo tree -i onig` and `-i onig_sys` empty; `cargo tree -i bincode` shows 1.3.3 via syntect only. THIRD_PARTY_NOTICES rows: syntect; fancy-regex with bit-set/bit-vec; bincode, noting RUSTSEC-2025-0141 (unmaintained; only the bundled dump goes through it); walkdir; fnv; regex-syntax; the sublimehq/Packages grammars; Vencord (`shikiCodeblocks`, GPL-3.0); VS Code (MIT). |
 | Theme | Main vendors `dark_plus.json` and `dark_vs.json` from microsoft/vscode at `1b92929b5683438c738ded7708c5418e9ff476ec` (MIT), converted to strict JSON with comments and trailing commas removed and nothing else changed. Both SHA-256 values go in the assets README and THIRD_PARTY_NOTICES. Core embeds them with `include_str!` and resolves `include` only to the other embedded file. A `scope` may be a string or an array; a selector syntect cannot parse skips that entry only. Background and default foreground come from `colors.editor.background` / `editor.foreground`. The theme is held in a `OnceLock<Option<Theme>>`. Test: the shipped assets build a theme with 0 skipped entries and at least 60 rules, with `#569CD6` on `keyword`. |
-| Computing | `highlight(code, language) -> Option<Highlighted>`, where `Highlighted{name, lines: Vec<Vec<Span{text, rgb, bold, italic, underline}>>}` and adjacent same-style spans are merged. It is computed at every `Stored.body` assignment (`parse`, `merge`, `begin_send`) into `Stored.highlights`, one per code block in core's pre-order walk (blocks, then `Inline::Block`). A nested `referenced_message` is never highlighted. `row()` attaches each highlight to its own `CodeBlock` node while converting that node, so no index table crosses FFI. A core property test, over the corpus and a fuzz set, checks that the spans' concatenated text equals the block's `code`. |
+| Computing | `highlight(code, language) -> Option<Highlighted>`, where `Highlighted{name, lines: Vec<Vec<Span{text, rgb, bold, italic, underline}>>}` and adjacent same-style spans are merged. **Carrier:** the highlight lives on its own node, as `Block::CodeBlock{language, code, highlight}`. The parser sets `highlight` to `None`. Every `Stored.body` assignment (`parse`, `merge`, `begin_send`) then walks the body mutably, including blocks inside `Inline::Block`, and fills each `CodeBlock`'s `highlight` from that block's own `code`. `row()` clones the body unchanged, and the FFI `From` conversion carries `highlight` with the node. No highlight ever crosses as a positional `Vec`. A nested `referenced_message` is never highlighted. The differential test compares `CodeBlock` without `highlight`, since the parser always leaves it `None`. A core property test, over the corpus and a fuzz set, checks that the spans' concatenated text equals the block's `code`. |
 | Limits (untrusted input) | A block with a line longer than 1024 bytes, more than 2000 lines, or more than 4096 spans after merging gets `None`. One wall-clock budget of 25 ms per message, shared by its blocks, is checked before each line; once it is spent, every remaining block is `None`. The clock starts after the syntax set and theme exist; `highlight::warm()` builds them on a background thread when the message store is created, so the first block is not starved. fancy-regex keeps its default limit of 1,000,000 backtrack steps per search: syntect 5.3.0 has no setter and maps a limit error to no match. That bounds one search, not one line, so the line cap is the real bound. `history()` parses and highlights the fetched list **before** taking the store lock; `observe()` stays under the lock, bounded by the per-message budget. Measured acceptance, in release: on the adversarial corpus (1024-byte runs of `(`, `"\"`, `/*`, `/[`, `a=`, `<a `, `${`, backticks, `\\`, and one long word), through every aliased syntax and through `md`, the worst capped line takes ≤ 10 ms. If it doesn't, lower the cap and record the measured value. A message of 20 maximum-cost blocks finishes under 40 ms in total. |
 | Panics | `catch_unwind(AssertUnwindSafe(...))` wraps only the computation, which writes to locals and returns its value. No velella state is mutated inside it, and a panic discards the whole result (`None`). The workspace never sets `panic = "abort"`. The default panic hook's stderr line is accepted: there is no logger, and stderr is not persisted. Tests: every syntax in `load_defaults_newlines()` highlights a 3-line sample without panicking; an injected panic gives `None`. |
 | Swift view | `MarkdownView`'s code-block view takes the Vencord look:<br>• the header (name from the table, and the SF Symbol `chevron.left.forwardslash.chevron.right`, provisional, standing in for devicons, which are a web font);<br>• a line-number column, only for blocks of ≤ 2000 lines (longer ones keep K3's plain block);<br>• wrapped code at 0.875 × body with an 18 pt line height, on the theme background, radius 4;<br>• for display only, C0 except `\n` and `\t`, DEL, C1 and the bidi controls U+061C, U+200E, U+200F, U+202A-202E and U+2066-2069 drawn as `\u{XXXX}`, as `LinkConfirmation.escaped` does, with ZWJ untouched.<br>Spans are used only when their concatenated text equals the block's `code`; otherwise the block renders plain. Spoiler cover, container rules and `Equatable` stay as K3 left them. |
@@ -438,18 +441,20 @@ Header names come only from this table, never from the fence text (shown with `T
 | K6-3 | No alias table | FIX: language table, with every target checked against syntect's names |
 | K6-4 | Limits do not bound the work | FIX: Limits row |
 | K6-5 | Side-table index alignment | FIX: highlights on the node; equality checks |
+| K6-1 (closing review, 7cc37be) | No type could carry a highlight onto the node within K6's files | FIX: `highlight` field on core `Block::CodeBlock`, filled in place; `markdown.rs`, `markdown_tests.rs` literals, `MarkdownText.swift` case, `Fixtures.swift` added to K6's Files and ownership; the user chose to start after this fix without another round (2026-10-14). Test: a hidden-spoiler code block before a visible one, through the FFI conversion, leaves the visible `MdBlock::CodeBlock`'s spans joined to exactly its own `code` |
 
 ### File ownership (K5, K6)
 
 | File | K5 | K6 |
 |---|---|---|
-| `markdown.rs`, `markdown_tests.rs` | list grammar, predicate, ticks | — |
+| `markdown.rs`, `markdown_tests.rs` | list grammar, predicate, ticks | `CodeBlock.highlight` field and literals (after K5 merges) |
 | `state.rs`, FFI locale route, AppModel locale line | live locale | — |
-| `MarkdownText.swift` | plain-link label | — |
+| `MarkdownText.swift` | plain-link label | `codeBlock` case and matches (after K5 and T1 merge) |
+| `Fixtures.swift` | — | `codeBlock` literals |
 | `MarkdownView.swift` | Q5 clause, marker comment | code-block view |
 | `DiscordTime.swift` | R, today header | — |
 | `Cargo.toml`/`Cargo.lock`, `highlight.rs`, `highlight_tests.rs`, `assets/` (main vendors) | — | yes |
-| `messages.rs` | — | `Stored.highlights`, `history()` order, `row()` attachment |
+| `messages.rs` | — | in-place fill at the three assignments, `history()` order |
 | FFI `markdown.rs`, AppModel mapping | — | `highlight` on `CodeBlock` |
 | `THIRD_PARTY_NOTICES.md` | — | rows above |
 
