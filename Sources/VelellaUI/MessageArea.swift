@@ -13,6 +13,7 @@ struct MessageArea: View {
     let messages: [MessageItem]
     var load: MessageLoad = .idle
     @Binding var reply: ReplyPreview?
+    @Binding var draft: String
     var onSend: ((String) -> Void)?
 
     var body: some View {
@@ -29,7 +30,7 @@ struct MessageArea: View {
             // Messages pass under the toolbar through a glass band with a hard lower edge, on a
             // darker pane than the translucent sidebar (Swiftcord v2, user's captures 2026-10-13).
             .scrollEdgeEffectStyle(.hard, for: .top)
-            .safeAreaInset(edge: .bottom) { Composer(reply: $reply, onSend: onSend) }
+            .safeAreaInset(edge: .bottom) { Composer(reply: $reply, draft: $draft, onSend: onSend) }
             // Under the toolbar too, so the toolbar band carries the pane's tint (a band of bare
             // window material over the messages read as a separate, lighter strip).
             .background(T.Palette.messagePane)
@@ -157,9 +158,10 @@ struct ImageAttachmentView: View {
 /// sticker and emoji are decoration until their pickers exist.
 struct Composer: View {
     @Binding var reply: ReplyPreview?
+    /// The open conversation's draft (`ShellState.draft`).
+    @Binding var draft: String
     /// Receives the draft on Return (`ComposerSubmit`: never blank, never an IME commit).
     var onSend: ((String) -> Void)?
-    @State private var draft = ""
     @State private var plusMenuOpen = false
 
     var body: some View {
@@ -314,7 +316,7 @@ private struct PlusMenuRow: View {
 }
 
 #Preview("Composer with reply") {
-    Composer(reply: .constant(Fixtures.reply)).frame(width: 640)
+    Composer(reply: .constant(Fixtures.reply), draft: .constant("")).frame(width: 640)
 }
 
 #Preview("Plus menu") {

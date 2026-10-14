@@ -59,7 +59,7 @@ public struct ShellView: View {
         } detail: {
             MessageArea(
                 header: state.header, isSignedIn: state.isSignedIn, messages: state.messages,
-                load: state.messageLoad, reply: $state.reply, onSend: onSend
+                load: state.messageLoad, reply: $state.reply, draft: $state.draft, onSend: onSend
             )
                 // No minimum of its own: SwiftUI's `.inspector` adds the floating sidebar's current
                 // width to this column's minimum twice (measured 2026-10-13, macOS 27.0.1,

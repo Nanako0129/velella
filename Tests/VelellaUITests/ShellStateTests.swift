@@ -18,6 +18,22 @@ private let guildRail = RailItem.guild(RailGuild(id: "g", name: "Guild", icon: .
     #expect(state.openTarget == nil)
 }
 
+@Test func eachConversationKeepsItsOwnDraft() {
+    var state = ShellState(rail: [dmRail, guildRail], selectedRailID: "g", selectedChannelID: "X", selectedDMID: "D")
+    state.draft = "for X"
+    // Channel X → DM D: D's composer starts empty, X's text stays with X.
+    state.selectedRailID = "dm"
+    #expect(state.draft == "")
+    state.draft = "for D"
+    state.selectedRailID = "g"
+    #expect(state.draft == "for X")
+    // A sent (cleared) draft leaves no entry; nothing open writes nothing.
+    state.draft = ""
+    state.selectedChannelID = nil
+    state.draft = "lost"
+    #expect(state.drafts == ["D": "for D"])
+}
+
 @Test func messageLoadStartsIdleAndFixturesKeepIt() {
     #expect(ShellState().messageLoad == .idle)
     #expect(ShellState.demo.messageLoad == .idle)

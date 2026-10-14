@@ -367,6 +367,8 @@ public struct ShellState: Equatable, Sendable {
     /// Set while the composer is replying to a message.
     public var reply: ReplyPreview?
     public var messageLoad: MessageLoad = .idle
+    /// Unsent composer text per conversation (`openTarget`), as the official client keeps it.
+    public var drafts: [String: String] = [:]
 
     public init(
         rail: [RailItem] = [], selectedRailID: String? = nil, serverName: String? = nil,
@@ -396,6 +398,13 @@ public struct ShellState: Equatable, Sendable {
     /// channel (the same rule as `header`). nil when nothing is open.
     public var openTarget: String? {
         isDMMode ? selectedDMID : selectedChannelID
+    }
+
+    /// The composer's text: the open conversation's own draft, so switching conversations never
+    /// carries text (and a Return) from one to the other.
+    public var draft: String {
+        get { openTarget.flatMap { drafts[$0] } ?? "" }
+        set { if let openTarget { drafts[openTarget] = newValue.isEmpty ? nil : newValue } }
     }
 
     public var header: ChannelHeader? {
