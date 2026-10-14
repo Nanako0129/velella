@@ -247,9 +247,21 @@ enum DesignTokens {
         static let dmTag = Font.caption2.weight(.bold)
         static let dmSectionHeader = Font.callout
         static let occupantName = Font.callout
-        static let authorName = Font.subheadline.weight(.semibold)
-        static let timestamp = Font.caption2
+        /// Username 16, weight 500 (`.username_c19a55`: font-size 1rem, --font-weight-medium).
+        static let authorName = Font.system(size: Message.authorSize, weight: .medium)
+        /// Header time 12, weight 500 (`.cozy_c19a55 .timestamp_c19a55`: .75rem, medium).
+        static let timestamp = Font.system(size: Message.timestampSize, weight: .medium)
+        /// Chrome text near the messages (load failure, file names, hover tips); the message body
+        /// itself is `Message.bodySize` through `MarkdownText`.
         static let messageBody = Font.callout
+        /// Time in a follow-up row's gutter: 11, medium (`.timestamp_c19a55.alt_c19a55`: .6875rem).
+        static let gutterTime = Font.system(size: Message.gutterTimeSize, weight: .medium)
+        /// Date divider label: 12, semibold (`.content__908e2`, module 5126c).
+        static let dividerLabel = Font.system(size: Message.dividerLabelSize, weight: .semibold)
+        /// Reply preview: 14 (`.repliedMessage_c19a55`: font-size .875rem).
+        static let reply = Font.system(size: Message.replySize)
+        /// "(edited)": 10 (`.edited_c19a55`: font-size .625rem).
+        static let edited = Font.system(size: Message.editedSize)
         /// Member name 14 and status line 12, both regular, one line (v2 MemberView /
         /// MemberActivityView labels).
         static let memberName = Font.system(size: 14)
@@ -275,6 +287,60 @@ enum DesignTokens {
         static let plusMenuRow = Font.body
         /// Initials on generated avatars, as a fraction of the avatar's edge.
         static let initialsScale: CGFloat = 0.4
+    }
+
+    /// The message area, from Discord's own CSS (docs/plans/markdown.md, T1; 1 CSS px = 1 pt,
+    /// 1 rem = 16). Module c19a55 is the message, 75297 the markup, 5126c the group and divider
+    /// spacing. gg sans is not shipped: the system font is used at the same sizes.
+    enum Message {
+        /// `--custom-message-spacing-vertical-container-cozy: .125rem`, top and bottom of every row.
+        static let rowPaddingVertical: CGFloat = 2
+        /// `.avatar_c19a55`: `inset-inline-start: var(--custom-message-margin-horizontal)`.
+        static let avatarLeading: CGFloat = 16
+        /// `.avatar_c19a55`: `margin-top: calc(4px - 2px)`, below the row's content top.
+        static let avatarTop: CGFloat = 2
+        /// Avatar to text: 72 = 16 + 40 + 16 (`--custom-message-margin-left-content-cozy`).
+        static let contentInset: CGFloat = avatarLeading + Size.messageAvatar + 16
+        /// `.wrapper_c19a55`: `padding-inline-end: var(--custom-message-margin-horizontal)`.
+        static let trailingInset: CGFloat = 16
+        /// `.cozy_c19a55 .header_c19a55`: `line-height: 1.375rem; min-height: 1.375rem`.
+        static let headerLineHeight: CGFloat = 22
+        /// `.cozy_c19a55 .headerText_c19a55`: `margin-inline-end: .25rem`, username to time.
+        static let headerGap: CGFloat = 4
+        /// `.username_c19a55`: font-size 1rem.
+        static let authorSize: CGFloat = 16
+        /// `.cozy_c19a55 .timestamp_c19a55`: font-size .75rem.
+        static let timestampSize: CGFloat = 12
+        /// `.timestamp_c19a55.alt_c19a55`: font-size .6875rem; 56 wide (`width: 56px`), right-aligned.
+        static let gutterTimeSize: CGFloat = 11
+        static let gutterWidth: CGFloat = 56
+        /// `.markup__75297`: font-size 1rem; `--chat-markup-line-height: 1.375rem`.
+        static let bodySize: CGFloat = 16
+        static let bodyLineHeight: CGFloat = 22
+        /// `.edited_c19a55`: font-size .625rem.
+        static let editedSize: CGFloat = 10
+        /// `.group-spacing-16 .groupStart`: `--custom-group-spacing-start: 1.0625rem`, above a group's first row.
+        static let groupStart: CGFloat = 17
+        /// PROVISIONAL: the gap past which the same author's next message starts a new group.
+        /// Seven minutes is the threshold commonly documented for Discord; it was not read from
+        /// Discord's code (only CSS was). To be checked live against the official client.
+        static let groupWindow: TimeInterval = 7 * 60
+        /// `--custom-message-reply-message-preview-line-height`: 18; `.repliedMessage_c19a55`: font-size .875rem.
+        static let replyLineHeight: CGFloat = 18
+        static let replySize: CGFloat = 14
+        /// `.cozy_c19a55 .repliedMessage_c19a55`: `margin-bottom: var(--reply-spacing)` (4px). The
+        /// plan's 10 pt reply indent (`--custom-message-reply-indent`) is applied by `.compact_c19a55`
+        /// only; the cozy layout the app uses has none.
+        static let replyGap: CGFloat = 4
+        /// `.group-spacing-16 .divider.hasContent`: margin 24 above and 8 below; the line is 1 pt.
+        static let dividerAbove: CGFloat = 24
+        static let dividerBelow: CGFloat = 8
+        static let dividerLineWidth: CGFloat = 1
+        /// `.content__908e2`: font-size 12, line-height 13, padding 2 x 4.
+        static let dividerLabelSize: CGFloat = 12
+        static let dividerLabelLineHeight: CGFloat = 13
+        static let dividerLabelPaddingV: CGFloat = 2
+        static let dividerLabelPaddingH: CGFloat = 4
     }
 
     enum Palette {

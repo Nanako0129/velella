@@ -10,7 +10,7 @@ private func live(
     pending: Bool = false, failure: String? = nil
 ) -> MessageItem {
     .live(
-        id: 42, authorName: authorName, authorColor: authorColor, avatarURL: avatarURL, timestampMs: 1_760_000_000_123,
+        id: 42, authorId: 7, authorName: authorName, authorColor: authorColor, avatarURL: avatarURL, timestampMs: 1_760_000_000_123,
         content: content, body: MessageBody(text: content), edited: edited, images: images, files: files, replyAuthor: replyAuthor,
         replyContent: replyContent, pending: pending, failure: failure
     )
@@ -29,6 +29,7 @@ private func live(
         images: [("https://cdn.discordapp.com/a.png", 640, 480)], files: ["notes.txt"], edited: true
     )
     #expect(item.id == "42")
+    #expect(item.authorId == "7")
     #expect(item.authorColor == RGB(1, 0, 0))
     #expect(item.avatar == .url(URL(string: "https://cdn.discordapp.com/embed/avatars/0.png")!))
     #expect(item.timestamp == Date(timeIntervalSince1970: 1_760_000_000.123))

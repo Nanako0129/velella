@@ -219,10 +219,20 @@ struct MarkdownText {
     var size: CGFloat = MarkdownText.bodySize
     var weight: Font.Weight = .regular
 
-    /// The message body's size (`T.Typography.messageBody` is `.callout`).
-    static let bodySize = NSFont.preferredFont(forTextStyle: .callout).pointSize
-    /// Inline code is monospaced at 0.875 × the run's size (plan K2).
-    static let codeScale: CGFloat = 0.875
+    /// The message body's size: 16 (`.markup__75297`: font-size 1rem; `DesignTokens.Message.bodySize`).
+    static let bodySize = DesignTokens.Message.bodySize
+    /// Inline code is monospaced at 85 % of the run's size (`.markup__75297 code.inline`: font-size 85%).
+    static let codeScale: CGFloat = 0.85
+
+    /// A line box is 1.375 em tall: the body's `--chat-markup-line-height: 1.375rem` (22 at 16), a
+    /// heading's `line-height: 1.375em`, and subtext's `1.20313rem` (19.25 at 14, the same ratio).
+    static let lineHeightRatio: CGFloat = 1.375
+
+    /// The line box of text at `size`; `BlockView` applies it with `.lineHeight(.exact)`. Measured
+    /// on SwiftUI's own layout (T1 report): that makes n lines exactly n boxes tall. The plan's
+    /// first idea, line spacing = box - NSFont's ascender - descender + leading (18.84 at 16), is
+    /// off, because SwiftUI lays a 16 pt line out 19 tall: lines came 22.16 apart and drifted.
+    static func lineHeight(size: CGFloat) -> CGFloat { size * lineHeightRatio }
 
     func segments(_ inlines: [MarkdownInline], style: InlineStyle = InlineStyle(), context: RenderContext) -> [Segment] {
         var out: [Segment] = []

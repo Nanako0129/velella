@@ -77,7 +77,8 @@ private let body = MarkdownText.bodySize
 
 @Test func codeIsMonospacedAtSevenEighthsOnTheCodeFill() {
     let code = run("x = 1", in: segments([.code("x = 1")]))
-    #expect(code?.swiftUI.font == Font.system(size: body * 0.875, weight: .regular, design: .monospaced))
+    // Discord: `.markup__75297 code.inline { font-size: 85% }`.
+    #expect(code?.swiftUI.font == Font.system(size: body * 0.85, weight: .regular, design: .monospaced))
     #expect(code?.swiftUI.backgroundColor == MarkdownPalette.codeFill)
 }
 

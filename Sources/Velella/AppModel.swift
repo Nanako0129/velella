@@ -220,7 +220,7 @@ final class AppModel {
         guard gen == generation, open == messagesOpen else { return }
         shell.messages = snapshot.rows.map { row in
             MessageItem.live(
-                id: row.id, authorName: row.authorName, authorColor: row.authorColor,
+                id: row.id, authorId: row.authorId, authorName: row.authorName, authorColor: row.authorColor,
                 avatarURL: row.authorAvatarUrl, timestampMs: row.timestampMs, content: row.content,
                 body: Self.body(row), edited: row.edited, images: row.images.map { ($0.url, $0.width, $0.height) },
                 files: row.files, replyAuthor: row.reply?.authorName, replyContent: row.reply?.content,

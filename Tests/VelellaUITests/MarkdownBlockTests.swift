@@ -19,7 +19,8 @@ private func model(_ block: MarkdownBlock, depth: Int = 0) -> BlockModel { Block
         guard case .text(_, let s, let w, let secondary, _, _) = model(.heading(level: UInt8(level), [.text("h")])) else {
             Issue.record("not text"); continue
         }
-        #expect(s == size && w == .semibold && !secondary)
+        // Discord: `h1..h6 { font-weight: var(--font-weight-bold) }`, sizes 1.5rem / 1.25rem / 1rem.
+        #expect(s == size && w == .bold && !secondary)
     }
     // K1 only produces 1-3; anything else clamps rather than traps.
     for level: UInt8 in [0, 4, 255] {
@@ -29,17 +30,38 @@ private func model(_ block: MarkdownBlock, depth: Int = 0) -> BlockModel { Block
 
 @Test func headingsHaveTheirOwnSpacingAndParagraphsNone() {
     let h1 = model(.heading(level: 1, [])), p = model(.paragraph([]))
-    #expect(h1.top == S.headingTop[0] && h1.bottom == S.headingBottom[0])
+    // Discord: `h1, h2, h3 { margin: 16px 0 8px }`; margins collapse, so the larger side wins.
+    #expect(h1.top == 16 && h1.bottom == 8)
     #expect(p.top == 0 && p.bottom == 0)
-    // A heading's space wins over the default gap only when larger.
-    #expect(BlockModel.gap(after: p, before: h1) == max(DesignTokens.Spacing.xs, S.headingTop[0]))
-    #expect(BlockModel.gap(after: h1, before: p) == max(DesignTokens.Spacing.xs, S.headingBottom[0]))
-    #expect(BlockModel.gap(after: p, before: p) == DesignTokens.Spacing.xs)
+    #expect(BlockModel.gap(after: p, before: h1) == 16)
+    #expect(BlockModel.gap(after: h1, before: p) == 8)
+    // Paragraphs carry no margin in the markup CSS: two stacked ones touch.
+    #expect(BlockModel.gap(after: p, before: p) == 0)
+    // `h1:first-child, h2:first-child { margin-top: 8px }`, `h3:first-child { margin-top: 4px }`.
+    #expect([1, 2, 3].map { BlockModel.firstTop(.heading(level: UInt8($0), [])) } == [8, 8, 4])
+    #expect(BlockModel.firstTop(.paragraph([])) == 0)
 }
 
-@Test func subtextIsElevenPointSecondary() {
+@Test func quotesAndListsAskForTheirFourPointMargins() {
+    let q = model(.quote([])), l = model(.list(ordered: false, start: 1, items: []))
+    // `.blockquoteContainer__75297 { margin-block: var(--space-4) }`, `ol, ul { margin-block: 4px 0 }`.
+    #expect(q.top == 4 && q.bottom == 4 && l.top == 4 && l.bottom == 0)
+    #expect(BlockModel.gap(after: model(.paragraph([])), before: l) == 4)
+}
+
+@Test func listIndentIsSixteenForBulletsAndGrowsWithTheOrderedMarkerWidth() {
+    // `ul { margin-inline: 16px 0 }`; `ol { margin-inline-start: calc(.4em + n * .6em) }`.
+    #expect(BlockModel.listIndent(markers: ["\u{2022}"], size: 16) == 16)
+    #expect(BlockModel.listIndent(markers: ["1.", "2."], size: 16) == 16)
+    #expect(abs(BlockModel.listIndent(markers: ["9.", "10."], size: 16) - 25.6) < 0.001)
+    #expect(abs(BlockModel.listIndent(markers: ["999999999."], size: 16) - 92.8) < 0.001)
+}
+
+@Test func subtextIsFourteenPointSecondary() {
     guard case .text(_, let size, _, let secondary, _, _) = model(.subtext([.text("s")])) else { Issue.record("not text"); return }
-    #expect(size == 11 && secondary)
+    // Discord: `.markup__75297 small { font-size: .875rem; color: var(--text-subtle); line-height: 1.20313rem }`.
+    #expect(size == 14 && secondary)
+    #expect(abs(MarkdownText.lineHeight(size: 14) - 19.25) < 0.001)
 }
 
 @Test func paragraphsKeepTheSurroundingSize() {
@@ -52,7 +74,8 @@ private func model(_ block: MarkdownBlock, depth: Int = 0) -> BlockModel { Block
 @Test func aQuoteIsOneBarAroundItsBlocksAndTheBarIsRounded() {
     let inner = MarkdownBlock.paragraph([.text("q")])
     #expect(model(.quote([inner, .codeBlock(language: nil, code: "c")])) == .quote([inner, .codeBlock(language: nil, code: "c")]))
-    #expect(S.quoteBarWidth == 4 && S.quoteBarGap == 8)
+    // Discord: divider 4 wide, radius 4; `blockquote { padding-inline: 12px 8px }`.
+    #expect(S.quoteBarWidth == 4 && S.quoteBarRadius == 4 && S.quoteBarGap == 12 && S.quoteEndPadding == 8)
 }
 
 @Test func orderedMarkersCountFromTheStartInInt() {
@@ -64,13 +87,14 @@ private func model(_ block: MarkdownBlock, depth: Int = 0) -> BlockModel { Block
     #expect(BlockModel.markers(ordered: true, start: 1, count: 0, depth: 0) == [])
 }
 
-@Test func bulletsStepWithNestingAndThenRepeat() {
+@Test func bulletsStepFromDiscToCircleAndThenRepeat() {
     let item = [[MarkdownBlock.paragraph([.text("x")])]]
     let glyphs = (0..<5).map { depth -> String in
         guard case .list(let markers, _) = model(.list(ordered: false, start: 1, items: item), depth: depth) else { return "" }
         return markers[0]
     }
-    #expect(glyphs == ["\u{2022}", "\u{25E6}", "\u{25AA}", "\u{25AA}", "\u{25AA}"])
+    // Discord: `ul { list-style-type: disc }`, `ol ul, ul ul { list-style-type: circle }`.
+    #expect(glyphs == ["\u{2022}", "\u{25E6}", "\u{25E6}", "\u{25E6}", "\u{25E6}"])
 }
 
 @Test func codeBlocksAreMonospacedUnwrappedOnTheCodeFill() {
@@ -132,8 +156,9 @@ private struct Pixels {
     let quoted = try #require(render([.quote(text)]))
     let plain = try #require(render(text))
     #expect(quoted.height == plain.height)
-    // The bar covers the full height of the two paragraphs, 4 pt wide, then the text starts 8 pt on.
-    for y in [0, quoted.height / 2, quoted.height - 1] {
+    // The bar covers the full height of the two paragraphs, 4 pt wide, then the text starts 12 pt on.
+    // (Clear of the rounded ends.)
+    for y in [4, quoted.height / 2, quoted.height - 5] {
         // separatorColor is faint (alpha ~0.1); the bar's pixel differs from the bare background.
         #expect(Int(quoted.at(2, y)[3]) - Int(plain.at(2, y)[3]) > 12, "no bar at row \(y)")
     }

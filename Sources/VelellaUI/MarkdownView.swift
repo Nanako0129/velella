@@ -104,37 +104,62 @@ struct LinkConfirmation {
 
 // MARK: Block style (plan K3)
 
-/// Every visual value of the block views. "v2" is Swiftcord v2's measured value (plan K3);
-/// "provisional" values have no source yet and await the K0 capture of the official client.
+/// Every visual value of the block views, from Discord's markup CSS (module 75297; plan T1):
+/// each constant cites its selector. Code blocks keep their K3 values until K6 replaces them.
 enum MarkdownBlockStyle {
-    /// Heading sizes for levels 1, 2, 3, semibold (v2).
+    /// Heading sizes for levels 1, 2, 3 (`.markup__75297 h1/h2/h3`: 1.5rem, 1.25rem, 1rem), bold
+    /// (`h1..h6`: `font-weight: var(--font-weight-bold)`, `line-height: 1.375em`).
     static let headingSizes: [CGFloat] = [24, 20, 16]
-    static let headingWeight = Font.Weight.semibold
-    /// Space above and below a heading, per level. Provisional, awaiting K0. A heading's space
-    /// replaces the default gap between blocks when larger; nothing sits above a list's first block.
-    static let headingTop: [CGFloat] = [12, 10, 8]
-    static let headingBottom: [CGFloat] = [4, 4, 2]
+    static let headingWeight = Font.Weight.bold
+    /// `h1, h2, h3 { margin: 16px 0 8px }`. A heading's space replaces the gap between blocks when
+    /// larger (CSS margins collapse).
+    static let headingTop: CGFloat = 16
+    static let headingBottom: CGFloat = 8
+    /// `h1:first-child, h2:first-child { margin-top: 8px }`, `h3:first-child { margin-top: 4px }`,
+    /// per level.
+    static let headingFirstTop: [CGFloat] = [8, 8, 4]
 
-    /// Subtext (`-#`): 11 pt in the secondary colour (plan K3).
-    static let subtextSize: CGFloat = 11
+    /// The gap between two stacked blocks that ask for none of their own. Paragraphs and subtext
+    /// carry no margin in the markup CSS (a newline is a line break); lists, quotes and headings
+    /// state theirs below.
+    static let blockGap: CGFloat = 0
 
-    /// Quote bar: 4 pt wide, rounded, in the separator colour, 8 pt from the text. Provisional,
-    /// awaiting the K0 capture of the official client (Discord's bar is a muted grey of this width).
+    /// Subtext (`-#`): `.markup__75297 small:not(.inlineFormat__75297)`: font-size .875rem, in
+    /// `--text-subtle` (the secondary colour); its `line-height: 1.20313rem` is 19.25, which is the
+    /// 1.375 ratio at 14.
+    static let subtextSize: CGFloat = 14
+
+    /// Quote: `.blockquoteContainer__75297 .blockquoteDivider__75297`: bar 4 wide, `border-radius:
+    /// 4px`; `blockquote { padding-inline: 12px 8px }`; text in `--text-subtle` (the secondary
+    /// colour); the container's `margin-top/bottom: var(--space-4)` (4) above and below.
     static let quoteBarWidth: CGFloat = 4
-    static let quoteBarGap: CGFloat = 8
+    static let quoteBarRadius: CGFloat = 4
+    static let quoteBarGap: CGFloat = 12
+    static let quoteEndPadding: CGFloat = 8
+    static let quoteMargin: CGFloat = 4
     static let quoteBar = Color(nsColor: .separatorColor)
 
-    /// Indent of every list from its container's leading edge, so a nested list steps in by it
-    /// plus the marker column. Provisional, awaiting K0.
-    static let listIndent: CGFloat = 8
-    /// Gap between the marker column and the item, and between items. Provisional, awaiting K0.
-    static let markerGap: CGFloat = 6
-    static let itemGap: CGFloat = 2
-    /// Bullets by nesting level, the last repeating. Provisional, awaiting K0.
-    static let bullets = ["\u{2022}", "\u{25E6}", "\u{25AA}"]
+    /// `ul { margin-inline: 16px 0 }`: a bullet list's content sits 16 from its container; the
+    /// marker hangs in that space (`list-style-position: outside`).
+    static let listIndent: CGFloat = 16
+    /// `ol { margin-inline-start: calc(.4em + var(--totalCharacters) * .6em) }`: the indent of an
+    /// ordered list, in em of the list's font, for `--totalCharacters` marker characters. Taken as
+    /// the digit count of the largest number (one digit gives 1 em = 16, as `ul`); not verified.
+    static let orderedIndentBase: CGFloat = 0.4
+    static let orderedIndentPerCharacter: CGFloat = 0.6
+    /// `ol, ul { margin-block: 4px 0 }`.
+    static let listTop: CGFloat = 4
+    /// Space between items (plan T1: each item 4 below).
+    static let itemGap: CGFloat = 4
+    /// Marker to the item's text. Not read from the CSS: the browser's own outside-marker offset,
+    /// approximated.
+    static let markerGap: CGFloat = 4
+    /// Bullets by nesting level, the last repeating (`ul { list-style-type: disc }`, `ol ul, ul ul
+    /// { list-style-type: circle }`).
+    static let bullets = ["\u{2022}", "\u{25E6}"]
 
-    /// Code blocks: monospaced at 0.875 x body, as inline code (plan K2/K3).
-    static let codeScale = MarkdownText.codeScale
+    /// Code blocks: monospaced at 0.875 x body (K3, until K6).
+    static let codeScale: CGFloat = 0.875
     /// The same fill as inline code (secondarySystemFill x 0.45).
     static let codeFill = MarkdownPalette.codeFill
     /// 0.5 pt separator colour x 0.35 border, radius 4 (v2).
@@ -165,7 +190,7 @@ enum BlockModel: Equatable {
         case .heading(let level, let c):
             let i = min(max(Int(level), 1), 3) - 1
             let s = MarkdownBlockStyle.self
-            self = .text(inlines: c, size: s.headingSizes[i], weight: s.headingWeight, secondary: false, top: s.headingTop[i], bottom: s.headingBottom[i])
+            self = .text(inlines: c, size: s.headingSizes[i], weight: s.headingWeight, secondary: false, top: s.headingTop, bottom: s.headingBottom)
         case .subtext(let c):
             self = .text(inlines: c, size: MarkdownBlockStyle.subtextSize, weight: base.weight, secondary: true, top: 0, bottom: 0)
         case .quote(let blocks):
@@ -185,12 +210,41 @@ enum BlockModel: Equatable {
         return Array(repeating: bullets[min(depth, bullets.count - 1)], count: count)
     }
 
-    var top: CGFloat { if case .text(_, _, _, _, let top, _) = self { top } else { 0 } }
-    var bottom: CGFloat { if case .text(_, _, _, _, _, let bottom) = self { bottom } else { 0 } }
+    /// The block's own margins; code keeps K3's 4 until K6.
+    var top: CGFloat {
+        switch self {
+        case .text(_, _, _, _, let top, _): top
+        case .quote: MarkdownBlockStyle.quoteMargin
+        case .list: MarkdownBlockStyle.listTop
+        case .code: T.Spacing.xs
+        }
+    }
+    var bottom: CGFloat {
+        switch self {
+        case .text(_, _, _, _, _, let bottom): bottom
+        case .quote: MarkdownBlockStyle.quoteMargin
+        case .list: 0
+        case .code: T.Spacing.xs
+        }
+    }
 
-    /// The gap between two stacked blocks: the default, or a heading's own space when larger.
+    /// The gap between two stacked blocks: the default, or the blocks' own margins when larger.
     static func gap(after previous: BlockModel, before next: BlockModel) -> CGFloat {
-        max(T.Spacing.xs, previous.bottom, next.top)
+        max(MarkdownBlockStyle.blockGap, previous.bottom, next.top)
+    }
+
+    /// Space above a container's first block: only headings ask for any (`h1:first-child` ...).
+    static func firstTop(_ block: MarkdownBlock) -> CGFloat {
+        guard case .heading(let level, _) = block else { return 0 }
+        return MarkdownBlockStyle.headingFirstTop[min(max(Int(level), 1), 3) - 1]
+    }
+
+    /// Where a list's text starts from its container: 16 for bullets, and for an ordered list
+    /// .4 em + n x .6 em for the n digits of its largest number.
+    static func listIndent(markers: [String], size: CGFloat) -> CGFloat {
+        let digits = markers.map { $0.filter(\.isNumber).count }.max() ?? 0
+        guard digits > 0 else { return MarkdownBlockStyle.listIndent }
+        return (MarkdownBlockStyle.orderedIndentBase + CGFloat(digits) * MarkdownBlockStyle.orderedIndentPerCharacter) * size
     }
 }
 
@@ -215,7 +269,7 @@ struct BlockList: View, Equatable {
         VStack(alignment: .leading, spacing: 0) {
             ForEach(Array(blocks.enumerated()), id: \.offset) { index, block in
                 BlockView(block: block, style: style, text: text, listDepth: listDepth)
-                    .padding(.top, index == 0 ? 0 : BlockModel.gap(after: models[index - 1], before: models[index]))
+                    .padding(.top, index == 0 ? BlockModel.firstTop(block) : BlockModel.gap(after: models[index - 1], before: models[index]))
             }
         }
     }
@@ -234,31 +288,36 @@ struct BlockView: View, Equatable {
         switch BlockModel(block, base: text, listDepth: listDepth) {
         case .text(let inlines, let size, let weight, let secondary, _, _):
             let sized = { var t = text; t.size = size; t.weight = weight; return t }()
+            // Every line is a whole line box (22 at 16): n lines are n boxes tall.
+            let box = AttributedString.LineHeight.exact(points: MarkdownText.lineHeight(size: size))
             if secondary {
-                InlineFlow(inlines: inlines, style: style, text: sized).foregroundStyle(.secondary)
+                InlineFlow(inlines: inlines, style: style, text: sized).foregroundStyle(.secondary).lineHeight(box)
             } else {
-                InlineFlow(inlines: inlines, style: style, text: sized)
+                InlineFlow(inlines: inlines, style: style, text: sized).lineHeight(box)
             }
         case .quote(let blocks):
             BlockList(blocks: blocks, style: style, text: text, listDepth: listDepth)
+                .foregroundStyle(.secondary)
                 .padding(.leading, MarkdownBlockStyle.quoteBarWidth + MarkdownBlockStyle.quoteBarGap)
+                .padding(.trailing, MarkdownBlockStyle.quoteEndPadding)
                 .overlay(alignment: .leading) {
-                    RoundedRectangle(cornerRadius: MarkdownBlockStyle.quoteBarWidth / 2)
+                    RoundedRectangle(cornerRadius: MarkdownBlockStyle.quoteBarRadius)
                         .fill(MarkdownBlockStyle.quoteBar)
                         .frame(width: MarkdownBlockStyle.quoteBarWidth)
                 }
         case .list(let markers, let items):
-            Grid(alignment: .topLeading, horizontalSpacing: MarkdownBlockStyle.markerGap, verticalSpacing: MarkdownBlockStyle.itemGap) {
+            // The marker hangs in the indent, right-aligned beside the item's first line.
+            let indent = BlockModel.listIndent(markers: markers, size: text.size)
+            VStack(alignment: .leading, spacing: MarkdownBlockStyle.itemGap) {
                 ForEach(Array(items.enumerated()), id: \.offset) { index, item in
-                    GridRow(alignment: .firstTextBaseline) {
+                    HStack(alignment: .firstTextBaseline, spacing: MarkdownBlockStyle.markerGap) {
                         Text(verbatim: markers[index])
                             .font(.system(size: text.size, weight: text.weight).monospacedDigit())
-                            .gridColumnAlignment(.trailing)
+                            .frame(width: indent - MarkdownBlockStyle.markerGap, alignment: .trailing)
                         BlockList(blocks: item, style: style, text: text, listDepth: listDepth + 1)
                     }
                 }
             }
-            .padding(.leading, MarkdownBlockStyle.listIndent)
         case .code(let code, let size):
             // A line that fits is drawn in place; a wider block scrolls sideways, never wraps.
             let lines = Text(verbatim: code)

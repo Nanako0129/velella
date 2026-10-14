@@ -2,6 +2,7 @@ import AppKit
 import SwiftUI
 
 private typealias T = DesignTokens
+private typealias M = DesignTokens.Message
 
 /// Message column: message rows, their load state and the composer. Fresh code (Swiftcord legacy
 /// has no matching view; its message list is a separate, DiscordKit-bound subsystem). The body
@@ -26,11 +27,18 @@ struct MessageArea: View {
                     MessageSkeleton(seed: conversationID)
                 } else {
                     ScrollView {
-                        LazyVStack(alignment: .leading, spacing: T.Spacing.lg) {
+                        // Rows carry their own 16 pt inset, padding and group spacing (T1).
+                        LazyVStack(alignment: .leading, spacing: 0) {
                             LoadStatus(load: load)
-                            ForEach(messages) { MessageRow(message: $0) }
+                            ForEach(MessageGrouping.entries(messages)) { entry in
+                                switch entry {
+                                case .divider(_, let date): DateDivider(date: date)
+                                case .row(let message, let startsGroup, let afterDivider):
+                                    MessageRow(message: message, startsGroup: startsGroup, afterDivider: afterDivider)
+                                }
+                            }
                         }
-                        .padding(T.Spacing.lg)
+                        .padding(.bottom, T.Spacing.lg)
                         .background(OverlayScrollerEnforcer())
                     }
                     .defaultScrollAnchor(.bottom)
@@ -62,34 +70,110 @@ private struct LoadStatus: View {
     var body: some View {
         if case .failed(let text) = load {
             Label { Text(verbatim: text) } icon: { Image(systemName: "exclamationmark.triangle.fill") }
+                .padding(.horizontal, T.Spacing.lg)
                 .font(T.Typography.messageBody)
                 .foregroundStyle(.secondary)
         }
     }
 }
 
+/// What the message column lists: rows, with a date divider before the first row of a new local day.
+enum MessageEntry: Identifiable, Equatable {
+    case divider(id: String, Date)
+    /// `afterDivider`: the row follows a divider, which already spaces it.
+    case row(MessageItem, startsGroup: Bool, afterDivider: Bool)
+
+    var id: String {
+        switch self {
+        case .divider(let id, _): id
+        case .row(let message, _, _): message.id
+        }
+    }
+}
+
+enum MessageGrouping {
+    /// A row starts a new group (avatar and header) when the previous row is from another author,
+    /// is more than `M.groupWindow` older, sits on another local day, or is a reply (its reply line
+    /// belongs above a header). `calendar` decides the day; only tests pass another.
+    static func entries(_ messages: [MessageItem], calendar: Calendar = .current) -> [MessageEntry] {
+        var out: [MessageEntry] = []
+        var previous: MessageItem?
+        for message in messages {
+            let newDay = previous.map { !calendar.isDate($0.timestamp, inSameDayAs: message.timestamp) } ?? false
+            if newDay { out.append(.divider(id: "divider-" + message.id, message.timestamp)) }
+            let startsGroup = newDay || message.reply != nil || previous.map {
+                $0.authorId != message.authorId || message.timestamp.timeIntervalSince($0.timestamp) > M.groupWindow
+            } ?? true
+            out.append(.row(message, startsGroup: startsGroup, afterDivider: newDay))
+            previous = message
+        }
+        return out
+    }
+}
+
+/// A hairline either side of the long date (`D` style, the account's locale). Discord draws one
+/// line under the label; the label sits on the chat background, which here is translucent, so the
+/// line stops at the label instead.
+struct DateDivider: View {
+    let date: Date
+    @Environment(\.discordLocale) private var discordLocale
+
+    var body: some View {
+        let label = DiscordTime.format(date: date, style: .longDate, locale: discordLocale, now: .now)
+        HStack(spacing: 0) {
+            line
+            Text(verbatim: label)
+                .font(T.Typography.dividerLabel)
+                .foregroundStyle(.secondary)
+                .frame(height: M.dividerLabelLineHeight)
+                .padding(.horizontal, M.dividerLabelPaddingH)
+                .padding(.vertical, M.dividerLabelPaddingV)
+            line
+        }
+        .padding(.horizontal, M.avatarLeading)
+        .padding(.top, M.dividerAbove)
+        .padding(.bottom, M.dividerBelow)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(Text(verbatim: label))
+        .accessibilityAddTraits(.isHeader)
+    }
+
+    private var line: some View {
+        Rectangle().fill(Color(nsColor: .separatorColor)).frame(height: M.dividerLineWidth)
+    }
+}
+
+/// One message (T1): the text column starts at 72; a group's first row adds the avatar at 16 and
+/// the header, a follow-up shows its time in the 56 pt gutter on hover.
 struct MessageRow: View {
     let message: MessageItem
+    var startsGroup = true
+    var afterDivider = false
     @Environment(\.discordLocale) private var discordLocale
+    @State private var hovered = false
 
     /// The context the header time formats with (K4); body paragraphs build their own per tick.
     private var renderContext: RenderContext { RenderContext(now: .now, locale: discordLocale) }
 
+    /// Above the header when the row replies to another.
+    private var replyHeight: CGFloat { message.reply == nil ? 0 : M.replyLineHeight + M.replyGap }
+
     var body: some View {
-        HStack(alignment: .top, spacing: T.Spacing.md) {
-            AvatarView(avatar: message.avatar, size: T.Size.messageAvatar)
-            VStack(alignment: .leading, spacing: 0) {
+        VStack(alignment: .leading, spacing: 0) {
+            if startsGroup {
                 if let reply = message.reply {
                     HStack(spacing: T.Spacing.xs) {
                         Image(systemName: "arrowshape.turn.up.left.fill")
                         Text(verbatim: reply.authorName).fontWeight(.semibold)
                         Text(verbatim: reply.segments.map { if case .text(let text) = $0 { text } else { "" } }.joined())
                     }
-                    .font(T.Typography.timestamp)
+                    .font(T.Typography.reply)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
+                    .frame(height: M.replyLineHeight)
+                    .padding(.bottom, M.replyGap)
                 }
-                HStack(alignment: .firstTextBaseline, spacing: T.Spacing.sm) {
+                HStack(alignment: .firstTextBaseline, spacing: M.headerGap) {
                     Text(verbatim: message.authorName)
                         .font(T.Typography.authorName)
                         .displayNameStyle(message.displayNameStyle)
@@ -98,26 +182,51 @@ struct MessageRow: View {
                         .font(T.Typography.timestamp)
                         .foregroundStyle(.secondary)
                         .help(DiscordTime.tooltip(date: message.timestamp, locale: renderContext.locale, now: renderContext.now))
-                    if message.edited {
-                        Text("(edited)").font(T.Typography.timestamp).foregroundStyle(.secondary)
-                    }
                 }
-                if !message.body.blocks.isEmpty {
-                    MarkdownView(content: message.body)
-                }
-                ForEach(Array(message.images.enumerated()), id: \.offset) { _, image in
-                    ImageAttachmentView(image: image).padding(.top, T.Spacing.xs)
-                }
-                ForEach(Array(message.files.enumerated()), id: \.offset) { _, file in
-                    Label { Text(verbatim: file) } icon: { Image(systemName: "doc") }
-                        .font(T.Typography.messageBody)
-                        .foregroundStyle(.secondary)
-                }
-                if case .failed(let reason) = message.delivery {
-                    Text(verbatim: reason).font(T.Typography.timestamp).foregroundStyle(.red)
-                }
+                .frame(height: M.headerLineHeight)
+            }
+            if !message.body.blocks.isEmpty {
+                MarkdownView(content: message.body)
+            }
+            // After the text, so a follow-up row (no header) shows it too.
+            if message.edited {
+                Text("(edited)").font(T.Typography.edited).foregroundStyle(.secondary)
+            }
+            ForEach(Array(message.images.enumerated()), id: \.offset) { _, image in
+                ImageAttachmentView(image: image).padding(.top, T.Spacing.xs)
+            }
+            ForEach(Array(message.files.enumerated()), id: \.offset) { _, file in
+                Label { Text(verbatim: file) } icon: { Image(systemName: "doc") }
+                    .font(T.Typography.messageBody)
+                    .foregroundStyle(.secondary)
+            }
+            if case .failed(let reason) = message.delivery {
+                Text(verbatim: reason).font(T.Typography.timestamp).foregroundStyle(.red)
             }
         }
+        .padding(.leading, M.contentInset)
+        .padding(.trailing, M.trailingInset)
+        .padding(.vertical, M.rowPaddingVertical)
+        // The avatar hangs beside the content: it never adds to the row's height, so a row with
+        // little text still clears it.
+        .frame(minHeight: startsGroup ? M.rowPaddingVertical * 2 + M.avatarTop + T.Size.messageAvatar : nil, alignment: .topLeading)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .overlay(alignment: .topLeading) {
+            if startsGroup {
+                AvatarView(avatar: message.avatar, size: T.Size.messageAvatar)
+                    .padding(.leading, M.avatarLeading)
+                    .padding(.top, M.rowPaddingVertical + replyHeight + M.avatarTop)
+            } else if hovered {
+                Text(verbatim: DiscordTime.format(date: message.timestamp, style: .shortTime, locale: renderContext.locale, now: renderContext.now))
+                    .font(T.Typography.gutterTime)
+                    .foregroundStyle(.secondary)
+                    .frame(width: M.gutterWidth, height: M.headerLineHeight, alignment: .trailing)
+                    .padding(.top, M.rowPaddingVertical)
+                    .help(DiscordTime.tooltip(date: message.timestamp, locale: renderContext.locale, now: renderContext.now))
+            }
+        }
+        .onHover { hovered = $0 }
+        .padding(.top, startsGroup && !afterDivider ? M.groupStart : 0)
         // An unconfirmed echo is dimmed until Discord confirms it.
         .opacity(message.delivery == .pending ? 0.5 : 1)
     }
