@@ -35,7 +35,8 @@ enum DesignTokens {
         /// Cut-out around a rail mention badge, and around a private channel's lock (v2).
         static let railBadgeCutout: CGFloat = 10
         static let channelLockCutout: CGFloat = 2
-        /// Member cards are visibly rounded in the reference.
+        /// Member section cards: corner ~12 measured on Swiftcord v2's member list (user's capture
+        /// 2026-10-14).
         static let memberCard: CGFloat = 12
         /// The user footer floats at the bottom of the channel column as a glass card; k-footer-card.png
         /// shows a corner of roughly 12-14pt, clearly squarer than a capsule.
@@ -145,6 +146,24 @@ enum DesignTokens {
         /// Images under messages are scaled down to at most this width.
         static let messageImageMaxWidth: CGFloat = 400
         static let memberAvatar: CGFloat = 32
+        /// Member rows (v2 DiscordUI.MemberView layout, refs/swiftcord-v2-teardown.md, kept out of
+        /// git): 44 tall, the avatar 16 in from the leading edge, the text 12 after it (x 60) and
+        /// 16 clear of the trailing edge. Separators start at the text, as in the v2 capture.
+        static let memberRowHeight: CGFloat = 44
+        static let memberRowInset: CGFloat = 16
+        static let memberAvatarGap: CGFloat = 12
+        /// Name and status line boxes: 20 and 15 tall, the status starting 1 above the name's
+        /// bottom (v2 MemberView: name at y 5, status at y 24).
+        static let memberNameLine: CGFloat = 20
+        static let memberStatusLine: CGFloat = 15
+        static let memberStatusOverlap: CGFloat = 1
+        /// Presence on member avatars (v2 MemberPresenceBadge): the dot's centre sits at 45° on
+        /// the avatar's rim, and the avatar is cut away 1.6 × the dot around it, so the gap shows
+        /// the card behind the row instead of a ring in the window colour.
+        static let memberPresenceCentre: CGFloat = (1 + 0.5.squareRoot()) / 2
+        static let memberPresenceCutout: CGFloat = 1.6
+        /// 12 above and below a member section header: 40 between cards in the v2 capture.
+        static let memberSectionHeaderPadding: CGFloat = 12
         static let footerAvatar: CGFloat = 32
         /// Footer height: k-footer-card.png and a-main-dark-dm-1x.png show a card of about 44pt (legacy 52).
         static let footerHeight: CGFloat = 44
@@ -210,9 +229,9 @@ enum DesignTokens {
         static let folderGlyph = Font.system(size: 18)
         /// Initials inside the 22 pt folder preview thumbs (0.36 of 22, as on rail icons).
         static let folderThumbInitials = Font.system(size: 8)
-        /// Channel-category and member-list section headers: normal case, small, secondary
-        /// (c-channels-guild.png "Name ⌄", a-toolbar-guild.png "Admin — 3"); the view adds no case or tracking.
-        static let categoryHeader = Font.caption
+        /// Member-list section headers ("Admin — 3"): 13 regular, secondary, normal case, the size
+        /// of v2's channel category headers (measured on the v2 member-list capture).
+        static let memberSectionHeader = Font.system(size: 13)
         /// Trailing chevron after a category name.
         static let categoryChevron = Font.system(size: 8, weight: .bold)
         /// Channel names 14, category headers 13, both regular; unread changes the colour, not
@@ -231,8 +250,10 @@ enum DesignTokens {
         static let authorName = Font.subheadline.weight(.semibold)
         static let timestamp = Font.caption2
         static let messageBody = Font.callout
-        static let memberName = Font.callout
-        static let memberStatus = Font.caption
+        /// Member name 14 and status line 12, both regular, one line (v2 MemberView /
+        /// MemberActivityView labels).
+        static let memberName = Font.system(size: 14)
+        static let memberStatus = Font.system(size: 12)
         /// Footer: k-footer-card.png shows a semibold ~13pt name over an ~11pt secondary username (legacy headline / 12pt).
         static let footerName = Font.system(size: 13, weight: .semibold)
         static let footerUsername = Font.system(size: 11)
@@ -295,7 +316,8 @@ enum DesignTokens {
         /// Collapsed folder tint strength over the folder's own colour: idle and hover.
         static let folderTintIdle: Double = 0.4
         static let folderTintHover: Double = 0.5
-        /// Member cards: faint fill so the rounded card shape shows on any backdrop.
+        /// Member section cards: faint fill so the rounded card shape shows on any backdrop (v2's
+        /// card sits ~15 levels above its pane in the dark capture, about this wash).
         static let memberCardFill = Color.primary.opacity(0.06)
         /// Server-tag pill and reply bar fills: faint label-colour wash that tracks the appearance.
         static let tagPillFill = Color.primary.opacity(0.12)
