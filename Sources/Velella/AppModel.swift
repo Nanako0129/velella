@@ -99,6 +99,7 @@ final class AppModel {
             shell.currentUser = CurrentUser(
                 displayName: username, username: username, avatar: .initials(String(username.prefix(1)).uppercased())
             )
+            shell.locale = handle?.locale() ?? "en-US"
             subscribeSidebar(generation: gen)
             let token = pending?.token
             pending = nil

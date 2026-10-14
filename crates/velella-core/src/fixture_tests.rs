@@ -377,3 +377,54 @@ fn role_name_and_colour_carry_through_ready_and_role_updates() {
         (Some("New"), 255)
     );
 }
+
+#[test]
+fn locale_from_ready_and_user_settings_update() {
+    let mut r = ready(vec![]);
+    assert_eq!(applied("READY", r.clone()).locale, None);
+    r["user_settings"]["locale"] = json!("zh-TW");
+    let mut s = applied("READY", r.clone());
+    assert_eq!(s.locale.as_deref(), Some("zh-TW"));
+    let rev = s.revision;
+    // Unchanged value, or other settings only: no mutation.
+    assert!(!s.ap("USER_SETTINGS_UPDATE", json!({"locale": "zh-TW"})));
+    assert!(!s.ap("USER_SETTINGS_UPDATE", json!({"theme": "dark"})));
+    assert_eq!(s.revision, rev);
+    assert!(s.ap("USER_SETTINGS_UPDATE", json!({"locale": "en-GB"})));
+    assert_eq!(s.locale.as_deref(), Some("en-GB"));
+    assert_eq!(s.revision, rev + 1);
+    // A later READY replaces it.
+    r["user_settings"]["locale"] = json!("ja");
+    assert!(s.ap("READY", r));
+    assert_eq!(s.locale.as_deref(), Some("ja"));
+}
+
+#[test]
+fn invalid_locale_is_ignored() {
+    let long = "a".repeat(36);
+    for bad in [
+        json!(""),
+        json!("en_US"),
+        json!("1en"),
+        json!("en US"),
+        json!("é"),
+        json!(long),
+        json!(5),
+        json!(null),
+    ] {
+        let mut r = ready(vec![]);
+        r["user_settings"]["locale"] = bad.clone();
+        let mut s = applied("READY", r);
+        assert_eq!(s.locale, None, "{bad}");
+        assert!(s.ap("USER_SETTINGS_UPDATE", json!({"locale": "fr"})));
+        assert!(
+            !s.ap("USER_SETTINGS_UPDATE", json!({"locale": bad})),
+            "{bad}"
+        );
+        assert_eq!(s.locale.as_deref(), Some("fr"));
+    }
+    let ok = "a".repeat(35);
+    let mut r = ready(vec![]);
+    r["user_settings"]["locale"] = json!(ok);
+    assert_eq!(applied("READY", r).locale.as_deref(), Some(ok.as_str()));
+}

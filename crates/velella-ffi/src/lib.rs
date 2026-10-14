@@ -118,6 +118,11 @@ impl SessionHandle {
         self.0.generation()
     }
 
+    /// The account's locale tag (BCP 47) as of now, `None` until READY carried a valid one.
+    pub fn locale(&self) -> Option<String> {
+        self.0.snapshot().locale.clone()
+    }
+
     /// Rail entries (guilds and folders in display order): the current snapshot at once, then
     /// again whenever it changes. Dropping the returned object stops the deliveries.
     pub fn subscribe_guilds(&self, listener: Arc<dyn GuildsListener>) -> Arc<SidebarSubscription> {
