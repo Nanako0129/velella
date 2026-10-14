@@ -1,0 +1,203 @@
+import AppKit
+import SwiftUI
+import Testing
+@testable import VelellaUI
+
+// Behaviour of the K3 block views (docs/plans/markdown.md, K3 acceptance): the block -> model
+// mapping, and offscreen renders for what only pixels can show (quote bar, wrapping, bold
+// runs, spoiler cover).
+
+private typealias S = MarkdownBlockStyle
+
+private let base = MarkdownText(body: MessageBody())
+private func model(_ block: MarkdownBlock, depth: Int = 0) -> BlockModel { BlockModel(block, base: base, listDepth: depth) }
+
+// MARK: Mapping
+
+@Test func headingLevelsMapToSizeAndWeight() {
+    for (level, size) in [(1, 24.0), (2, 20.0), (3, 16.0)] {
+        guard case .text(_, let s, let w, let secondary, _, _) = model(.heading(level: UInt8(level), [.text("h")])) else {
+            Issue.record("not text"); continue
+        }
+        #expect(s == size && w == .semibold && !secondary)
+    }
+    // K1 only produces 1-3; anything else clamps rather than traps.
+    for level: UInt8 in [0, 4, 255] {
+        if case .text(_, let s, _, _, _, _) = model(.heading(level: level, [])) { #expect(s == (level == 0 ? 24 : 16)) }
+    }
+}
+
+@Test func headingsHaveTheirOwnSpacingAndParagraphsNone() {
+    let h1 = model(.heading(level: 1, [])), p = model(.paragraph([]))
+    #expect(h1.top == S.headingTop[0] && h1.bottom == S.headingBottom[0])
+    #expect(p.top == 0 && p.bottom == 0)
+    // A heading's space wins over the default gap only when larger.
+    #expect(BlockModel.gap(after: p, before: h1) == max(DesignTokens.Spacing.xs, S.headingTop[0]))
+    #expect(BlockModel.gap(after: h1, before: p) == max(DesignTokens.Spacing.xs, S.headingBottom[0]))
+    #expect(BlockModel.gap(after: p, before: p) == DesignTokens.Spacing.xs)
+}
+
+@Test func subtextIsElevenPointSecondary() {
+    guard case .text(_, let size, _, let secondary, _, _) = model(.subtext([.text("s")])) else { Issue.record("not text"); return }
+    #expect(size == 11 && secondary)
+}
+
+@Test func paragraphsKeepTheSurroundingSize() {
+    var small = base
+    small.size = 9
+    guard case .text(_, let size, let weight, let secondary, _, _) = BlockModel(.paragraph([]), base: small, listDepth: 0) else { return }
+    #expect(size == 9 && weight == .regular && !secondary)
+}
+
+@Test func aQuoteIsOneBarAroundItsBlocksAndTheBarIsRounded() {
+    let inner = MarkdownBlock.paragraph([.text("q")])
+    #expect(model(.quote([inner, .codeBlock(language: nil, code: "c")])) == .quote([inner, .codeBlock(language: nil, code: "c")]))
+    #expect(S.quoteBarWidth == 4 && S.quoteBarGap == 8)
+}
+
+@Test func orderedMarkersCountFromTheStartInInt() {
+    #expect(BlockModel.markers(ordered: true, start: 1, count: 3, depth: 0) == ["1.", "2.", "3."])
+    #expect(BlockModel.markers(ordered: true, start: 3, count: 3, depth: 0) == ["3.", "4.", "5."])
+    #expect(BlockModel.markers(ordered: true, start: 999_999_999, count: 3, depth: 0) == ["999999999.", "1000000000.", "1000000001."])
+    // Past K1's clamp: still no overflow.
+    #expect(BlockModel.markers(ordered: true, start: .max, count: 3, depth: 0).last == "4294967297.")
+    #expect(BlockModel.markers(ordered: true, start: 1, count: 0, depth: 0) == [])
+}
+
+@Test func bulletsStepWithNestingAndThenRepeat() {
+    let item = [[MarkdownBlock.paragraph([.text("x")])]]
+    let glyphs = (0..<5).map { depth -> String in
+        guard case .list(let markers, _) = model(.list(ordered: false, start: 1, items: item), depth: depth) else { return "" }
+        return markers[0]
+    }
+    #expect(glyphs == ["\u{2022}", "\u{25E6}", "\u{25AA}", "\u{25AA}", "\u{25AA}"])
+}
+
+@Test func codeBlocksAreMonospacedUnwrappedOnTheCodeFill() {
+    guard case .code(let code, let size) = model(.codeBlock(language: "swift", code: "a\nb")) else { Issue.record("not code"); return }
+    #expect(code == "a\nb" && size == MarkdownText.bodySize * 0.875)
+    #expect(S.codeFill == MarkdownPalette.codeFill)
+    #expect(S.codeBorderWidth == 0.5 && S.codeRadius == 4)
+    #expect(S.codeBorder == Color(nsColor: .separatorColor).opacity(0.35))
+}
+
+@Test func unchangedRowsCompareEqualAndRevealedOnesDoNot() {
+    let body = MessageBody(blocks: [.paragraph([.spoiler(id: 0, [.text("s")])])])
+    let a = BlockList(blocks: body.blocks, text: MarkdownText(body: body))
+    #expect(a == BlockList(blocks: body.blocks, text: MarkdownText(body: body)))
+    #expect(a != BlockList(blocks: body.blocks, text: MarkdownText(body: body, revealed: [0])))
+    #expect(a != BlockList(blocks: body.blocks, style: InlineStyle(bold: true), text: MarkdownText(body: body)))
+}
+
+// MARK: Renders
+
+private struct Pixels {
+    let image: CGImage
+    let data: Data
+    var width: Int { image.width }
+    var height: Int { image.height }
+
+    @MainActor init?<V: View>(_ view: V, width: CGFloat = 240) {
+        let renderer = ImageRenderer(content: view.frame(width: width, alignment: .leading).environment(\.colorScheme, .light))
+        renderer.scale = 1
+        guard let image = renderer.cgImage, image.bitsPerPixel == 32, let data = image.dataProvider?.data as Data? else { return nil }
+        self.image = image
+        self.data = data
+    }
+
+    /// (r, g, b, a) at a pixel, as stored.
+    func at(_ x: Int, _ y: Int) -> [UInt8] {
+        let o = y * image.bytesPerRow + x * 4
+        return Array(data[o..<o + 4])
+    }
+
+    /// The distinct pixels well inside the image (clear of rounded corners and borders).
+    var colours: Set<[UInt8]> {
+        Set((4..<max(5, height - 4)).flatMap { y in (4..<max(5, width - 4)).map { x in at(x, y) } })
+    }
+
+    /// Columns holding any non-transparent pixel, as a range.
+    var inkColumns: ClosedRange<Int>? {
+        let cols = (0..<width).filter { x in (0..<height).contains { at(x, $0)[3] > 40 } }
+        return cols.first.map { $0...cols.last! }
+    }
+}
+
+@MainActor private func render(_ blocks: [MarkdownBlock], width: CGFloat = 240) -> Pixels? {
+    Pixels(BlockList(blocks: blocks, text: MarkdownText(body: MessageBody(blocks: blocks))), width: width)
+}
+
+@MainActor @Test func aQuoteDrawsItsBarAlongTheLeftEdgeAndAParagraphDoesNot() throws {
+    let text = [MarkdownBlock.paragraph([.text("one line")]), .paragraph([.text("another")])]
+    let quoted = try #require(render([.quote(text)]))
+    let plain = try #require(render(text))
+    #expect(quoted.height == plain.height)
+    // The bar covers the full height of the two paragraphs, 4 pt wide, then the text starts 8 pt on.
+    for y in [0, quoted.height / 2, quoted.height - 1] {
+        // separatorColor is faint (alpha ~0.1); the bar's pixel differs from the bare background.
+        #expect(Int(quoted.at(2, y)[3]) - Int(plain.at(2, y)[3]) > 12, "no bar at row \(y)")
+    }
+    #expect(quoted.at(4 + 4, quoted.height / 2)[3] < 10, "gap between bar and text")
+}
+
+@MainActor @Test func listItemsWrapBesideTheirMarker() throws {
+    let long = String(repeating: "word ", count: 40)
+    let list = try #require(render([.list(ordered: true, start: 9, items: [[.paragraph([.text(long)])], [.paragraph([.text("b")])]])], width: 200))
+    let one = try #require(render([.list(ordered: true, start: 9, items: [[.paragraph([.text("a")])], [.paragraph([.text("b")])]])], width: 200))
+    #expect(list.height > one.height * 3, "a long item wraps inside the column")
+    // Never wider than the column.
+    #expect(list.width == 200)
+}
+
+@MainActor @Test func aCodeBlockNeverWrapsAndKeepsItsFillAndRadius() throws {
+    let short = try #require(render([.codeBlock(language: nil, code: "x = 1")], width: 200))
+    let long = try #require(render([.codeBlock(language: nil, code: String(repeating: "x = 1; ", count: 40))], width: 200))
+    #expect(short.height == long.height, "a long line does not wrap")
+    // The fill reaches the middle; the corner pixel is cut off by the radius.
+    #expect(short.at(short.width / 2, 1)[3] > 0)
+    #expect(short.at(0, 0)[3] < short.at(short.width / 2, 1)[3])
+    // Two lines are exactly one line taller by a line, so lines are kept.
+    let two = try #require(render([.codeBlock(language: nil, code: "a\nb")], width: 200))
+    #expect(two.height > short.height)
+}
+
+@MainActor @Test func headingsAreTallerThanBodyAndBoldContainersWidenBlockText() throws {
+    let h = try #require(render([.heading(level: 1, [.text("Title")])]))
+    let p = try #require(render([.paragraph([.text("Title")])]))
+    let s = try #require(render([.subtext([.text("Title")])]))
+    #expect(h.height > p.height && p.height > s.height)
+
+    // `**# mmmmmm**` and `# mmmmmm` are both semibold; a paragraph in bold is wider than plain.
+    let word = [MarkdownInline.text("mmmmmmmmmm")]
+    let plain = try #require(Pixels(InlineFlow(inlines: [.block(.paragraph(word))], text: base)))
+    let bold = try #require(Pixels(InlineFlow(inlines: [.bold([.block(.paragraph(word))])], text: base)))
+    let widthPlain = try #require(plain.inkColumns).count, widthBold = try #require(bold.inkColumns).count
+    #expect(widthBold > widthPlain, "\(widthBold) vs \(widthPlain)")
+}
+
+@MainActor @Test func aCodeBlockInABoldContainerIsUnchanged() throws {
+    let code = MarkdownBlock.codeBlock(language: nil, code: "mmmmmmmmmm")
+    let plain = try #require(Pixels(InlineFlow(inlines: [.block(code)], text: base)))
+    let bold = try #require(Pixels(InlineFlow(inlines: [.bold([.italic([.underline([.strike([.block(code)])])])])], text: base)))
+    #expect(plain.data == bold.data)
+}
+
+@MainActor @Test func aBlockUnderAHiddenSpoilerStaysCoveredUntilRevealed() throws {
+    func flow(revealed: Set<Int>) -> Pixels? {
+        let inlines: [MarkdownInline] = [.spoiler(id: 0, [.block(.codeBlock(language: nil, code: "WWWWWWWWWW"))])]
+        let body = MessageBody(blocks: [.paragraph(inlines)])
+        guard case .paragraph(let numbered) = body.blocks[0] else { return nil }
+        return Pixels(InlineFlow(inlines: numbered, text: MarkdownText(body: body, revealed: revealed)), width: 200)
+    }
+    let hidden = try #require(flow(revealed: []))
+    let shown = try #require(flow(revealed: [0]))
+    // Hidden: a flat cover, no glyph edges; revealed: glyph antialiasing makes many colours.
+    #expect(hidden.colours.count == 1, "\(hidden.colours.count) colours under the cover")
+    #expect(shown.colours.count > 2)
+    // A heading under the same cover is covered as well, not only code: at most the cover and
+    // the cover over the heading's own covered runs, never glyph edges.
+    let body = MessageBody(blocks: [.paragraph([.spoiler(id: 0, [.block(.heading(level: 1, [.text("WWWW")]))])])])
+    guard case .paragraph(let numbered) = body.blocks[0] else { return }
+    let heading = try #require(Pixels(InlineFlow(inlines: numbered, text: MarkdownText(body: body)), width: 200))
+    #expect(heading.colours.count <= 2, "\(heading.colours.count) colours")
+}
