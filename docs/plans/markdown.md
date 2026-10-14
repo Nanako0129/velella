@@ -287,3 +287,49 @@ A fresh pilotfish:verifier (26 mutants: 21 killed by assertion, 4 survivors note
 A narrow re-verification is CONFIRMED. The F1 fix holds under CoreText layout for the four test nicks and ten adversarial nicks the verifier chose; the old wrapper fails on several of those. All 6 fix mutants fail by assertion. It raised two new advisories:
 - A-1 (P3, deferred): a bidi paragraph separator in a name still ends every isolate. U+001C-U+001E pass through both wrappers; `\n`, `\r`, U+0085 and U+2029 pass through the Swift body only, since the core preview turns them into spaces. An RLO after one of these reverses the text that follows. This predates the fix. It rises to P2 if Discord accepts such characters in nicks, role names or channel names. The fix is to turn paragraph separators in substituted names into spaces in both wrappers.
 - A-2 (P4, deferred): no test fails if the `.accessibilityLabel` line is removed.
+
+## K0 findings (official client, zh-TW, captures in refs/discord-ground-truth/captures/, git-excluded)
+
+| Item | Official client | velella now | Action |
+|---|---|---|---|
+| Times t…S | Flexible day periods (`清晨5:20`), `2021/4/21`, `2021年4月21日 清晨5:20`, `2021年4月21日 星期三 清晨5:20`, `2021/4/21 清晨5:20(:30)` | ICU zh-TW gives the same shapes (`晚上9:20`, `2021/4/20`, `2021年4月20日 星期二 晚上9:20`) | Keep ICU; K5 adds tests at 05:20 Asia/Taipei asserting the capture's strings (separator of s/S: ICU uses U+2009, the capture is indistinguishable at its size) |
+| R | **English even in zh-TW**: `5 years ago`, `6 hours ago`, `4 hours ago` | ICU in the account locale (`2小時前`) | K5: R always formats in `en-US`; singular/"now" wording stays ICU's until a capture shows Discord's |
+| Header, today | **Time only** (`下午2:23`) | "Today at …" / "今天 …" | K5: today → short time only. Yesterday and older: awaiting a capture |
+| `+ item` | Literal text | List (D1) | K5: `+` is not a list marker |
+| `1234567890. x` | Ordered item shown as `1000000000.` | Literal (≤ 9 digits rule) | K5: any digit count is an ordered marker; `start` = min(value, 1_000_000_000), parsed saturating |
+| `1. a` right after `- b` | Continues the bullet list as bullets | Ends the list (K1 ruling 2) | K5: a marker of the other kind continues the current list; ordered-ness comes from the first item |
+| Plain links (`url`, autolink) | Show the canonical URL (`https://discord.com/`) | Show the typed text | K5: non-masked links display `Link.url` |
+| Spoiler crossing bold (sample 3 lines 1-2) | Inconclusive (no cover visible, delimiters partly consumed) | Oracle's strict nesting | Keep; revisit with a clearer capture |
+| Code block | Language header, line numbers, highlighting | K3: plain block (v2) | K6, styled after Vencord's ShikiCodeblocks (user, 2026-10-14) |
+| Still to capture | Timestamp hover text; plain and masked link click warnings; yesterday and older headers | | K0b |
+
+## K5 — K0 adjustments (SECURITY slice: parser grammar and link display)
+
+**Owner:** pilotfish:security-executor, after K3 merges. **Files:** core `markdown.rs` and `markdown_tests.rs` (list grammar only), core `state.rs` plus a locale subscription in FFI and AppModel (live locale updates), `MarkdownText.swift` (plain-link label, R locale), `DiscordTime.swift` (R in en-US, today header), `MessageArea.swift` (`.equatable()` on the body if `MarkdownView` gets a content-only `==`), tests.
+
+| Part | Contract |
+|---|---|
+| Lists | `+` is never a marker. Ordered markers take any number of digits; `start` saturates at 1_000_000_000 (Discord's display), so no overflow and no trap. A marker of the other kind continues the current list, and the list's kind is its first item's. Named tests per row of the K0 table; K1's affected tests updated with the capture as the source. |
+| Plain links | Non-masked links render `Link.url` as their text (canonical, with the empty-path `/`); Q5's visible-equals-canonical check then always holds for them. Masked links unchanged. |
+| R | Always `en-US` regardless of the account locale. |
+| Header | Today → short time only; yesterday/older unchanged until K0b. |
+| Locale updates | USER_SETTINGS_UPDATE reaches `ShellState.locale` without a reconnect (a session event or subscription the app already polls; smallest addition). Also confirm whether Discord sends USER_SETTINGS_UPDATE or only USER_SETTINGS_PROTO_UPDATE under capabilities 253 (K4 verifier A3); if only the proto event, note it and keep READY as the source. |
+| Test gaps | K4 verifier A1 (READY clears an old locale) and A2 (R refresh uses `context.now`); K2 verifier A-2 (accessibility label attached) and A1's S12 (handler returns `.handled`). |
+| Acceptance | All suites, clippy, fmt; differential test still 0 mismatches (lists are D1, so filtered); a fresh verifier with mutants. **Live:** sample 3's `+`, ten-digit and mixed lists, and sample 2's links match the capture. |
+
+## K6 — Vencord-style code blocks (decision pending: highlighter)
+
+The user chose Vencord's ShikiCodeblocks look as the default (2026-10-14). From `refs/vencord/src/plugins/shikiCodeblocks.desktop` (GPL-3.0):
+- **Container:** a `background-base-lower` fill with radius 4.
+- **Header:** the language name, bold and capitalised, with padding 0 5, 6 below, and a colourless devicon 8 before it.
+- **Code:** 0.875 rem with a 1.125 rem line height and 0.5 em padding. It wraps (`pre-wrap`, `overflow-wrap: anywhere`).
+- **Line numbers:** a column with padding 5 / 8, then 8 before the code, and 19 pt rows.
+- **Copy button:** appears on hover at the bottom right, with a 1 s cooldown.
+- **Highlighting:** Shiki, which uses TextMate grammars with the VS Code Dark+ theme.
+
+The highlighter is open. Options:
+- `syntect` with `fancy-regex`, in core, as Oxicord does: TextMate grammars plus a Dark+ theme, the closest to Shiki.
+- A port of SimpleAST's `CodeRules` (Apache-2.0): a few languages, no dependency.
+- No highlighting.
+
+Whichever is chosen, highlighting runs in core on untrusted text, so it needs the same limits as K1: size cap, time budget, fallback to plain.
