@@ -13,7 +13,7 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
-const CDN: &str = "https://cdn.discordapp.com";
+pub(crate) const CDN: &str = "https://cdn.discordapp.com";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SidebarGuild {

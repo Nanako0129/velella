@@ -4,9 +4,9 @@ import SwiftUI
 private typealias T = DesignTokens
 
 /// Message column: message rows, their load state and the composer. Fresh code (Swiftcord legacy
-/// has no matching view; its message list is a separate, DiscordKit-bound subsystem). Every
-/// payload string (content, names, reply previews, fixed failure texts) goes through
-/// `Text(verbatim:)`: no Markdown, no link detection (plan M, F5).
+/// has no matching view; its message list is a separate, DiscordKit-bound subsystem). The body
+/// renders through `MarkdownView`, built only from core's AST; every other payload string (names,
+/// reply previews, file names, fixed failure texts) goes through `Text(verbatim:)` (plan M, F5).
 struct MessageArea: View {
     let header: ChannelHeader?
     /// The open conversation's id: seeds the loading skeleton.
@@ -70,6 +70,10 @@ private struct LoadStatus: View {
 
 struct MessageRow: View {
     let message: MessageItem
+    @Environment(\.discordLocale) private var discordLocale
+
+    /// The context the header time formats with (K4); body paragraphs build their own per tick.
+    private var renderContext: RenderContext { RenderContext(now: .now, locale: discordLocale) }
 
     var body: some View {
         HStack(alignment: .top, spacing: T.Spacing.md) {
@@ -97,8 +101,8 @@ struct MessageRow: View {
                         Text("(edited)").font(T.Typography.timestamp).foregroundStyle(.secondary)
                     }
                 }
-                if !message.text.isEmpty {
-                    Text(verbatim: message.text).font(T.Typography.messageBody)
+                if !message.body.blocks.isEmpty {
+                    MarkdownView(content: message.body)
                 }
                 ForEach(Array(message.images.enumerated()), id: \.offset) { _, image in
                     ImageAttachmentView(image: image).padding(.top, T.Spacing.xs)

@@ -269,3 +269,21 @@ The executor settled ten points the plan left open, each pinned by tests; main r
 A fresh pilotfish:verifier found two P2 findings: `cargo fmt` drift in main's ruling test, and no test failing when the 8192-node limit was removed (the `wide` case tripped the input cap instead). Both are fixed, and a narrow re-verification is CONFIRMED: the node-limit and `>=` mutants now fail by assertion. Everything else was CONFIRMED with 38 mutants; two equivalent mutants survive (a scheme prefix and a host check that `url::Url` already enforces).
 
 Advisory A1 (P3, deferred): the step counter does not tick inside a few helper scans (the list `line_end` scan, the 512-byte token window, the code-block language count, `take_while` loops). The step-bound test therefore covers ticked work only, and a list mutant that went quadratic passed it while its own named tests caught it. The shipped parser measured linear: 52 adversarial 256 KiB patterns took 0.58 s in total in release, and no fuzz input among 400k exceeded the bound. Add ticks to those helpers when the counter is next touched.
+
+## K2 verification
+
+A fresh pilotfish:verifier (26 mutants: 21 killed by assertion, 4 survivors noted below, 1 build error not counted) confirmed C1-C3 and C5-C7 and refuted C4 on one P2.
+
+| # | Finding | Disposition |
+|---|---|---|
+| F1 (P2) | A name containing U+2069 closed velella's FSI early, so an RLO after it reversed the author's text; reply previews share the wrapper | FIX (main): Swift `MarkdownText.isolated` and core `isolate` drop a PDI the name has no isolate of its own to close and close every isolate the name leaves open; tests `aNameCannotCloseOrHoldOpenItsIsolate` and `a_name_cannot_close_or_hold_open_its_isolate_in_a_preview` (four nicks each), both killed by the keep-unmatched-PDI mutant |
+| A3 (P3) | Hidden spoiler text likely readable by VoiceOver | FIX (main): ParagraphView's accessibility label replaces each covered run by "Spoiler" (`ParagraphView.spoken`, test `hiddenSpoilerTextNeverReachesTheAccessibilityLabel`) |
+| A1 (P3) | No test fails when the view ignores the tick date (S11), `SpoilerCover(hidden: nil)` (S14), the handler returns `.systemAction` (S12), `row()` re-parses (R6, result identical), or the emoji host check goes | Emoji host check: FIX (`EmojiImages.fetchable`, test `onlyTheEmojiCDNOverHTTPSIsFetched`). S11, S12, S14, R6: DEFER (code correct by reading and by the verifier's render probe; add tests when the views are next touched) |
+| A2 (P3) | IPv6-literal links do nothing (`[::1]` vs `::1` host forms) | DEFER: fails closed |
+| A4 (P4) | Emoji deduplicated by (id, animated), not id | ACCEPT: cap still holds |
+| A5 (P4) | Emoji fetches follow redirects; image cache never evicted | DEFER (ponytail-marked) |
+| Review points | Trailing-"/" equality for Q5; FSI/PDI in previews | Trailing "/": safe (verifier). Previews: isolated, now with the F1 fix; a 200-char cut may leave an FSI open at the line end, which is harmless |
+
+A narrow re-verification is CONFIRMED. The F1 fix holds under CoreText layout for the four test nicks and ten adversarial nicks the verifier chose; the old wrapper fails on several of those. All 6 fix mutants fail by assertion. It raised two new advisories:
+- A-1 (P3, deferred): a bidi paragraph separator in a name still ends every isolate. U+001C-U+001E pass through both wrappers; `\n`, `\r`, U+0085 and U+2029 pass through the Swift body only, since the core preview turns them into spaces. An RLO after one of these reverses the text that follows. This predates the fix. It rises to P2 if Discord accepts such characters in nicks, role names or channel names. The fix is to turn paragraph separators in substituted names into spaces in both wrappers.
+- A-2 (P4, deferred): no test fails if the `.accessibilityLabel` line is removed.

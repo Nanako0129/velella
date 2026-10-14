@@ -1,5 +1,6 @@
 //! Messages across FFI (plan M): open one channel's messages and send to it. Only ids, text and
 //! fixed-text states cross; the token stays in core.
+use crate::markdown::{blocks, MdBlock, MdEmoji, MdMention};
 use crate::{runtime, SessionHandle};
 use std::sync::Arc;
 
@@ -40,7 +41,13 @@ pub struct MessageRow {
     pub author_name: String,
     pub author_avatar_url: String,
     pub author_color: Option<u32>,
+    /// Raw content; render `body`, never this.
     pub content: String,
+    pub body: Vec<MdBlock>,
+    /// Each distinct mention in `body`, resolved.
+    pub mentions: Vec<MdMention>,
+    /// Image URLs of at most 64 distinct custom emoji in `body`; others render as `:name:`.
+    pub emoji: Vec<MdEmoji>,
     pub timestamp_ms: u64,
     pub edited: bool,
     pub images: Vec<MessageImage>,
@@ -111,6 +118,9 @@ impl From<velella_core::MessageRow> for MessageRow {
             author_avatar_url: r.author_avatar_url,
             author_color: r.author_color,
             content: r.content,
+            body: blocks(r.body),
+            mentions: r.mentions.into_iter().map(Into::into).collect(),
+            emoji: r.emoji.into_iter().map(Into::into).collect(),
             timestamp_ms: r.timestamp_ms,
             edited: r.edited,
             images: r
@@ -146,6 +156,18 @@ mod tests {
             author_avatar_url: "https://cdn.discordapp.com/embed/avatars/0.png".into(),
             author_color: Some(0x112233),
             content: "[a](file:///etc)".into(),
+            body: velella_core::markdown::parse("[a](file:///etc)"),
+            mentions: vec![velella_core::ResolvedMention {
+                kind: velella_core::MentionKind::Role,
+                id: 6,
+                name: Some("mods".into()),
+                color: 0x445566,
+            }],
+            emoji: vec![velella_core::EmojiImage {
+                id: 7,
+                animated: true,
+                url: "https://cdn.discordapp.com/emojis/7.gif?size=48".into(),
+            }],
             timestamp_ms: 3,
             edited: true,
             images: vec![velella_core::MessageImage {
@@ -179,6 +201,32 @@ mod tests {
                 &*r.content
             ),
             (1, 2, "n", Some(0x112233), "[a](file:///etc)")
+        );
+        // A rejected link target stays literal text in the body (K1 D4).
+        assert_eq!(
+            r.body,
+            [MdBlock::Paragraph {
+                content: vec![crate::markdown::MdInline::Text {
+                    text: "[a](file:///etc)".into()
+                }]
+            }]
+        );
+        assert_eq!(
+            r.mentions,
+            [MdMention {
+                kind: crate::markdown::MdMentionKind::Role,
+                id: 6,
+                name: Some("mods".into()),
+                color: 0x445566
+            }]
+        );
+        assert_eq!(
+            r.emoji,
+            [MdEmoji {
+                id: 7,
+                animated: true,
+                url: "https://cdn.discordapp.com/emojis/7.gif?size=48".into()
+            }]
         );
         assert_eq!((r.timestamp_ms, r.edited, r.pending), (3, true, false));
         assert_eq!(

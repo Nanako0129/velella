@@ -165,8 +165,8 @@ public struct ChannelHeader: Hashable, Sendable {
 
 // MARK: Messages
 
-/// One message row. `text`, `authorName` and the reply preview are shown verbatim: no Markdown,
-/// no link detection (plan M, F5).
+/// One message row. `body` renders through `MarkdownView` (core's AST only); `authorName` and the
+/// reply preview are shown verbatim (plan M, F5 as restated in the markdown plan).
 public struct MessageItem: Identifiable, Hashable, Sendable {
     /// A local echo is `pending` until Discord confirms it, or `failed` with fixed text.
     public enum Delivery: Hashable, Sendable {
@@ -179,7 +179,9 @@ public struct MessageItem: Identifiable, Hashable, Sendable {
     public var authorColor: RGB?
     public var avatar: Avatar
     public var timestamp: Date
+    /// The raw content; `body` is what shows.
     public var text: String
+    public var body: MessageBody
     public var displayNameStyle: DisplayNameStyle?
     public var images: [ImageAttachment]
     /// Filenames of non-image attachments.
@@ -188,13 +190,16 @@ public struct MessageItem: Identifiable, Hashable, Sendable {
     public var reply: ReplyPreview?
     public var edited: Bool
     public var delivery: Delivery
+    /// Without a `body`, `text` shows as one plain paragraph.
     public init(
         id: String, authorName: String, authorColor: RGB? = nil, avatar: Avatar, timestamp: Date, text: String,
+        body: MessageBody? = nil,
         displayNameStyle: DisplayNameStyle? = nil, images: [ImageAttachment] = [], files: [String] = [],
         reply: ReplyPreview? = nil, edited: Bool = false, delivery: Delivery = .sent
     ) {
         self.id = id; self.authorName = authorName; self.authorColor = authorColor
         self.avatar = avatar; self.timestamp = timestamp; self.text = text
+        self.body = body ?? MessageBody(text: text)
         self.displayNameStyle = displayNameStyle; self.images = images; self.files = files
         self.reply = reply; self.edited = edited; self.delivery = delivery
     }
@@ -216,16 +221,17 @@ public struct ImageAttachment: Hashable, Sendable {
 }
 
 public extension MessageItem {
-    /// One engine row, passed as plain values (VelellaUI sees no FFI types). Text is kept as is.
+    /// One engine row, passed as plain values (VelellaUI sees no FFI types; the app maps core's
+    /// AST onto `body`). Text is kept as is.
     static func live(
         id: UInt64, authorName: String, authorColor: UInt32?, avatarURL: String, timestampMs: UInt64,
-        content: String, edited: Bool, images: [(url: String, width: UInt32, height: UInt32)],
+        content: String, body: MessageBody, edited: Bool, images: [(url: String, width: UInt32, height: UInt32)],
         files: [String], replyAuthor: String?, replyContent: String?, pending: Bool, failure: String?
     ) -> MessageItem {
         MessageItem(
             id: String(id), authorName: authorName, authorColor: authorColor.map { RGB(rgb: $0) },
             avatar: URL(string: avatarURL).map(Avatar.url) ?? .initials(initials(of: authorName)),
-            timestamp: Date(timeIntervalSince1970: Double(timestampMs) / 1000), text: content,
+            timestamp: Date(timeIntervalSince1970: Double(timestampMs) / 1000), text: content, body: body,
             images: images.compactMap { image in
                 URL(string: image.url).map { ImageAttachment(url: $0, width: Double(image.width), height: Double(image.height)) }
             },
@@ -369,6 +375,9 @@ public struct ShellState: Equatable, Sendable {
     public var messageLoad: MessageLoad = .idle
     /// Unsent composer text per conversation (`openTarget`), as the official client keeps it.
     public var drafts: [String: String] = [:]
+    /// The Discord account's locale (BCP 47), for message times; ShellView puts it in the
+    /// environment as `discordLocale`.
+    public var locale = "en-US"
 
     public init(
         rail: [RailItem] = [], selectedRailID: String? = nil, serverName: String? = nil,

@@ -221,7 +221,7 @@ final class AppModel {
             MessageItem.live(
                 id: row.id, authorName: row.authorName, authorColor: row.authorColor,
                 avatarURL: row.authorAvatarUrl, timestampMs: row.timestampMs, content: row.content,
-                edited: row.edited, images: row.images.map { ($0.url, $0.width, $0.height) },
+                body: Self.body(row), edited: row.edited, images: row.images.map { ($0.url, $0.width, $0.height) },
                 files: row.files, replyAuthor: row.reply?.authorName, replyContent: row.reply?.content,
                 pending: row.pending, failure: row.failure
             )
@@ -230,6 +230,82 @@ final class AppModel {
         case .loading: .loading
         case .loaded: .loaded
         case .failed(let text): .failed(text)
+        }
+    }
+
+    // MARK: Message body (core's AST, field for field; `MessageBody` numbers links and spoilers)
+
+    private static func body(_ row: VelellaFFI.MessageRow) -> MessageBody {
+        MessageBody(
+            blocks: row.body.map(block),
+            mentions: row.mentions.map { mention in
+                let kind: MentionKind = switch mention.kind {
+                case .user: .user
+                case .role: .role
+                case .channel: .channel
+                }
+                return ResolvedMention(kind: kind, id: mention.id, name: mention.name, color: mention.color)
+            },
+            emoji: row.emoji.compactMap { e in URL(string: e.url).map { EmojiImage(id: e.id, animated: e.animated, url: $0) } }
+        )
+    }
+
+    private static func block(_ block: MdBlock) -> MarkdownBlock {
+        switch block {
+        case .paragraph(let content): .paragraph(content.map(inline))
+        case .heading(let level, let content): .heading(level: level, content.map(inline))
+        case .subtext(let content): .subtext(content.map(inline))
+        case .quote(let blocks): .quote(blocks.map(Self.block))
+        case .list(let ordered, let start, let items): .list(ordered: ordered, start: start, items: items.map { $0.map(Self.block) })
+        case .codeBlock(let language, let code): .codeBlock(language: language, code: code)
+        }
+    }
+
+    private static func inline(_ inline: MdInline) -> MarkdownInline {
+        switch inline {
+        case .text(let text): .text(text)
+        case .bold(let content): .bold(content.map(Self.inline))
+        case .italic(let content): .italic(content.map(Self.inline))
+        case .underline(let content): .underline(content.map(Self.inline))
+        case .strike(let content): .strike(content.map(Self.inline))
+        case .spoiler(let content): .spoiler(id: 0, content.map(Self.inline))
+        case .code(let text): .code(text)
+        case .link(let url, let host, let label, let masked):
+            .link(id: 0, url: url, host: host, label: label.map(Self.inline), masked: masked)
+        case .userMention(let id): .userMention(id)
+        case .roleMention(let id): .roleMention(id)
+        case .channelMention(let id): .channelMention(id)
+        case .everyone: .everyone
+        case .here: .here
+        case .customEmoji(let id, let name, let animated): .customEmoji(id: id, name: name, animated: animated)
+        case .timestamp(let unix, let style): .timestamp(unix: unix, style: timestampStyle(style))
+        case .slashCommand(let name, let id): .slashCommand(name: name, id: id)
+        case .guildNavigation(let guild, let target): .guildNavigation(guild: guild, target: navTarget(target))
+        case .lineBreak: .lineBreak
+        case .block(let block): .block(Self.block(block))
+        }
+    }
+
+    private static func timestampStyle(_ style: MdTimestampStyle) -> TimestampStyle {
+        switch style {
+        case .shortTime: .shortTime
+        case .mediumTime: .mediumTime
+        case .shortDate: .shortDate
+        case .longDate: .longDate
+        case .longDateShortTime: .longDateShortTime
+        case .fullDateShortTime: .fullDateShortTime
+        case .shortDateShortTime: .shortDateShortTime
+        case .shortDateMediumTime: .shortDateMediumTime
+        case .relative: .relative
+        }
+    }
+
+    private static func navTarget(_ target: MdNavTarget) -> NavTarget {
+        switch target {
+        case .customize: .customize
+        case .browse: .browse
+        case .guide: .guide
+        case .linkedRoles(let role): .linkedRoles(role)
         }
     }
 

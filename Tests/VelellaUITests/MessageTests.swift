@@ -11,7 +11,7 @@ private func live(
 ) -> MessageItem {
     .live(
         id: 42, authorName: authorName, authorColor: authorColor, avatarURL: avatarURL, timestampMs: 1_760_000_000_123,
-        content: content, edited: edited, images: images, files: files, replyAuthor: replyAuthor,
+        content: content, body: MessageBody(text: content), edited: edited, images: images, files: files, replyAuthor: replyAuthor,
         replyContent: replyContent, pending: pending, failure: failure
     )
 }
