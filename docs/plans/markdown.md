@@ -452,3 +452,48 @@ Header names come only from this table, never from the fence text (shown with `T
 | `messages.rs` | — | `Stored.highlights`, `history()` order, `row()` attachment |
 | FFI `markdown.rs`, AppModel mapping | — | `highlight` on `CodeBlock` |
 | `THIRD_PARTY_NOTICES.md` | — | rows above |
+
+## T1 — Discord message typography (user, 2026-10-14: "拆官方 Discord")
+
+The user chose the official Discord client as the reference for the message area's type, sizes and spacing. The server rail, channel list and member list keep their approved v2 styling. Values were read from Discord's CSS in the local Discord cache. The user chose that source; only `.css` entries were read, and the `.css` filter was applied to cache keys before any body was read. Module `c19a55` is messages; `75297` is markup; `5126c` is the group and divider spacing. rem = 16 px, and 1 CSS px is one point on macOS. gg sans is proprietary and is not shipped, so velella uses the system font (SF Pro) at the same sizes. **Owner:** pilotfish:executor (UI only, no risk trigger), in parallel with K5 under the additive-edit rule; main resolves merge conflicts.
+
+**Files:**
+- `MessageArea.swift`: the row layout, header, grouping, date dividers and reply line;
+- `DesignTokens.swift`: message tokens;
+- `MarkdownText.swift`: base sizes only;
+- `MarkdownView.swift`: the `MarkdownBlockStyle` constants for non-code blocks only;
+- `ShellState.swift` `MessageItem`: author id;
+- AppModel's message mapping: author id;
+- tests.
+
+### Discord values
+
+| Element | Discord value (selector) | velella now |
+|---|---|---|
+| Message row | padding 2 top/bottom (`--custom-message-spacing-vertical-container-cozy: 0.125rem`); content inset 72 = avatar 40 + 2 × 16 (`--custom-message-margin-left-content-cozy`) | flat 16 gap; inset 68 |
+| Avatar | 40 × 40 circle at x 16, 2 below the row's content top (`.avatar_c19a55`: `margin-top: calc(4px - 2px)`) | 40 at x 16 |
+| Header line | line height 22, min-height 22 (`.cozy .header`) | — |
+| Username | 16, weight 500 (medium), line height 22, then 4 before the timestamp (`.username`, `.headerText` margin-end .25rem) | 11 semibold, gap 8 |
+| Timestamp | 12, weight 500, muted colour, baseline-aligned (`.cozy .timestamp`) | 10 |
+| Body (markup) | 16, weight 400, line height 22 (`.markup__75297`, `--chat-markup-line-height: 1.375rem`) | 12 |
+| Group start | +17 above (`.group-spacing-16 .groupStart`: `--custom-group-spacing-start: 1.0625rem`); Discord's default group spacing is 16 | none |
+| Follow-up rows | no header or avatar; on hover a time in the 56 pt gutter, right-aligned, 11 pt, weight 500, muted, line height 22 (`.cozy .timestamp.alt`) | none |
+| Date divider | margin 24 above and 8 below (`.group-spacing-16 .divider.hasContent`); a 1 pt line; a centred label 12, weight 600, line height 13, padding 2 × 4, radius 8, on the chat background (`.content__908e2`) | none |
+| Reply | preview line height 18 (`--custom-message-reply-message-preview-line-height`), 4 below (`--reply-spacing`), indent 10 (`--custom-message-reply-indent`) | 10 pt line |
+| Emoji | inline 1.375 em; jumbo (emoji-only message) 48 (`--custom-emoji-size-jumbo-emoji: 3rem`) | — |
+| Headings | h1 24, h2 20, h3 16, **weight 700**, line height 1.375 em, margin 16 above / 8 below (8 / 4 when first) | 24/20/16 semibold, provisional spacing |
+| Subtext (`-#`) | **14**, subtle colour, line height 19.25 | 11 |
+| Quote | bar 4 wide, radius 4; text 12 from the bar and 8 at the end; 4 above and below; subtle colour | bar 4, gap 8 |
+| Lists | indent 16, 4 above; each item 4 below; nested bullets disc → circle; ordered indent grows with the marker's characters (.4 em + n × .6 em) | indent 8, item gap 2 |
+| Inline code | 85 % of the body, radius 4, padding 0 × .2 em, 1 pt border | 0.875 ×, no border |
+
+### Contract
+
+| Part | Contract |
+|---|---|
+| Tokens | Every value above is a named constant in `DesignTokens` (or `MarkdownBlockStyle`), with a comment citing its Discord selector. They replace the K3 values marked "awaiting K0" and the v2-derived message sizes. |
+| Grouping | A row starts a new group when the previous row is from another author, is more than 7 minutes older, or sits across a date divider. **7 minutes** is Discord's commonly documented threshold; it was not read from Discord's code, since only CSS was read. It is a named provisional constant, to be checked live by the user against the official client. `MessageItem` carries `authorId`, mapped from the FFI row that already has it. |
+| Date dividers | Between rows on different local calendar days. The label is the long date in the account locale (`DiscordTime`, `D` style), pending a K0b capture of the official label. |
+| Rendering | The body's base size is 16 with a 22 pt line box (SwiftUI line spacing = 22 minus the font's line height, measured, not hard-coded). The header is 16 medium plus the 12 medium time. Avatars and headers appear only on group starts. Follow-up rows show the hover time in the gutter. |
+| Tests | Grouping: same author within and over 7 minutes, author change, day change. Divider placement across days. Token values. An offscreen render: a group start's text begins at x 72, the avatar sits at x 16, and the body line pitch is 22. |
+| Acceptance | `make build`, `swift test` and `cargo test` pass. A fresh verifier with mutants (threshold, divider placement, inset, line pitch). **Live:** the user compares a busy channel with the official client side by side. |
