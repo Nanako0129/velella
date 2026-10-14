@@ -502,3 +502,21 @@ The user chose the official Discord client as the reference for the message area
 | Rendering | The body's base size is 16 with a 22 pt line box (SwiftUI line spacing = 22 minus the font's line height, measured, not hard-coded). The header is 16 medium plus the 12 medium time. Avatars and headers appear only on group starts. Follow-up rows show the hover time in the gutter. |
 | Tests | Grouping: same author within and over 7 minutes, author change, day change. Divider placement across days. Token values. An offscreen render: a group start's text begins at x 72, the avatar sits at x 16, and the body line pitch is 22. |
 | Acceptance | `make build`, `swift test` and `cargo test` pass. A fresh verifier with mutants (threshold, divider placement, inset, line pitch). **Live:** the user compares a busy channel with the official client side by side. |
+
+## T1 verification and deviations
+
+A fresh verifier CONFIRMED T1 (every value against the CSS; 13 mutants killed). Recorded here as the repo's record:
+
+| Item | Status |
+|---|---|
+| Inline code border, radius 4 and 0.2 em padding | Not done: runs carry only a fill; needs a `SegmentRenderer` attribute (K2's file). Size 85 % done |
+| Emoji: inline 1.375 em (22 at 16) and jumbo 48 for emoji-only messages | Not done: inline custom emoji are ~19; unicode emoji are text |
+| Blockquote `max-width: 90%` | Not done |
+| Bold inside a heading | Lighter than the heading (runs are fixed at semibold, headings are 700): F3, P3 |
+| Text position inside the 22 pt line box | ~1 pt higher than CSS centring (SwiftUI's exact line height) |
+| Gap after a date divider | velella 8; Discord likely 8 + 17 = 25, since the presets' divider margin and group spacing always sum to 25. F1, P3, check live |
+| Header and group-start render tests | Four mutants survive: group-start spacing, username weight, timestamp size, header gap. F2, P3 |
+| Group-start min-height 44 (velella 46), divider trailing margin 14 (velella 16) | P4 |
+| 7-minute group window, divider label text | Provisional, check live |
+
+These are deferred to a T1 follow-up after K6, ordered by the user's live comparison.
