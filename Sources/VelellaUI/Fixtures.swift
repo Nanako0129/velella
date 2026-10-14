@@ -125,7 +125,7 @@ public enum Fixtures {
                 .link(id: 0, url: "https://example.com/", host: "example.com", label: [.text("a masked link")], masked: true),
                 .text(" and "), .timestamp(unix: 1_618_953_630, style: .longDateShortTime), .lineBreak,
                 // K1 keeps this break (it is not beside the block itself); the split drops it.
-                .spoiler(id: 0, [.block(.codeBlock(language: nil, code: "hidden block", highlight: nil))]),
+                .spoiler(id: 0, [.block(.codeBlock(language: nil, code: "hidden block", header: nil, highlight: nil))]),
             ]),
         ],
         mentions: [ResolvedMention(kind: .user, id: 1, name: "Bob Example")]

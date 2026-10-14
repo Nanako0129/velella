@@ -73,7 +73,7 @@ private func model(_ block: MarkdownBlock, depth: Int = 0) -> BlockModel { Block
 
 @Test func aQuoteIsOneBarAroundItsBlocksAndTheBarIsRounded() {
     let inner = MarkdownBlock.paragraph([.text("q")])
-    #expect(model(.quote([inner, .codeBlock(language: nil, code: "c", highlight: nil)])) == .quote([inner, .codeBlock(language: nil, code: "c", highlight: nil)]))
+    #expect(model(.quote([inner, .codeBlock(language: nil, code: "c", header: nil, highlight: nil)])) == .quote([inner, .codeBlock(language: nil, code: "c", header: nil, highlight: nil)]))
     // Discord: divider 4 wide, radius 4; `blockquote { padding-inline: 12px 8px }`.
     #expect(S.quoteBarWidth == 4 && S.quoteBarRadius == 4 && S.quoteBarGap == 12 && S.quoteEndPadding == 8)
 }
@@ -98,12 +98,12 @@ private func model(_ block: MarkdownBlock, depth: Int = 0) -> BlockModel { Block
 }
 
 @Test func codeBlocksTakeVencordsLookUpTo2000LinesAndK3sPlainBlockBeyond() {
-    let highlight = CodeHighlight(name: "Python", lines: [[CodeSpan(text: "a", rgb: 1)], [CodeSpan(text: "b", rgb: 2)]])
-    guard case .code(let code, let h, let size) = model(.codeBlock(language: "py", code: "a\nb", highlight: highlight)) else { Issue.record("not code"); return }
-    #expect(code == "a\nb" && h == highlight && size == MarkdownText.bodySize * 0.875)
+    let highlight = CodeHighlight(lines: [[CodeSpan(text: "a", rgb: 1)], [CodeSpan(text: "b", rgb: 2)]])
+    guard case .code(let code, let header, let h, let size) = model(.codeBlock(language: "py", code: "a\nb", header: "Python", highlight: highlight)) else { Issue.record("not code"); return }
+    #expect(code == "a\nb" && header == "Python" && h == highlight && size == MarkdownText.bodySize * 0.875)
     let lines = Array(repeating: "x", count: 2000).joined(separator: "\n")
-    guard case .code = model(.codeBlock(language: nil, code: lines, highlight: nil)) else { Issue.record("2000 lines"); return }
-    guard case .plainCode(_, let plainSize) = model(.codeBlock(language: nil, code: lines + "\nx", highlight: nil)) else { Issue.record("2001 lines"); return }
+    guard case .code = model(.codeBlock(language: nil, code: lines, header: nil, highlight: nil)) else { Issue.record("2000 lines"); return }
+    guard case .plainCode(_, let plainSize) = model(.codeBlock(language: nil, code: lines + "\nx", header: nil, highlight: nil)) else { Issue.record("2001 lines"); return }
     #expect(plainSize == MarkdownText.bodySize * 0.875)
     // K3's plain block keeps its fill, border and radius.
     #expect(S.codeFill == MarkdownPalette.codeFill)
@@ -181,8 +181,8 @@ private struct Pixels {
 }
 
 @MainActor @Test func aCodeBlockWrapsOnTheThemeBackgroundWithItsRadius() throws {
-    let short = try #require(render([.codeBlock(language: nil, code: "x = 1", highlight: nil)], width: 200))
-    let long = try #require(render([.codeBlock(language: nil, code: String(repeating: "x = 1; ", count: 40), highlight: nil)], width: 200))
+    let short = try #require(render([.codeBlock(language: nil, code: "x = 1", header: nil, highlight: nil)], width: 200))
+    let long = try #require(render([.codeBlock(language: nil, code: String(repeating: "x = 1; ", count: 40), header: nil, highlight: nil)], width: 200))
     // Vencord: `white-space: pre-wrap; overflow-wrap: anywhere`. Never wider than the column.
     #expect(long.height > short.height * 2, "a long line wraps")
     #expect(long.width == 200)
@@ -191,7 +191,7 @@ private struct Pixels {
     #expect(edge[0...2].allSatisfy { abs(Int($0) - 0x1E) <= 4 } && edge[3] == 255, "\(edge)")
     #expect(short.at(0, 0)[3] < 255)
     // Lines are kept.
-    let two = try #require(render([.codeBlock(language: nil, code: "a\nb", highlight: nil)], width: 200))
+    let two = try #require(render([.codeBlock(language: nil, code: "a\nb", header: nil, highlight: nil)], width: 200))
     #expect(two.height > short.height)
 }
 
@@ -210,7 +210,7 @@ private struct Pixels {
 }
 
 @MainActor @Test func aCodeBlockInABoldContainerIsUnchanged() throws {
-    let code = MarkdownBlock.codeBlock(language: nil, code: "mmmmmmmmmm", highlight: nil)
+    let code = MarkdownBlock.codeBlock(language: nil, code: "mmmmmmmmmm", header: nil, highlight: nil)
     let plain = try #require(Pixels(InlineFlow(inlines: [.block(code)], text: base)))
     let bold = try #require(Pixels(InlineFlow(inlines: [.bold([.italic([.underline([.strike([.block(code)])])])])], text: base)))
     #expect(plain.data == bold.data)
@@ -218,7 +218,7 @@ private struct Pixels {
 
 @MainActor @Test func aBlockUnderAHiddenSpoilerStaysCoveredUntilRevealed() throws {
     func flow(revealed: Set<Int>) -> Pixels? {
-        let inlines: [MarkdownInline] = [.spoiler(id: 0, [.block(.codeBlock(language: nil, code: "WWWWWWWWWW", highlight: nil))])]
+        let inlines: [MarkdownInline] = [.spoiler(id: 0, [.block(.codeBlock(language: nil, code: "WWWWWWWWWW", header: nil, highlight: nil))])]
         let body = MessageBody(blocks: [.paragraph(inlines)])
         guard case .paragraph(let numbered) = body.blocks[0] else { return nil }
         return Pixels(InlineFlow(inlines: numbered, text: MarkdownText(body: body, revealed: revealed)), width: 200)

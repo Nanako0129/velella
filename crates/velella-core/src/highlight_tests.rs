@@ -1,8 +1,9 @@
-//! Highlighter tests (docs/plans/markdown.md, K6 "Tests"): the language table, the theme build,
-//! Dark+ colours, the concatenation property, the limits and the shared budget, panics, every
-//! bundled syntax, and the release timing corpus.
+//! Highlighter tests (docs/plans/markdown.md, K6 rev 2 "Tests" kept by rev 3.1, and rev 3.1's
+//! per-job caps and release corpus): the language table and headers, the theme build, Dark+
+//! colours, the concatenation property, the per-block and per-message limits, panics, every bundled
+//! syntax, and the worst line per grammar.
 use super::*;
-use crate::markdown::parse;
+use crate::markdown::{parse, Block, Inline};
 use std::time::Instant;
 
 /// A clock that never moves: no budget is spent.
@@ -11,31 +12,40 @@ fn frozen() -> impl FnMut() -> Instant {
     move || t
 }
 
-fn block(language: &str, code: &str) -> Block {
-    Block::CodeBlock {
-        language: Some(language.to_owned()),
-        code: code.to_owned(),
-        highlight: None,
+/// A clock that moves `step_ms` on every reading.
+fn ticking(step_ms: u64) -> impl FnMut() -> Instant {
+    let base = Instant::now();
+    let mut t = 0;
+    move || {
+        t += step_ms;
+        base + Duration::from_millis(t)
     }
 }
 
-fn highlight_of(b: &Block) -> Option<&Highlighted> {
-    match b {
-        Block::CodeBlock { highlight, .. } => highlight.as_ref(),
-        _ => None,
+fn job(blocks: &[(Option<&str>, &str)]) -> Job {
+    Job {
+        id: 1,
+        blocks: blocks
+            .iter()
+            .map(|(f, c)| (f.map(str::to_owned), (*c).to_owned()))
+            .collect(),
     }
 }
 
-/// One block highlighted with no budget.
-fn highlighted(language: &str, code: &str) -> Option<Highlighted> {
-    let mut b = [block(language, code)];
-    fill_with(&mut b, &mut frozen());
-    highlight_of(&b[0]).cloned()
+/// One block with no budget.
+fn highlighted(fence: &str, code: &str) -> Option<Arc<Highlighted>> {
+    compute_job_with(&job(&[(Some(fence), code)]), &mut frozen())
+        .pop()
+        .flatten()
 }
 
-/// Every code block in `blocks`, inline containers included, in document order.
-fn code_blocks(blocks: &[Block]) -> Vec<&Block> {
-    fn inl<'a>(i: &'a [Inline], out: &mut Vec<&'a Block>) {
+fn some(results: &[Option<Arc<Highlighted>>]) -> Vec<bool> {
+    results.iter().map(Option::is_some).collect()
+}
+
+/// Every code block's (fence, code) in `blocks`, inline containers included, in document order.
+fn code_blocks(blocks: &[Block]) -> Vec<(Option<String>, String)> {
+    fn inl(i: &[Inline], out: &mut Vec<(Option<String>, String)>) {
         for x in i {
             match x {
                 Inline::Bold(c)
@@ -49,7 +59,7 @@ fn code_blocks(blocks: &[Block]) -> Vec<&Block> {
             }
         }
     }
-    fn blk<'a>(b: &'a [Block], out: &mut Vec<&'a Block>) {
+    fn blk(b: &[Block], out: &mut Vec<(Option<String>, String)>) {
         for x in b {
             match x {
                 Block::Paragraph(c) | Block::Subtext(c) | Block::Heading { content: c, .. } => {
@@ -57,7 +67,9 @@ fn code_blocks(blocks: &[Block]) -> Vec<&Block> {
                 }
                 Block::Quote(q) => blk(q, out),
                 Block::List { items, .. } => items.iter().for_each(|i| blk(i, out)),
-                Block::CodeBlock { .. } => out.push(x),
+                Block::CodeBlock { language, code, .. } => {
+                    out.push((language.clone(), code.clone()))
+                }
             }
         }
     }
@@ -73,6 +85,10 @@ fn rgb(h: &Highlighted, text: &str) -> u32 {
         .find(|s| s.text.trim() == text)
         .unwrap_or_else(|| panic!("no span {text:?} in {h:?}"))
         .rgb
+}
+
+fn span_count(h: &Highlighted) -> usize {
+    h.lines.iter().map(Vec::len).sum()
 }
 
 // ---- Language table ----
@@ -131,11 +147,14 @@ fn every_row_of_the_language_table_maps_and_nothing_else_does() {
             assert_eq!(language(fence), Some((*syntax, *name)), "{fence}");
             // Case-insensitive.
             assert_eq!(language(&fence.to_uppercase()), Some((*syntax, *name)));
+            // The header is the table's name, not the fence text.
+            assert_eq!(header(Some(fence)), Some(*name), "{fence}");
         }
     }
     let table: usize = LANGUAGES.iter().map(|(a, ..)| a.len()).sum();
     assert_eq!(aliases, table, "the code's table has rows the plan's lacks");
     assert_eq!(language("ts"), Some(("JavaScript", "TypeScript")));
+    assert_eq!(header(Some("TS")), Some("TypeScript"));
     for other in [
         "swift",
         "kotlin",
@@ -146,18 +165,13 @@ fn every_row_of_the_language_table_maps_and_nothing_else_does() {
         "javascript ",
     ] {
         assert_eq!(language(other), None, "{other}");
+        assert_eq!(header(Some(other)), None, "{other}");
     }
-    // No language, or one off the table: no highlight, so no header.
+    assert_eq!(header(None), None);
+    // No language, or one off the table: no highlight.
     assert_eq!(highlighted("swift", "let x = 1"), None);
-    let mut none = [Block::CodeBlock {
-        language: None,
-        code: "x = 1".into(),
-        highlight: None,
-    }];
-    fill_with(&mut none, &mut frozen());
-    assert_eq!(highlight_of(&none[0]), None);
-    // The header is the table's name, not the fence text.
-    assert_eq!(highlighted("TS", "let x = 1").unwrap().name, "TypeScript");
+    let none = compute_job_with(&job(&[(None, "x = 1")]), &mut frozen());
+    assert_eq!(none, [None]);
 }
 
 #[test]
@@ -202,7 +216,6 @@ fn the_vendored_theme_builds_whole() {
 #[test]
 fn a_python_snippet_takes_dark_plus_colours() {
     let h = highlighted("py", "def f(x):\n    return \"s\" + 1  # c").unwrap();
-    assert_eq!(h.name, "Python");
     assert_eq!(rgb(&h, "def"), 0x569CD6);
     assert_eq!(rgb(&h, "f"), 0xDCDCAA);
     assert_eq!(rgb(&h, "x"), 0x9CDCFE);
@@ -234,22 +247,21 @@ impl Lcg {
     }
 }
 
-fn assert_spans_are_the_code(b: &Block) -> bool {
-    let Block::CodeBlock {
-        code, highlight, ..
-    } = b
-    else {
-        unreachable!()
-    };
-    if let Some(h) = highlight {
-        assert_eq!(&h.text(), code);
+/// Every result of `job` spells its own block's code; returns how many were highlighted.
+fn assert_results_spell_their_code(job: &Job) -> usize {
+    let results = compute_job_with(job, &mut frozen());
+    assert_eq!(results.len(), job.blocks.len());
+    for ((_, code), r) in job.blocks.iter().zip(&results) {
+        if let Some(h) = r {
+            assert_eq!(&h.text(), code);
+        }
     }
-    highlight.is_some()
+    results.iter().filter(|r| r.is_some()).count()
 }
 
 #[test]
 fn spans_always_join_to_exactly_the_blocks_code() {
-    // The oracle corpus, parsed: every code block it holds, highlighted as itself.
+    // The oracle corpus, parsed: every code block it holds, as the store's job would carry it.
     let fixture = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/markdown_oracle.jsonl"
@@ -263,21 +275,23 @@ fn spans_always_join_to_exactly_the_blocks_code() {
         })
         .collect();
     for input in &inputs {
-        let mut body = parse(input);
-        fill_with(&mut body, &mut frozen());
-        code_blocks(&body)
-            .into_iter()
-            .for_each(|b| _ = assert_spans_are_the_code(b));
+        assert_results_spell_their_code(&Job {
+            id: 1,
+            blocks: code_blocks(&parse(input)),
+        });
     }
     // Every corpus input as the code of a block in several grammars.
     let fences = ["py", "md", "html", "sh", "js", "rs", "c", "diff"];
-    let mut some = 0;
+    let mut highlighted = 0;
     for (i, input) in inputs.iter().enumerate() {
-        let mut b = [block(fences[i % fences.len()], input)];
-        fill_with(&mut b, &mut frozen());
-        some += usize::from(assert_spans_are_the_code(&b[0]));
+        highlighted +=
+            assert_results_spell_their_code(&job(&[(Some(fences[i % fences.len()]), input)]));
     }
-    assert!(some * 10 > inputs.len() * 9, "{some} of {}", inputs.len());
+    assert!(
+        highlighted * 10 > inputs.len() * 9,
+        "{highlighted} of {}",
+        inputs.len()
+    );
     // A fuzz set over every grammar in the table.
     const ALPHABET: &[&str] = &[
         "(", ")", "[", "]", "{", "}", "<", ">", "\"", "'", "`", "/", "*", "#", "$", "\\", "=", ";",
@@ -292,9 +306,7 @@ fn spans_always_join_to_exactly_the_blocks_code() {
             let code: String = (0..len)
                 .map(|_| ALPHABET[rng.pick() % ALPHABET.len()])
                 .collect();
-            let mut b = [block(aliases[0], &code)];
-            fill_with(&mut b, &mut frozen());
-            fuzzed += usize::from(assert_spans_are_the_code(&b[0]));
+            fuzzed += assert_results_spell_their_code(&job(&[(Some(aliases[0]), &code)]));
         }
     }
     assert!(fuzzed > LANGUAGES.len() * 40 * 9 / 10, "{fuzzed}");
@@ -309,6 +321,12 @@ fn a_line_over_1024_bytes_gives_no_highlight() {
     assert_eq!(highlighted("py", &format!("x = 1\n{at}a")), None);
     // Bytes, not characters: 342 three-byte characters are 1026 bytes.
     assert_eq!(highlighted("py", &"字".repeat(342)), None);
+    // A per-block cap: the next block of the message still runs.
+    let results = compute_job_with(
+        &job(&[(Some("py"), &format!("{at}a")), (Some("py"), "x = 1")]),
+        &mut frozen(),
+    );
+    assert_eq!(some(&results), [false, true]);
 }
 
 #[test]
@@ -317,79 +335,81 @@ fn more_than_2000_lines_gives_no_highlight() {
     assert_eq!(highlighted("py", &vec!["x"; 2001].join("\n")), None);
 }
 
-#[test]
-fn more_than_4096_spans_gives_no_highlight() {
-    // `1 1 … 1`: a number and a space alternate, two styles, so k numbers give 2k - 1 spans.
+/// About 3000 spans in Python: `1 1 … 1` alternates a number and a space, so a line of k numbers
+/// is 2k - 1 spans; 12 lines of 121 and one of 54 make 12 × 241 + 107 = 2999.
+fn about_3000_spans() -> String {
     let line = |k: usize| vec!["1"; k].join(" ");
-    let mut lines = vec![line(121); 16]; // 16 × 241
-    lines.push(format!("{} ", line(120))); // + 240, the trailing space its own span
-    let code = lines.join("\n");
-    let h = highlighted("py", &code).expect("4096 spans are allowed");
-    assert_eq!(h.lines.iter().map(Vec::len).sum::<usize>(), 4096);
-    assert_eq!(highlighted("py", &format!("{code}1")), None);
+    let mut lines = vec![line(121); 12];
+    lines.push(line(54));
+    lines.join("\n")
 }
 
-/// A clock that moves `step_ms` on every reading.
-fn ticking(step_ms: u64) -> impl FnMut() -> Instant {
-    let base = Instant::now();
-    let mut t = 0;
-    move || {
-        t += step_ms;
-        base + Duration::from_millis(t)
-    }
+#[test]
+fn one_message_shares_one_span_allowance() {
+    let code = about_3000_spans();
+    let results = compute_job_with(
+        &job(&[
+            (Some("py"), &code),
+            (Some("py"), &code),
+            (Some("py"), "x = 1"),
+        ]),
+        &mut frozen(),
+    );
+    let first = results[0].as_ref().expect("the first block fits");
+    assert_eq!(span_count(first), 2999);
+    // The second would take the message to 5998 > 4096; it and every later block stay plain.
+    assert_eq!(some(&results), [true, false, false]);
+    // On its own, a block of 4096 spans is allowed.
+    let mut lines = vec![vec!["1"; 121].join(" "); 16]; // 16 × 241
+    lines.push(format!("{} ", vec!["1"; 120].join(" "))); // + 240, the trailing space its own span
+    let at = lines.join("\n");
+    assert_eq!(span_count(&highlighted("py", &at).unwrap()), 4096);
+    assert_eq!(highlighted("py", &format!("{at}1")), None);
 }
 
 #[test]
 fn blocks_of_one_message_share_one_budget() {
-    // 10 ms per reading: the start, then one reading before each line.
-    let mut body = parse("```py\na = 1\nb = 2\n``` ```py\nc = 3\n``` ```py\nd = 4\n```");
-    fill_with(&mut body, &mut ticking(10));
-    let got: Vec<bool> = code_blocks(&body)
-        .iter()
-        .map(|b| highlight_of(b).is_some())
-        .collect();
-    // Readings at 10 (start), 20 and 30 for the first block's lines: 20 ms spent, it fits. The
-    // second block's first line reads 40, 30 ms after the start, so it and every later one fail.
-    assert_eq!(got, [true, false, false]);
+    // 100 ms per reading: the start, then one reading before each line; the budget is 250 ms.
+    let blocks = [
+        (Some("py"), "a = 1\nb = 2"),
+        (Some("py"), "c = 3"),
+        (Some("py"), "d = 4"),
+    ];
+    let results = compute_job_with(&job(&blocks), &mut ticking(100));
+    // Readings at 100 (start), 200 and 300 for the first block's lines: 200 ms spent, it fits. The
+    // second block's first line reads 400, 300 ms after the start, so it and every later one fail.
+    assert_eq!(some(&results), [true, false, false]);
     // A block that runs out mid-way gets nothing (no partial highlight).
-    let mut long = [block("py", "a\nb\nc\nd")];
-    fill_with(&mut long, &mut ticking(10));
-    assert_eq!(highlight_of(&long[0]), None);
-    // With time to spare, a second message starts its own budget.
-    let mut next = parse("```py\nc = 3\n```");
-    fill_with(&mut next, &mut ticking(10));
-    assert!(highlight_of(code_blocks(&next)[0]).is_some());
+    let long = compute_job_with(&job(&[(Some("py"), "a\nb\nc\nd")]), &mut ticking(100));
+    assert_eq!(long, [None]);
+    // The next message starts its own budget.
+    let next = compute_job_with(&job(&[(Some("py"), "c = 3")]), &mut ticking(100));
+    assert_eq!(some(&next), [true]);
 }
 
 #[test]
 fn a_block_without_a_language_spends_no_budget() {
-    let mut body = parse("```\na\nb\nc\n``` ```py\nx = 1\n```");
-    fill_with(&mut body, &mut ticking(10));
-    let got: Vec<bool> = code_blocks(&body)
-        .iter()
-        .map(|b| highlight_of(b).is_some())
-        .collect();
-    assert_eq!(got, [false, true]);
+    let blocks = [(None, "a\nb\nc"), (Some("py"), "x = 1")];
+    let results = compute_job_with(&job(&blocks), &mut ticking(100));
+    assert_eq!(some(&results), [false, true]);
 }
 
 #[test]
 fn a_panic_while_highlighting_gives_none_and_the_next_block_still_runs() {
-    let mut body = parse("```py\na = 1\nb = 2\n``` ```py\nc = 3\n```");
     let frozen_at = Instant::now();
     let mut readings = 0;
     // The third reading is inside the first block's computation (start, line 1, line 2).
-    fill_with(&mut body, &mut || {
-        readings += 1;
-        if readings == 3 {
-            panic!("injected");
-        }
-        frozen_at
-    });
-    let got: Vec<bool> = code_blocks(&body)
-        .iter()
-        .map(|b| highlight_of(b).is_some())
-        .collect();
-    assert_eq!(got, [false, true]);
+    let results = compute_job_with(
+        &job(&[(Some("py"), "a = 1\nb = 2"), (Some("py"), "c = 3")]),
+        &mut || {
+            readings += 1;
+            if readings == 3 {
+                panic!("injected");
+            }
+            frozen_at
+        },
+    );
+    assert_eq!(some(&results), [false, true]);
 }
 
 #[test]
@@ -398,18 +418,18 @@ fn every_bundled_syntax_highlights_three_lines_without_panicking() {
     let sample = "a = (1, \"s\") # c\n  if x { y } // z\n<b>'q'</b> $v @w";
     let mut failed = Vec::new();
     for syntax in set.syntaxes() {
-        match compute(sample, syntax, &syntax.name, set, theme, &mut || false) {
-            Some(h) => assert_eq!(h.text(), sample, "{}", syntax.name),
-            None => failed.push(syntax.name.clone()),
+        match compute(sample, syntax, set, theme, MAX_SPANS, &mut || false) {
+            Outcome::Done(h) => assert_eq!(h.text(), sample, "{}", syntax.name),
+            _ => failed.push(syntax.name.clone()),
         }
     }
     assert!(failed.is_empty(), "no highlight from {failed:?}");
     assert!(set.syntaxes().len() > 50);
 }
 
-// ---- Release timing ----
+// ---- Release corpus ----
 
-/// The plan's adversarial corpus: 1024-byte runs of each unit.
+/// Rev 2's adversarial corpus: 1024-byte runs of each unit.
 fn adversarial() -> Vec<(&'static str, String)> {
     let run = |unit: &str| unit.repeat(1024 / unit.len() + 1)[..1024].to_owned();
     let word = "abcdefghij".repeat(103)[..1024].to_owned();
@@ -420,78 +440,78 @@ fn adversarial() -> Vec<(&'static str, String)> {
         .collect()
 }
 
+/// Grammars whose end patterns use backreferences (syntect cannot cache those searches): an
+/// opener that enters the construct, and a near-miss of its terminator, 1024 bytes.
+fn backref_cases() -> Vec<(&'static str, &'static str, &'static str)> {
+    vec![
+        ("sh", "cat <<EOF", "EOF "),
+        ("rb", "x = <<~EOF", "EOF "),
+        ("pl", "print <<EOF;", "EOF "),
+        ("php", "<?php\n$x = <<<EOF", "EOF "),
+        ("lua", "x = [==[", "]=]"),
+        ("cs", "var s = \"\"\"", "\"\" "),
+        ("md", "```py", "`` "),
+        ("md", "~~~~", "~~~ "),
+    ]
+}
+
 #[test]
-#[ignore = "timing, release only: cargo test --release -p velella-core -- --ignored highlight_timing --nocapture"]
-fn highlight_timing_release() {
+#[ignore = "timing, release only: cargo test --release -p velella-core -- --ignored --exact highlight::tests::release_corpus_worst_line_per_grammar --test-threads=1 --nocapture"]
+fn release_corpus_worst_line_per_grammar() {
     if cfg!(debug_assertions) {
-        panic!("run in release: the bounds are for the shipped build");
+        panic!("run in release: the numbers are for the shipped build");
     }
     let (set, theme) = warm().unwrap();
-    let mut syntaxes: Vec<&str> = LANGUAGES.iter().map(|(_, s, _)| *s).collect();
-    syntaxes.dedup();
-    let time_line = |syntax: &SyntaxReference, line: &str| {
-        let start = Instant::now();
-        let h = compute(line, syntax, "", set, theme, &mut || false);
-        (start.elapsed(), h.is_some())
-    };
-    let mut worst = (Duration::ZERO, "", "");
-    let mut worst_cold = (Duration::ZERO, "", "");
-    for name in &syntaxes {
-        let syntax = set.find_syntax_by_name(name).unwrap();
-        let mut row = (Duration::ZERO, "");
-        for (unit, line) in adversarial() {
-            // The first run also compiles the grammar's regexes it reaches (cold); the second is
-            // the steady state.
-            let (cold, _) = time_line(syntax, &line);
-            let (warm, _) = time_line(syntax, &line);
-            if cold > worst_cold.0 {
-                worst_cold = (cold, name, unit);
-            }
-            if warm > row.0 {
-                row = (warm, unit);
-            }
-            if warm > worst.0 {
-                worst = (warm, name, unit);
-            }
+    let run = |unit: &str| unit.repeat(1024 / unit.len() + 1)[..1024].to_owned();
+    // (fence, opener, line) for every measured line: the plain corpus in every grammar, then the
+    // corpus and each near-miss inside every backreference construct.
+    let mut cases: Vec<(&str, String, String)> = Vec::new();
+    for (aliases, ..) in LANGUAGES {
+        for (_, line) in adversarial() {
+            cases.push((aliases[0], String::new(), line));
         }
+    }
+    for (fence, opener, near_miss) in backref_cases() {
+        for (_, line) in adversarial() {
+            cases.push((fence, format!("{opener}\n"), line));
+        }
+        cases.push((fence, format!("{opener}\n"), run(near_miss)));
+    }
+    // syntax -> (worst warm, its line's first bytes, worst cold)
+    let mut worst: Vec<(&str, Duration, String, Duration)> = Vec::new();
+    for (fence, opener, line) in &cases {
+        let (name, _) = language(fence).unwrap();
+        let syntax = set.find_syntax_by_name(name).unwrap();
+        let code = format!("{opener}{line}");
+        let time = || {
+            let start = Instant::now();
+            let _ = compute(&code, syntax, set, theme, MAX_SPANS, &mut || false);
+            start.elapsed()
+        };
+        // The first run also builds what the grammar reaches (cold); the second is the steady state.
+        let cold = time();
+        let warm = time();
+        let label = format!(
+            "{}{}",
+            opener.replace('\n', "⏎"),
+            &line[..line.len().min(6)]
+        );
+        match worst.iter_mut().find(|w| w.0 == name) {
+            Some(w) => {
+                if warm > w.1 {
+                    (w.1, w.2) = (warm, label);
+                }
+                w.3 = w.3.max(cold);
+            }
+            None => worst.push((name, warm, label, cold)),
+        }
+    }
+    worst.sort_by_key(|w| std::cmp::Reverse(w.1));
+    for (name, warm, label, cold) in &worst {
         println!(
-            "{name:<28} worst line {:>8.3} ms ({})",
-            row.0.as_secs_f64() * 1e3,
-            row.1
+            "{name:<28} worst line {:>9.3} ms (cold {:>9.3} ms)  {label:?}",
+            warm.as_secs_f64() * 1e3,
+            cold.as_secs_f64() * 1e3
         );
     }
-    println!(
-        "worst warm line: {:.3} ms ({} / {}); worst cold line: {:.3} ms ({} / {})",
-        worst.0.as_secs_f64() * 1e3,
-        worst.1,
-        worst.2,
-        worst_cold.0.as_secs_f64() * 1e3,
-        worst_cold.1,
-        worst_cold.2
-    );
-
-    // A message of 20 maximum-cost blocks: the worst pattern in its grammar, 2000 capped lines
-    // each. The shared budget ends it. Both numbers are printed before either bound is checked.
-    let (_, worst_syntax, worst_unit) = worst;
-    let fence = LANGUAGES
-        .iter()
-        .find(|(_, s, _)| *s == worst_syntax)
-        .unwrap()
-        .0[0];
-    let line = adversarial()
-        .into_iter()
-        .find(|(u, _)| *u == worst_unit)
-        .unwrap()
-        .1;
-    let code = vec![line.as_str(); 2000].join("\n");
-    let mut body: Vec<Block> = (0..20).map(|_| block(fence, &code)).collect();
-    let start = Instant::now();
-    fill(&mut body);
-    let total = start.elapsed();
-    println!(
-        "20 maximum-cost blocks ({fence}, {worst_unit}): {:.3} ms",
-        total.as_secs_f64() * 1e3
-    );
-    assert!(worst.0 <= Duration::from_millis(10), "{worst:?}");
-    assert!(total < Duration::from_millis(40), "{total:?}");
 }

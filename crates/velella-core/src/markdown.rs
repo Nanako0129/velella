@@ -18,7 +18,7 @@
 //! level (the link rule's label walk, target and validation). Nesting is checked before each
 //! recursive call. Nothing here logs.
 use crate::highlight::Highlighted;
-use std::{collections::HashMap, ops::Range};
+use std::{collections::HashMap, ops::Range, sync::Arc};
 
 /// Content longer than this (bytes) falls back without parsing (4000 characters × 4).
 const MAX_INPUT: usize = 16384;
@@ -53,9 +53,9 @@ pub enum Block {
     CodeBlock {
         language: Option<String>,
         code: String,
-        /// The parser leaves it `None`; every `Stored.body` assignment fills it in place from this
-        /// block's own `code` (`highlight::fill`, plan K6).
-        highlight: Option<Highlighted>,
+        /// The parser leaves it `None`; the message store's highlight worker sets it later, from
+        /// this block's own `code` (plan K6 rev 3.1). Shared, so a snapshot never copies spans.
+        highlight: Option<Arc<Highlighted>>,
     },
 }
 

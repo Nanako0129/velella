@@ -1,21 +1,24 @@
-//! Code-block highlighting (docs/plans/markdown.md, K6). Untrusted input.
+//! Code-block highlighting (docs/plans/markdown.md, K6 revision 3.1). Untrusted input.
 //!
 //! syntect's bundled Sublime grammars (`SyntaxSet::load_defaults_newlines`, the only loader called)
 //! with VS Code's Dark+ theme, vendored as strict JSON in `assets/vscode-dark-plus/`. Only the
-//! fence selects a grammar, through the language table below. A highlight lives on its own
-//! `Block::CodeBlock` node: `fill` walks a body in place and computes each block from that block's
-//! own `code`, so spans can never land on another block.
+//! fence selects a grammar, through the language table below.
 //!
-//! Limits, all failing to `None` (the block renders plain): a line over `MAX_LINE_BYTES`, more
-//! than `MAX_LINES` lines or `MAX_SPANS` spans, and one `BUDGET` per message shared by its blocks,
-//! checked before each line. A panic inside the computation is caught and also gives `None`.
-//! Nothing here logs.
-use crate::markdown::{Block, Inline};
+//! Two halves. The table lookups (`header`, and `language` inside this module) are pure: they are
+//! the only part the session path reaches. `warm`, `compute_job` and the statics run only on a
+//! message store's worker thread (messages.rs) and in tests: the worker takes one message's code
+//! blocks as a `Job`, computes them here off the store lock, and the store applies each result to
+//! its own block only if that block is still the same.
+//!
+//! Limits, all failing to `None` (the block renders plain): per block, a line over
+//! `MAX_LINE_BYTES` or more than `MAX_LINES` lines; per message, `MAX_SPANS` spans and one
+//! `BUDGET`, checked before each line. A panic inside a block's computation is caught and gives
+//! `None`. Nothing here logs.
 use serde_json::Value;
 use std::{
     panic::{catch_unwind, AssertUnwindSafe},
     str::FromStr,
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 use syntect::{
@@ -26,22 +29,23 @@ use syntect::{
     parsing::{ParseState, ScopeStack, SyntaxReference, SyntaxSet},
 };
 
-/// A block with a longer line (bytes) is not highlighted. fancy-regex bounds one search (1,000,000
-/// backtrack steps, syntect has no setter), not one line, so this is the real bound per line; the
-/// release timing test measures the worst capped line.
+/// A block with a longer line (bytes) is not highlighted. This caps a line's length, not its
+/// cost: fancy-regex stops one search after 1,000,000 backtrack steps (syntect has no setter), and
+/// a line runs many searches, so one capped line can still take hundreds of milliseconds (the
+/// release corpus test records the worst per grammar). That time is the worker's alone.
 const MAX_LINE_BYTES: usize = 1024;
 /// A block with more lines is not highlighted (the Swift view drops line numbers past it too).
 const MAX_LINES: usize = 2000;
-/// A block with more spans after merging is not highlighted.
+/// Spans per message, after merging. The block that would pass it, and every later block of the
+/// message, get `None`.
 const MAX_SPANS: usize = 4096;
-/// Wall-clock time per message, shared by its blocks; once spent, the rest are `None`.
-const BUDGET: Duration = Duration::from_millis(25);
+/// Wall-clock time per message, shared by its blocks and checked before each line; once spent,
+/// every remaining block is `None`. A single line can overrun it (fancy-regex cannot be stopped).
+const BUDGET: Duration = Duration::from_millis(250);
 
-/// A highlighted code block: `name` is the header from the language table (never the fence
-/// text); `lines` joined with `\n` give back the block's code exactly.
+/// A highlighted code block: `lines` joined with `\n` give back the block's code exactly.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Highlighted {
-    pub name: String,
     pub lines: Vec<Vec<Span>>,
 }
 
@@ -66,6 +70,13 @@ impl Highlighted {
             .collect();
         lines.join("\n")
     }
+}
+
+/// One message's code blocks, (fence, code) in the store's walk order, mapped or not.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Job {
+    pub(crate) id: u64,
+    pub(crate) blocks: Vec<(Option<String>, String)>,
 }
 
 /// Fence aliases (matched case-insensitively), syntect syntax name, header name: the plan's K6
@@ -119,13 +130,19 @@ const LANGUAGES: &[(&[&str], &str, &str)] = &[
     (&["lisp", "el", "scm"], "Lisp", "Lisp"),
 ];
 
-/// (syntect syntax name, header name) for a fence language.
+/// (syntect syntax name, header name) for a fence language. Pure: no static, no syntect.
 fn language(fence: &str) -> Option<(&'static str, &'static str)> {
     let fence = fence.to_ascii_lowercase();
     LANGUAGES
         .iter()
         .find(|(aliases, ..)| aliases.contains(&fence.as_str()))
         .map(|&(_, syntax, name)| (syntax, name))
+}
+
+/// A code block's header: the table's name for its fence, `None` for none or an unmapped one.
+/// Pure (the same lookup): the FFI conversion and the store's pending check call it.
+pub fn header(language: Option<&str>) -> Option<&'static str> {
+    language.and_then(self::language).map(|(_, name)| name)
 }
 
 // ---- Theme ----
@@ -226,113 +243,88 @@ fn build_theme(top: &str, included: &str) -> Option<(Theme, usize)> {
     Some((theme, skipped))
 }
 
-// ---- Engine ----
+// ---- Engine (the worker thread and tests only) ----
 
 static SYNTAXES: OnceLock<SyntaxSet> = OnceLock::new();
 static THEME: OnceLock<Option<Theme>> = OnceLock::new();
-static GRAMMARS: OnceLock<()> = OnceLock::new();
 
-/// Runs once through every grammar in the table, so the contexts and regexes syntect builds on
-/// first use (measured in release: up to ~170 ms for one grammar, 35 ms for Python) are not
-/// charged to the first message's budget.
-const WARM_SAMPLE: &str = "import os\n# c\ndef f(x, y=1):\n    \"\"\"d\"\"\"\n    return 'a' + \"b\" if x else [1, 2.0, 0x1F]\nclass A(B):\n    pass\n// c /* d */ { let s = `t ${u}`; fn g<T>(a: &str) -> i32 { 0 } }\n<a href=\"x\">y</a> $v @w %z";
-
-/// Builds the syntax set and the theme once, then runs `WARM_SAMPLE` through each grammar of the
-/// table; later calls return at once. `MessageStore::new` runs it on a background thread, so the
-/// first message's budget is not spent on any of this; a `fill` that comes first waits for it.
-/// `None` only if the vendored theme does not build (the build test pins that it does).
-pub fn warm() -> Option<(&'static SyntaxSet, &'static Theme)> {
+/// Builds the syntax set and the theme once; later calls return them. The worker calls it first;
+/// nothing on the session path does. `None` only if the vendored theme does not build (the build
+/// test pins that it does).
+pub(crate) fn warm() -> Option<(&'static SyntaxSet, &'static Theme)> {
     let theme = THEME
         .get_or_init(|| build_theme(DARK_PLUS, DARK_VS).map(|(theme, _)| theme))
         .as_ref()?;
-    let set = SYNTAXES.get_or_init(SyntaxSet::load_defaults_newlines);
-    GRAMMARS.get_or_init(|| {
-        for (_, name, _) in LANGUAGES {
-            if let Some(syntax) = set.find_syntax_by_name(name) {
-                guarded(WARM_SAMPLE, syntax, name, set, theme, &mut || false);
+    Some((
+        SYNTAXES.get_or_init(SyntaxSet::load_defaults_newlines),
+        theme,
+    ))
+}
+
+/// One result per block of `job`, in order: each block computed from its own code, under one
+/// `BUDGET` and one `MAX_SPANS` allowance for the whole message.
+pub(crate) fn compute_job(job: &Job) -> Vec<Option<Arc<Highlighted>>> {
+    compute_job_with(job, &mut Instant::now)
+}
+
+/// `compute_job` with an injectable clock (tests pass a fake one; a frozen one lifts the budget).
+pub(crate) fn compute_job_with(
+    job: &Job,
+    now: &mut dyn FnMut() -> Instant,
+) -> Vec<Option<Arc<Highlighted>>> {
+    let Some((set, theme)) = warm() else {
+        return vec![None; job.blocks.len()];
+    };
+    let start = now();
+    let mut spans_left = MAX_SPANS;
+    let mut stopped = false;
+    job.blocks
+        .iter()
+        .map(|(fence, code)| {
+            if stopped {
+                return None;
             }
-        }
-    });
-    Some((set, theme))
-}
-
-/// Fills the `highlight` of every code block in `blocks` (also inside `Inline::Block`, in
-/// document order) from that block's own code, sharing one `BUDGET` that starts once the engine
-/// is warm. A body without a block to highlight neither waits for `warm` nor reads the clock.
-pub fn fill(blocks: &mut [Block]) {
-    fill_with(blocks, &mut Instant::now);
-}
-
-/// `fill` with an injectable clock (tests pass a fake one; a frozen one lifts the budget).
-pub fn fill_with(blocks: &mut [Block], now: &mut dyn FnMut() -> Instant) {
-    let mut start = None;
-    each_code_block(blocks, &mut |code, language| {
-        let (syntax, name) = language.and_then(self::language)?;
-        let (set, theme) = warm()?;
-        let syntax = set.find_syntax_by_name(syntax)?;
-        // One budget for the whole message, started at its first block to highlight.
-        let start = *start.get_or_insert_with(&mut *now);
-        guarded(code, syntax, name, set, theme, &mut || {
-            now().saturating_duration_since(start) >= BUDGET
+            let (syntax, _) = fence.as_deref().and_then(language)?;
+            let syntax = set.find_syntax_by_name(syntax)?;
+            let spent = &mut || now().saturating_duration_since(start) >= BUDGET;
+            match guarded(code, syntax, set, theme, spans_left, spent) {
+                Outcome::Done(h) => {
+                    spans_left -= h.lines.iter().map(Vec::len).sum::<usize>();
+                    Some(Arc::new(h))
+                }
+                Outcome::Plain => None,
+                Outcome::Stop => {
+                    stopped = true;
+                    None
+                }
+            }
         })
-    });
+        .collect()
 }
 
-/// `compute` with a panic caught as `None`. Only the computation is inside: it writes to locals
+/// One block's computation.
+enum Outcome {
+    Done(Highlighted),
+    /// This block stays plain (a cap, a parse error, a panic); the next one still runs.
+    Plain,
+    /// The budget or the span allowance ran out: this block and every later one stay plain.
+    Stop,
+}
+
+/// `compute` with a panic caught as `Plain`. Only the computation is inside: it writes to locals
 /// and returns its value, and no velella state is touched.
 fn guarded(
     code: &str,
     syntax: &SyntaxReference,
-    name: &str,
     set: &SyntaxSet,
     theme: &Theme,
+    spans_left: usize,
     spent: &mut dyn FnMut() -> bool,
-) -> Option<Highlighted> {
+) -> Outcome {
     catch_unwind(AssertUnwindSafe(|| {
-        compute(code, syntax, name, set, theme, spent)
+        compute(code, syntax, set, theme, spans_left, spent)
     }))
-    .ok()
-    .flatten()
-}
-
-/// Sets each code block's `highlight` to `f(code, language)`, walking every block list and inline
-/// container. Depth is bounded by the parser's nesting limit.
-fn each_code_block(
-    blocks: &mut [Block],
-    f: &mut impl FnMut(&str, Option<&str>) -> Option<Highlighted>,
-) {
-    for b in blocks {
-        match b {
-            Block::Paragraph(c) | Block::Subtext(c) | Block::Heading { content: c, .. } => {
-                each_code_block_in(c, f)
-            }
-            Block::Quote(inner) => each_code_block(inner, f),
-            Block::List { items, .. } => items.iter_mut().for_each(|i| each_code_block(i, f)),
-            Block::CodeBlock {
-                language,
-                code,
-                highlight,
-            } => *highlight = f(code, language.as_deref()),
-        }
-    }
-}
-
-fn each_code_block_in(
-    inlines: &mut [Inline],
-    f: &mut impl FnMut(&str, Option<&str>) -> Option<Highlighted>,
-) {
-    for i in inlines {
-        match i {
-            Inline::Bold(c)
-            | Inline::Italic(c)
-            | Inline::Underline(c)
-            | Inline::Strike(c)
-            | Inline::Spoiler(c)
-            | Inline::Link { label: c, .. } => each_code_block_in(c, f),
-            Inline::Block(b) => each_code_block(std::slice::from_mut(&mut **b), f),
-            _ => {}
-        }
-    }
+    .unwrap_or(Outcome::Plain)
 }
 
 fn span(text: &str, style: Style) -> Span {
@@ -346,18 +338,19 @@ fn span(text: &str, style: Style) -> Span {
     }
 }
 
-/// One block's highlight, or `None` over a limit, on a parse error, or once `spent()`.
+/// One block: `Plain` over a per-block cap or on a parse error, `Stop` once `spent()` or past
+/// `spans_left`.
 fn compute(
     code: &str,
     syntax: &SyntaxReference,
-    name: &str,
     set: &SyntaxSet,
     theme: &Theme,
+    spans_left: usize,
     spent: &mut dyn FnMut() -> bool,
-) -> Option<Highlighted> {
+) -> Outcome {
     let lines: Vec<&str> = code.split('\n').collect();
     if lines.len() > MAX_LINES || lines.iter().any(|l| l.len() > MAX_LINE_BYTES) {
-        return None;
+        return Outcome::Plain;
     }
     let highlighter = Highlighter::new(theme);
     let mut parser = ParseState::new(syntax);
@@ -368,12 +361,14 @@ fn compute(
     let mut buf = String::with_capacity(MAX_LINE_BYTES + 1);
     for line in lines {
         if spent() {
-            return None;
+            return Outcome::Stop;
         }
         buf.clear();
         buf.push_str(line);
         buf.push('\n');
-        let ops = parser.parse_line(&buf, set).ok()?;
+        let Ok(ops) = parser.parse_line(&buf, set) else {
+            return Outcome::Plain;
+        };
         let mut spans: Vec<Span> = Vec::new();
         for (style, _, range) in RangedHighlightIterator::new(&mut state, &ops, &buf, &highlighter)
         {
@@ -393,17 +388,18 @@ fn compute(
             }
         }
         total += spans.len();
-        if total > MAX_SPANS {
-            return None;
+        if total > spans_left {
+            return Outcome::Stop;
         }
         out.push(spans);
     }
-    let highlighted = Highlighted {
-        name: name.to_owned(),
-        lines: out,
-    };
+    let highlighted = Highlighted { lines: out };
     // syntect's iterator stops early on a scope-stack error; such a result would not be the code.
-    (highlighted.text() == code).then_some(highlighted)
+    if highlighted.text() == code {
+        Outcome::Done(highlighted)
+    } else {
+        Outcome::Plain
+    }
 }
 
 #[cfg(test)]

@@ -180,7 +180,7 @@ enum BlockModel: Equatable {
     /// `markers[i]` leads `items[i]`; the items' own lists sit one level deeper.
     case list(markers: [String], items: [[MarkdownBlock]])
     /// Vencord's look (K6): header, line numbers, wrapped lines on the theme background.
-    case code(String, highlight: CodeHighlight?, size: CGFloat)
+    case code(String, header: String?, highlight: CodeHighlight?, size: CGFloat)
     /// Too many lines for line numbers: K3's block, monospaced, unwrapped, horizontally scrollable.
     case plainCode(String, size: CGFloat)
 
@@ -199,10 +199,11 @@ enum BlockModel: Equatable {
             self = .quote(blocks)
         case .list(let ordered, let start, let items):
             self = .list(markers: Self.markers(ordered: ordered, start: start, count: items.count, depth: listDepth), items: items)
-        case .codeBlock(_, let code, let highlight):
+        case .codeBlock(_, let code, let header, let highlight):
             let size = base.size * MarkdownBlockStyle.codeScale
             let lines = code.utf8.count { $0 == 0x0A } + 1
-            self = lines <= CodeBlockStyle.maxNumberedLines ? .code(code, highlight: highlight, size: size) : .plainCode(code, size: size)
+            self = lines <= CodeBlockStyle.maxNumberedLines
+                ? .code(code, header: header, highlight: highlight, size: size) : .plainCode(code, size: size)
         }
     }
 
@@ -322,8 +323,8 @@ struct BlockView: View, Equatable {
                     }
                 }
             }
-        case .code(let code, let highlight, let size):
-            CodeBlockView(code: code, highlight: highlight, size: size, style: style, revealed: text.revealed)
+        case .code(let code, let header, let highlight, let size):
+            CodeBlockView(code: code, header: header, highlight: highlight, size: size, style: style, revealed: text.revealed)
         case .plainCode(let code, let size):
             // A line that fits is drawn in place; a wider block scrolls sideways, never wraps.
             let lines = Text(verbatim: code)
@@ -390,8 +391,9 @@ enum CodeBlockStyle {
     static let copyCooldown: Duration = .seconds(1)
 }
 
-/// What a code block draws. Core's spans are used only when they spell exactly the block's own
-/// code (byte for byte); otherwise the code itself is drawn in the plain colour, with no header.
+/// What a code block draws. The header is core's, shown with or without colours, so a block keeps
+/// its layout when they arrive. Core's spans are used only when they spell exactly the block's own
+/// code (byte for byte); otherwise the code itself is drawn in the plain colour.
 struct CodeBlockModel: Equatable {
     /// The header: the name core's language table gave, never the fence text.
     let name: String?
@@ -399,12 +401,11 @@ struct CodeBlockModel: Equatable {
     /// "1" ... "n", one per line.
     var numbers: [String] { lines.indices.map { String($0 + 1) } }
 
-    init(code: String, highlight: CodeHighlight?) {
+    init(code: String, header: String?, highlight: CodeHighlight?) {
+        name = header
         if let highlight, Self.text(of: highlight).utf8.elementsEqual(code.utf8) {
-            name = highlight.name
             lines = highlight.lines
         } else {
-            name = nil
             lines = code.unicodeScalars.split(separator: "\n", omittingEmptySubsequences: false).map {
                 [CodeSpan(text: String(String.UnicodeScalarView($0)), rgb: CodeBlockStyle.plain)]
             }
@@ -464,10 +465,10 @@ struct CodeBlockView: View {
 
     /// `style` is the containers around the block (only its spoilers count); `hovering` is for
     /// offscreen renders of the hover state.
-    init(code: String, highlight: CodeHighlight?, size: CGFloat, style: InlineStyle, revealed: Set<Int>,
+    init(code: String, header: String?, highlight: CodeHighlight?, size: CGFloat, style: InlineStyle, revealed: Set<Int>,
          pasteboard: NSPasteboard = .general, hovering: Bool = false) {
         self.code = code
-        model = CodeBlockModel(code: code, highlight: highlight)
+        model = CodeBlockModel(code: code, header: header, highlight: highlight)
         self.size = size
         covered = style.hiddenSpoiler(revealed: revealed) != nil
         self.pasteboard = pasteboard
@@ -585,8 +586,8 @@ private func blockPreview(_ blocks: [MarkdownBlock]) -> some View {
 #Preview("Code block") {
     blockPreview([
         .paragraph([.text("see:")]),
-        .codeBlock(language: "swift", code: "let x = 1\nlet aLongLineThatWrapsInsideTheBlock = x + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9", highlight: nil),
-        .codeBlock(language: "py", code: "def f(x):\n    return \"s\"  # c", highlight: CodeHighlight(name: "Python", lines: [
+        .codeBlock(language: "swift", code: "let x = 1\nlet aLongLineThatWrapsInsideTheBlock = x + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9", header: nil, highlight: nil),
+        .codeBlock(language: "py", code: "def f(x):\n    return \"s\"  # c", header: "Python", highlight: CodeHighlight(lines: [
             [CodeSpan(text: "def", rgb: 0x569CD6), CodeSpan(text: " ", rgb: 0xD4D4D4), CodeSpan(text: "f", rgb: 0xDCDCAA),
              CodeSpan(text: "(", rgb: 0xD4D4D4), CodeSpan(text: "x", rgb: 0x9CDCFE), CodeSpan(text: "):", rgb: 0xD4D4D4)],
             [CodeSpan(text: "    ", rgb: 0xD4D4D4), CodeSpan(text: "return", rgb: 0xC586C0), CodeSpan(text: " ", rgb: 0xD4D4D4),
@@ -599,6 +600,6 @@ private func blockPreview(_ blocks: [MarkdownBlock]) -> some View {
     blockPreview([.paragraph([
         .bold([.block(.heading(level: 2, [.text("bold heading")]))]),
         .italic([.block(.quote([.paragraph([.text("italic quote")])]))]),
-        .spoiler(id: 0, [.block(.codeBlock(language: nil, code: "hidden code", highlight: nil))]),
+        .spoiler(id: 0, [.block(.codeBlock(language: nil, code: "hidden code", header: nil, highlight: nil))]),
     ])])
 }

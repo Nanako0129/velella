@@ -185,7 +185,7 @@ impl SessionHandle {
     pub(crate) fn messages(&self) -> Arc<MessageStore> {
         self.shared
             .messages
-            .get_or_init(|| Arc::new(MessageStore::new(self.shared.rest.clone())))
+            .get_or_init(|| MessageStore::new(self.shared.rest.clone()))
             .clone()
     }
 
