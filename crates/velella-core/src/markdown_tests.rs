@@ -433,6 +433,7 @@ fn code_blocks_keep_a_short_language_and_their_content() {
     let code = |language: Option<&str>, code: &str| Block::CodeBlock {
         language: language.map(str::to_owned),
         code: code.to_owned(),
+        highlight: None,
     };
     assert_eq!(
         parse("```py\nprint(1)\n```"),
@@ -748,6 +749,7 @@ fn code_x() -> Block {
     Block::CodeBlock {
         language: None,
         code: "x".into(),
+        highlight: None,
     }
 }
 

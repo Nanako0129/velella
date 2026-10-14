@@ -104,7 +104,8 @@ struct LinkConfirmation {
 // MARK: Block style (plan K3)
 
 /// Every visual value of the block views, from Discord's markup CSS (module 75297; plan T1):
-/// each constant cites its selector. Code blocks keep their K3 values until K6 replaces them.
+/// each constant cites its selector. Code blocks take Vencord's look (`CodeBlockStyle`, K6); the
+/// K3 values below remain for blocks too long for line numbers.
 enum MarkdownBlockStyle {
     /// Heading sizes for levels 1, 2, 3 (`.markup__75297 h1/h2/h3`: 1.5rem, 1.25rem, 1rem), bold
     /// (`h1..h6`: `font-weight: var(--font-weight-bold)`, `line-height: 1.375em`).
@@ -157,7 +158,7 @@ enum MarkdownBlockStyle {
     /// { list-style-type: circle }`).
     static let bullets = ["\u{2022}", "\u{25E6}"]
 
-    /// Code blocks: monospaced at 0.875 x body (K3, until K6).
+    /// Code blocks: monospaced at 0.875 x body (K3; Vencord's `.vc-shiki-code { font-size: .875rem }`).
     static let codeScale: CGFloat = 0.875
     /// The same fill as inline code (secondarySystemFill x 0.45).
     static let codeFill = MarkdownPalette.codeFill
@@ -178,8 +179,10 @@ enum BlockModel: Equatable {
     case quote([MarkdownBlock])
     /// `markers[i]` leads `items[i]`; the items' own lists sit one level deeper.
     case list(markers: [String], items: [[MarkdownBlock]])
-    /// Monospaced, unwrapped, horizontally scrollable.
-    case code(String, size: CGFloat)
+    /// Vencord's look (K6): header, line numbers, wrapped lines on the theme background.
+    case code(String, header: String?, highlight: CodeHighlight?, size: CGFloat)
+    /// Too many lines for line numbers: K3's block, monospaced, unwrapped, horizontally scrollable.
+    case plainCode(String, size: CGFloat)
 
     /// `base` is the surrounding text (size, weight); `listDepth` the number of lists around the block.
     init(_ block: MarkdownBlock, base: MarkdownText, listDepth: Int) {
@@ -196,8 +199,11 @@ enum BlockModel: Equatable {
             self = .quote(blocks)
         case .list(let ordered, let start, let items):
             self = .list(markers: Self.markers(ordered: ordered, start: start, count: items.count, depth: listDepth), items: items)
-        case .codeBlock(_, let code):
-            self = .code(code, size: base.size * MarkdownBlockStyle.codeScale)
+        case .codeBlock(_, let code, let header, let highlight):
+            let size = base.size * MarkdownBlockStyle.codeScale
+            let lines = code.utf8.count { $0 == 0x0A } + 1
+            self = lines <= CodeBlockStyle.maxNumberedLines
+                ? .code(code, header: header, highlight: highlight, size: size) : .plainCode(code, size: size)
         }
     }
 
@@ -209,13 +215,13 @@ enum BlockModel: Equatable {
         return Array(repeating: bullets[min(depth, bullets.count - 1)], count: count)
     }
 
-    /// The block's own margins; code keeps K3's 4 until K6.
+    /// The block's own margins; code keeps K3's 4.
     var top: CGFloat {
         switch self {
         case .text(_, _, _, _, let top, _): top
         case .quote: MarkdownBlockStyle.quoteMargin
         case .list: MarkdownBlockStyle.listTop
-        case .code: T.Spacing.xs
+        case .code, .plainCode: T.Spacing.xs
         }
     }
     var bottom: CGFloat {
@@ -223,7 +229,7 @@ enum BlockModel: Equatable {
         case .text(_, _, _, _, _, let bottom): bottom
         case .quote: MarkdownBlockStyle.quoteMargin
         case .list: 0
-        case .code: T.Spacing.xs
+        case .code, .plainCode: T.Spacing.xs
         }
     }
 
@@ -317,7 +323,9 @@ struct BlockView: View, Equatable {
                     }
                 }
             }
-        case .code(let code, let size):
+        case .code(let code, let header, let highlight, let size):
+            CodeBlockView(code: code, header: header, highlight: highlight, size: size, style: style, revealed: text.revealed)
+        case .plainCode(let code, let size):
             // A line that fits is drawn in place; a wider block scrolls sideways, never wraps.
             let lines = Text(verbatim: code)
                 .font(.system(size: size, design: .monospaced))
@@ -335,6 +343,210 @@ struct BlockView: View, Equatable {
                     .strokeBorder(MarkdownBlockStyle.codeBorder, lineWidth: MarkdownBlockStyle.codeBorderWidth)
             }
         }
+    }
+}
+
+// MARK: Code blocks (plan K6)
+
+/// The code-block look of Vencord's ShikiCodeblocks (refs/vencord/src/plugins/shikiCodeblocks.desktop,
+/// GPL-3.0; look only, no code), with VS Code's Dark+ colours. Each constant cites its source.
+enum CodeBlockStyle {
+    /// Dark+ `colors.editor.background` and `editor.foreground` (dark_vs.json): the root's
+    /// background (`backgroundColor: editor.background` at the default 100 % opacity) and the plain
+    /// colour of text, line numbers and the header. Core's theme takes the same two values.
+    static let background = RGB(rgb: 0x1E1E1E)
+    static let plain: UInt32 = 0xD4D4D4
+    /// `.vc-shiki-code { line-height: 1.125rem }`.
+    static let lineHeight: CGFloat = 18
+    /// `.vc-shiki-table-row { height: 19px }`: a line's row is at least this tall.
+    static let rowHeight: CGFloat = 19
+    /// `.vc-shiki-code { padding: .5em }`, in em of the code's size; without a header
+    /// `.vc-shiki-plain .vc-shiki-code { padding-top: 8px }`.
+    static let paddingEm: CGFloat = 0.5
+    static let plainTopPadding: CGFloat = 8
+    /// `.vc-shiki-root { border-radius: 4px }`.
+    static let radius: CGFloat = 4
+    /// `.vc-shiki-lang { padding: 0 5px; margin-bottom: 6px; font-weight: bold }` and
+    /// `.vc-shiki-devicon { margin-right: 8px }`.
+    static let headerPaddingH: CGFloat = 5
+    static let headerBottom: CGFloat = 6
+    static let headerIconGap: CGFloat = 8
+    /// Stands in for the devicon (a web font). Provisional.
+    static let headerSymbol = "chevron.left.forwardslash.chevron.right"
+    /// `.vc-shiki-table-cell:first-child { padding-left: 5px; padding-right: 8px }` (the number),
+    /// `:last-child { padding-left: 8px }` (the code).
+    static let numberLeading: CGFloat = 5
+    static let numberTrailing: CGFloat = 8
+    static let codeLeading: CGFloat = 8
+    /// Line numbers only up to core's line cap; a longer block is K3's plain block.
+    static let maxNumberedLines = 2000
+    /// The Copy button: Vencord's accent for a theme without `statusBar.background`, as Dark+
+    /// (`#007BC8` on `#FFF`); `.vc-shiki-btn { padding: 4px 8px }`, the last button's
+    /// `border-radius: 4px 0`; "Copied!" for `useCopyCooldown(1000)`.
+    static let copyBackground = RGB(rgb: 0x007BC8)
+    static let copyForeground = RGB(rgb: 0xFFFFFF)
+    static let copyPaddingV: CGFloat = 4
+    static let copyPaddingH: CGFloat = 8
+    static let copyRadius: CGFloat = 4
+    static let copyCooldown: Duration = .seconds(1)
+}
+
+/// What a code block draws. The header is core's, shown with or without colours, so a block keeps
+/// its layout when they arrive. Core's spans are used only when they spell exactly the block's own
+/// code (byte for byte); otherwise the code itself is drawn in the plain colour.
+struct CodeBlockModel: Equatable {
+    /// The header: the name core's language table gave, never the fence text.
+    let name: String?
+    let lines: [[CodeSpan]]
+    /// "1" ... "n", one per line.
+    var numbers: [String] { lines.indices.map { String($0 + 1) } }
+
+    init(code: String, header: String?, highlight: CodeHighlight?) {
+        name = header
+        if let highlight, Self.text(of: highlight).utf8.elementsEqual(code.utf8) {
+            lines = highlight.lines
+        } else {
+            lines = code.unicodeScalars.split(separator: "\n", omittingEmptySubsequences: false).map {
+                [CodeSpan(text: String(String.UnicodeScalarView($0)), rgb: CodeBlockStyle.plain)]
+            }
+        }
+    }
+
+    static func text(of highlight: CodeHighlight) -> String {
+        highlight.lines.map { $0.map(\.text).joined() }.joined(separator: "\n")
+    }
+
+    /// For display only (the copy is the code itself): C0 controls except tab and newline, DEL,
+    /// C1 controls and the bidi controls (ALM, LRM, RLM, LRE-RLO, LRI-PDI) drawn as `\u{XXXX}`, as
+    /// `LinkConfirmation.escaped` writes them. ZWJ and every other character stay as they are.
+    static func escaped(_ s: String) -> String {
+        s.unicodeScalars.map { scalar in
+            switch scalar.value {
+            case 0x00...0x08, 0x0B...0x1F, 0x7F...0x9F, 0x061C, 0x200E, 0x200F, 0x202A...0x202E, 0x2066...0x2069:
+                String(format: "\\u{%04X}", scalar.value)
+            default: String(scalar)
+            }
+        }.joined()
+    }
+}
+
+/// "Copied!" after a copy, for `CodeBlockStyle.copyCooldown`; a newer copy restarts it.
+@MainActor @Observable
+final class CopyFeedback {
+    private(set) var copied = false
+    @ObservationIgnored private var generation = 0
+
+    /// Writes `code` exactly. The pasteboard is cleared and set, never read.
+    func copy(_ code: String, to pasteboard: NSPasteboard, cooldown: Duration = CodeBlockStyle.copyCooldown) {
+        pasteboard.clearContents()
+        pasteboard.setString(code, forType: .string)
+        copied = true
+        generation += 1
+        let mine = generation
+        Task { @MainActor in
+            try? await Task.sleep(for: cooldown)
+            if generation == mine { copied = false }
+        }
+    }
+}
+
+/// A code block in Vencord's look (plan K6). Under a hidden spoiler it has no Copy control; the
+/// spoiler's cover (`SpoilerCover`) hides the rest.
+struct CodeBlockView: View {
+    let code: String
+    let model: CodeBlockModel
+    let size: CGFloat
+    let covered: Bool
+    let pasteboard: NSPasteboard
+    @State private var hovering: Bool
+    @State private var feedback = CopyFeedback()
+
+    private typealias S = CodeBlockStyle
+
+    /// `style` is the containers around the block (only its spoilers count); `hovering` is for
+    /// offscreen renders of the hover state.
+    init(code: String, header: String?, highlight: CodeHighlight?, size: CGFloat, style: InlineStyle, revealed: Set<Int>,
+         pasteboard: NSPasteboard = .general, hovering: Bool = false) {
+        self.code = code
+        model = CodeBlockModel(code: code, header: header, highlight: highlight)
+        self.size = size
+        covered = style.hiddenSpoiler(revealed: revealed) != nil
+        self.pasteboard = pasteboard
+        _hovering = State(initialValue: hovering)
+    }
+
+    var body: some View {
+        let font = Font.system(size: size, design: .monospaced)
+        VStack(alignment: .leading, spacing: 0) {
+            if let name = model.name {
+                HStack(spacing: S.headerIconGap) {
+                    Image(systemName: S.headerSymbol)
+                    Text(verbatim: name)
+                }
+                .font(.system(size: size, weight: .bold))
+                .padding(.horizontal, S.headerPaddingH)
+                .padding(.bottom, S.headerBottom)
+            }
+            // Rows rather than a `Grid`: a Grid sizes a wrapping cell for another width and clips
+            // its last line. The number column is as wide as the longest number (monospaced digits).
+            let numberWidth = (Self.digitWidth(size: size) * CGFloat(model.numbers.last?.count ?? 1)).rounded(.up)
+            ForEach(Array(zip(model.numbers, model.lines).enumerated()), id: \.offset) { _, row in
+                HStack(alignment: .firstTextBaseline, spacing: 0) {
+                    Text(verbatim: row.0)
+                        .font(font)
+                        .frame(width: numberWidth, alignment: .leading)
+                        .padding(.leading, S.numberLeading)
+                        .padding(.trailing, S.numberTrailing)
+                    Text(Self.attributed(row.1, size: size))
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.leading, S.codeLeading)
+                        .frame(maxWidth: .infinity, minHeight: S.rowHeight, alignment: .topLeading)
+                }
+            }
+        }
+        .lineHeight(.exact(points: S.lineHeight))
+        .foregroundStyle(Color(RGB(rgb: S.plain)))
+        .padding(size * S.paddingEm)
+        .padding(.top, model.name == nil ? max(0, S.plainTopPadding - size * S.paddingEm) : 0)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(S.background))
+        .clipShape(RoundedRectangle(cornerRadius: S.radius))
+        .overlay(alignment: .bottomTrailing) {
+            if hovering && !covered { copyButton }
+        }
+        .onHover { hovering = $0 }
+    }
+
+    private var copyButton: some View {
+        Button { feedback.copy(code, to: pasteboard) } label: {
+            Text(feedback.copied ? "Copied!" : "Copy")
+                .font(.system(size: size))
+                .foregroundStyle(Color(S.copyForeground))
+                .padding(.vertical, S.copyPaddingV)
+                .padding(.horizontal, S.copyPaddingH)
+                .background(Color(S.copyBackground), in: UnevenRoundedRectangle(topLeadingRadius: S.copyRadius, bottomTrailingRadius: S.copyRadius))
+        }
+        .buttonStyle(.plain)
+    }
+
+    /// One digit of the monospaced system font (SwiftUI's `.monospaced` design) at `size`.
+    static func digitWidth(size: CGFloat) -> CGFloat {
+        ("0" as NSString).size(withAttributes: [.font: NSFont.monospacedSystemFont(ofSize: size, weight: .regular)]).width
+    }
+
+    /// One line's runs, escaped for display, in their colours and styles.
+    static func attributed(_ line: [CodeSpan], size: CGFloat) -> AttributedString {
+        var out = AttributedString()
+        for span in line {
+            var run = AttributedString(CodeBlockModel.escaped(span.text))
+            var font = Font.system(size: size, weight: span.bold ? .bold : .regular, design: .monospaced)
+            if span.italic { font = font.italic() }
+            run.swiftUI.font = font
+            run.swiftUI.foregroundColor = Color(RGB(rgb: span.rgb))
+            if span.underline { run.swiftUI.underlineStyle = .single }
+            out += run
+        }
+        return out
     }
 }
 
@@ -374,7 +586,13 @@ private func blockPreview(_ blocks: [MarkdownBlock]) -> some View {
 #Preview("Code block") {
     blockPreview([
         .paragraph([.text("see:")]),
-        .codeBlock(language: "swift", code: "let x = 1\nlet reallyLongLineThatDoesNotWrapButScrollsSideways = x + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9"),
+        .codeBlock(language: "swift", code: "let x = 1\nlet aLongLineThatWrapsInsideTheBlock = x + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9", header: nil, highlight: nil),
+        .codeBlock(language: "py", code: "def f(x):\n    return \"s\"  # c", header: "Python", highlight: CodeHighlight(lines: [
+            [CodeSpan(text: "def", rgb: 0x569CD6), CodeSpan(text: " ", rgb: 0xD4D4D4), CodeSpan(text: "f", rgb: 0xDCDCAA),
+             CodeSpan(text: "(", rgb: 0xD4D4D4), CodeSpan(text: "x", rgb: 0x9CDCFE), CodeSpan(text: "):", rgb: 0xD4D4D4)],
+            [CodeSpan(text: "    ", rgb: 0xD4D4D4), CodeSpan(text: "return", rgb: 0xC586C0), CodeSpan(text: " ", rgb: 0xD4D4D4),
+             CodeSpan(text: "\"s\"", rgb: 0xCE9178), CodeSpan(text: "  ", rgb: 0xD4D4D4), CodeSpan(text: "# c", rgb: 0x6A9955)],
+        ])),
     ])
 }
 
@@ -382,6 +600,6 @@ private func blockPreview(_ blocks: [MarkdownBlock]) -> some View {
     blockPreview([.paragraph([
         .bold([.block(.heading(level: 2, [.text("bold heading")]))]),
         .italic([.block(.quote([.paragraph([.text("italic quote")])]))]),
-        .spoiler(id: 0, [.block(.codeBlock(language: nil, code: "hidden code"))]),
+        .spoiler(id: 0, [.block(.codeBlock(language: nil, code: "hidden code", header: nil, highlight: nil))]),
     ])])
 }

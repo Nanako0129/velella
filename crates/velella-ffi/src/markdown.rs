@@ -1,7 +1,10 @@
 //! The message-body AST across FFI (docs/plans/markdown.md, K2): a field-for-field mirror of
 //! `velella_core::markdown`, plus the resolved mentions and emoji images a row carries. Names
 //! carry an `Md` prefix so the Swift shell's own `MarkdownBlock`/`MarkdownInline` do not clash.
-use velella_core::markdown::{Block, Inline, NavTarget, TimestampStyle};
+use velella_core::{
+    highlight::{self, Highlighted, Span},
+    markdown::{Block, Inline, NavTarget, TimestampStyle},
+};
 
 #[derive(Debug, PartialEq, uniffi::Enum)]
 pub enum MdBlock {
@@ -25,10 +28,31 @@ pub enum MdBlock {
         start: u32,
         items: Vec<Vec<MdBlock>>,
     },
+    /// `header` is the language table's name for the fence (never the fence text), present
+    /// whether or not the colours have arrived. `highlight` was computed in core from this block's
+    /// own `code` (K6); `None` renders plain.
     CodeBlock {
         language: Option<String>,
         code: String,
+        header: Option<String>,
+        highlight: Option<MdHighlighted>,
     },
+}
+
+/// A code block's highlight: `lines` joined with `\n` give the block's code.
+#[derive(Debug, PartialEq, uniffi::Record)]
+pub struct MdHighlighted {
+    pub lines: Vec<Vec<MdSpan>>,
+}
+
+/// A run of one style; `rgb` is 0xRRGGBB.
+#[derive(Debug, PartialEq, uniffi::Record)]
+pub struct MdSpan {
+    pub text: String,
+    pub rgb: u32,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
 }
 
 #[derive(Debug, PartialEq, uniffi::Enum)]
@@ -173,7 +197,17 @@ impl From<Block> for MdBlock {
                 start,
                 items: items.into_iter().map(blocks).collect(),
             },
-            Block::CodeBlock { language, code } => Self::CodeBlock { language, code },
+            Block::CodeBlock {
+                language,
+                code,
+                highlight,
+            } => Self::CodeBlock {
+                header: highlight::header(language.as_deref()).map(str::to_owned),
+                language,
+                code,
+                // The spans are copied here, after `snapshot()` returned: off the store lock.
+                highlight: highlight.as_deref().map(Into::into),
+            },
         }
     }
 }
@@ -257,6 +291,30 @@ impl From<NavTarget> for MdNavTarget {
     }
 }
 
+impl From<&Highlighted> for MdHighlighted {
+    fn from(h: &Highlighted) -> Self {
+        Self {
+            lines: h
+                .lines
+                .iter()
+                .map(|l| l.iter().map(Into::into).collect())
+                .collect(),
+        }
+    }
+}
+
+impl From<&Span> for MdSpan {
+    fn from(s: &Span) -> Self {
+        Self {
+            text: s.text.clone(),
+            rgb: s.rgb,
+            bold: s.bold,
+            italic: s.italic,
+            underline: s.underline,
+        }
+    }
+}
+
 impl From<velella_core::ResolvedMention> for MdMention {
     fn from(m: velella_core::ResolvedMention) -> Self {
         Self {
@@ -285,6 +343,7 @@ impl From<velella_core::EmojiImage> for MdEmoji {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use velella_core::markdown::parse;
 
     fn text(s: &str) -> Inline {
@@ -363,6 +422,7 @@ mod tests {
                 Inline::Spoiler(vec![Inline::Block(Box::new(Block::CodeBlock {
                     language: None,
                     code: "x".into(),
+                    highlight: None,
                 }))]),
                 Inline::Code("c".into()),
                 Inline::Link {
@@ -413,6 +473,8 @@ mod tests {
                         block: MdBlock::CodeBlock {
                             language: None,
                             code: "x".into(),
+                            header: None,
+                            highlight: None,
                         },
                     }],
                 },
@@ -463,7 +525,25 @@ mod tests {
             },
             Block::CodeBlock {
                 language: Some("rs".into()),
-                code: "fn".into(),
+                code: "fn\n".into(),
+                highlight: Some(Arc::new(Highlighted {
+                    lines: vec![
+                        vec![Span {
+                            text: "fn".into(),
+                            rgb: 0x569CD6,
+                            bold: true,
+                            italic: false,
+                            underline: true,
+                        }],
+                        vec![],
+                    ],
+                })),
+            },
+            // An unmapped fence: no header.
+            Block::CodeBlock {
+                language: Some("swift".into()),
+                code: "let".into(),
+                highlight: None,
             },
         ];
         let md = vec![
@@ -494,7 +574,26 @@ mod tests {
             },
             MdBlock::CodeBlock {
                 language: Some("rs".into()),
-                code: "fn".into(),
+                code: "fn\n".into(),
+                header: Some("Rust".into()),
+                highlight: Some(MdHighlighted {
+                    lines: vec![
+                        vec![MdSpan {
+                            text: "fn".into(),
+                            rgb: 0x569CD6,
+                            bold: true,
+                            italic: false,
+                            underline: true,
+                        }],
+                        vec![],
+                    ],
+                }),
+            },
+            MdBlock::CodeBlock {
+                language: Some("swift".into()),
+                code: "let".into(),
+                header: None,
+                highlight: None,
             },
         ];
         assert_eq!(blocks(core), md);
@@ -514,13 +613,105 @@ mod tests {
                         content: vec![MdInline::Block {
                             block: MdBlock::CodeBlock {
                                 language: None,
-                                code: "x".into()
+                                code: "x".into(),
+                                header: None,
+                                highlight: None,
                             }
                         }]
                     }
                 ]
             }]
         );
+    }
+
+    /// The text of a converted code block's spans, lines joined with `\n`.
+    fn joined(h: &MdHighlighted) -> String {
+        let lines: Vec<String> = h
+            .lines
+            .iter()
+            .map(|l| l.iter().map(|s| s.text.as_str()).collect())
+            .collect();
+        lines.join("\n")
+    }
+
+    /// One line's synthetic highlight: a span per character, so a misplaced one shows.
+    fn spans_of(code: &str) -> Arc<Highlighted> {
+        let line = |l: &str| {
+            l.chars()
+                .map(|c| Span {
+                    text: c.to_string(),
+                    rgb: 0x9CDCFE,
+                    bold: false,
+                    italic: false,
+                    underline: false,
+                })
+                .collect()
+        };
+        Arc::new(Highlighted {
+            lines: code.split('\n').map(line).collect(),
+        })
+    }
+
+    /// Plan K6-1: a hidden-spoiler code block before a visible one. Each block's highlight sits on
+    /// its own node (core's `apply` sets it there, messages_tests.rs), and the conversion keeps it
+    /// there: each converted `MdBlock::CodeBlock`'s spans join to its own code, with its header.
+    #[test]
+    fn a_hidden_spoiler_code_block_never_lends_its_spans_to_a_visible_one() {
+        let mut body = parse("||```py\nsecret = 1\n```|| then\n```rb\nshown = 2\n```");
+        let [Block::Paragraph(content), Block::CodeBlock {
+            code, highlight, ..
+        }] = body.as_mut_slice()
+        else {
+            panic!("unexpected core shape");
+        };
+        *highlight = Some(spans_of(code));
+        let [Inline::Spoiler(hidden), ..] = content.as_mut_slice() else {
+            panic!("no spoiler first");
+        };
+        let [Inline::Block(b)] = hidden.as_mut_slice() else {
+            panic!("no hidden block");
+        };
+        let Block::CodeBlock {
+            code, highlight, ..
+        } = &mut **b
+        else {
+            panic!("not a code block");
+        };
+        *highlight = Some(spans_of(code));
+
+        let md = blocks(body);
+        let [MdBlock::Paragraph { content }, MdBlock::CodeBlock {
+            code: visible_code,
+            header: visible_header,
+            highlight: Some(visible),
+            ..
+        }] = md.as_slice()
+        else {
+            panic!("unexpected shape {md:?}");
+        };
+        assert_eq!(visible_code, "shown = 2");
+        assert_eq!(joined(visible), "shown = 2");
+        assert_eq!(visible_header.as_deref(), Some("Ruby"));
+        let [MdInline::Spoiler { content: hidden }, ..] = content.as_slice() else {
+            panic!("no spoiler first: {content:?}");
+        };
+        let [MdInline::Block {
+            block:
+                MdBlock::CodeBlock {
+                    code: hidden_code,
+                    header: hidden_header,
+                    highlight: Some(hidden),
+                    ..
+                },
+        }] = hidden.as_slice()
+        else {
+            panic!("no hidden code block: {hidden:?}");
+        };
+        assert_eq!(
+            (hidden_code.as_str(), joined(hidden).as_str()),
+            ("secret = 1", "secret = 1")
+        );
+        assert_eq!(hidden_header.as_deref(), Some("Python"));
     }
 
     /// What the Swift shell receives for the trap inputs of the plan's K2 acceptance: an

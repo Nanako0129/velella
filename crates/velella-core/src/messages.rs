@@ -12,9 +12,17 @@
 //! - Every failure is fixed text (`&'static str`): no REST error, body or header reaches a row.
 //! - The body is parsed once, when content arrives or changes (K1); `row()` never re-parses.
 //!   Mentions are resolved by walking that AST into side data, so a resolved name is never parsed.
+//! - Code blocks are highlighted off the session task (K6 rev 3.1). A message whose body has a
+//!   fence in the language table is marked `pending` where the body is assigned (`parse` of a
+//!   top-level message, `merge` with new content); never an echo or a nested reply. One worker
+//!   thread per store, holding only a `Weak`, takes the newest pending message (`next_job`),
+//!   computes off the lock, and `apply` sets each block's highlight only while the message still has
+//!   exactly those blocks. Every `bump` wakes it. On the session path the only highlighting code is
+//!   the pure table lookup `highlight::header`.
 //! - A reply preview is flattened from the replied message's AST: a spoiler and everything in it
 //!   become one placeholder, so a preview never shows spoiler text.
 use crate::{
+    highlight::{self, Highlighted, Job},
     markdown::{self, Block, Inline, NavTarget, TimestampStyle},
     rest::{Rest, RestError},
     session::{SessionHandle, Subscription},
@@ -27,7 +35,8 @@ use std::{
     collections::HashSet,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
+        mpsc::{sync_channel, Receiver, SyncSender},
+        Arc, Mutex, Weak,
     },
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -216,6 +225,57 @@ fn mentions(v: Option<&Value>) -> Vec<(u64, String)> {
         .unwrap_or_default()
 }
 
+/// Calls `f(fence, code, highlight)` for every code block of `blocks`, in document order,
+/// descending into quotes, list items and blocks inside inline containers. The one walk behind the
+/// pending check, `next_job` and `apply`, so their orders agree by construction. Depth is bounded by
+/// the parser's nesting limit.
+fn each_code_block(
+    blocks: &mut [Block],
+    f: &mut impl FnMut(Option<&str>, &str, &mut Option<Arc<Highlighted>>),
+) {
+    for b in blocks {
+        match b {
+            Block::Paragraph(c) | Block::Subtext(c) | Block::Heading { content: c, .. } => {
+                each_code_block_in(c, f)
+            }
+            Block::Quote(inner) => each_code_block(inner, f),
+            Block::List { items, .. } => items.iter_mut().for_each(|i| each_code_block(i, f)),
+            Block::CodeBlock {
+                language,
+                code,
+                highlight,
+            } => f(language.as_deref(), code, highlight),
+        }
+    }
+}
+
+fn each_code_block_in(
+    inlines: &mut [Inline],
+    f: &mut impl FnMut(Option<&str>, &str, &mut Option<Arc<Highlighted>>),
+) {
+    for i in inlines {
+        match i {
+            Inline::Bold(c)
+            | Inline::Italic(c)
+            | Inline::Underline(c)
+            | Inline::Strike(c)
+            | Inline::Spoiler(c)
+            | Inline::Link { label: c, .. } => each_code_block_in(c, f),
+            Inline::Block(b) => each_code_block(std::slice::from_mut(&mut **b), f),
+            _ => {}
+        }
+    }
+}
+
+/// Whether any code block's fence is in the language table (the pure lookup; no syntect).
+fn has_mapped_fence(body: &mut [Block]) -> bool {
+    let mut mapped = false;
+    each_code_block(body, &mut |fence, _, _| {
+        mapped |= highlight::header(fence).is_some()
+    });
+    mapped
+}
+
 #[derive(Clone, Debug)]
 struct Stored {
     id: u64,
@@ -225,6 +285,8 @@ struct Stored {
     content: String,
     /// `content` parsed once, when it arrives or changes (never per snapshot).
     body: Vec<markdown::Block>,
+    /// A highlight job is due: set with the body when a fence maps, cleared by `next_job`.
+    pending: bool,
     edited: bool,
     attachments: Vec<Attachment>,
     mentions: Vec<(u64, String)>,
@@ -236,6 +298,9 @@ struct Stored {
 fn parse(v: &Value, nested: bool) -> Option<Stored> {
     let member = v.get("member").filter(|m| m.is_object());
     let content = text(v, "content").unwrap_or_default();
+    let mut body = markdown::parse(&content);
+    // A nested reply only feeds the one-line preview: never highlighted.
+    let pending = !nested && has_mapped_fence(&mut body);
     Some(Stored {
         id: v.get("id").and_then(id)?,
         author: user(v.get("author")?)?,
@@ -244,7 +309,8 @@ fn parse(v: &Value, nested: bool) -> Option<Stored> {
             .and_then(|m| m.get("roles")?.as_array())
             .map(|r| r.iter().filter_map(id).collect())
             .unwrap_or_default(),
-        body: markdown::parse(&content),
+        body,
+        pending,
         content,
         edited: v.get("edited_timestamp").is_some_and(|t| !t.is_null()),
         attachments: attachments(v.get("attachments")),
@@ -270,6 +336,7 @@ impl Stored {
         if let Some(content) = text(d, "content") {
             if content != self.content {
                 self.body = markdown::parse(&content);
+                self.pending = has_mapped_fence(&mut self.body);
             }
             self.content = content;
         }
@@ -634,9 +701,18 @@ struct Open {
 
 impl Open {
     /// Inserts in id order; `replace` decides whether an existing copy is overwritten.
-    fn insert(&mut self, m: Stored, replace: bool) {
+    /// A replacing copy with equal `content` keeps the existing body and `pending`: the body is a
+    /// function of `content` alone, so colours already applied stay.
+    fn insert(&mut self, mut m: Stored, replace: bool) {
         match self.messages.binary_search_by_key(&m.id, |s| s.id) {
-            Ok(i) if replace => self.messages[i] = m,
+            Ok(i) if replace => {
+                let old = &mut self.messages[i];
+                if old.content == m.content {
+                    m.body = std::mem::take(&mut old.body);
+                    m.pending = old.pending;
+                }
+                *old = m;
+            }
             Ok(_) => {}
             Err(i) => self.messages.insert(i, m),
         }
@@ -656,17 +732,50 @@ pub(crate) struct MessageStore {
     inner: Mutex<Inner>,
     /// Bumped on every buffer change; message subscriptions wait on it.
     revision: watch::Sender<u64>,
+    /// Wakes this store's highlight worker; `None` without one (a failed spawn, or tests).
+    wake: Option<SyncSender<()>>,
     /// Dispatch names seen, so a test can show the observer is wired.
     #[cfg(test)]
     pub(crate) seen: std::sync::Mutex<Vec<String>>,
 }
 
 impl MessageStore {
-    pub(crate) fn new(rest: Rest) -> MessageStore {
+    /// A store with its highlight worker thread.
+    pub(crate) fn new(rest: Rest) -> Arc<MessageStore> {
+        Self::start(rest, highlight::compute_job).0
+    }
+
+    /// `new` with the compute function as a parameter, also returning the worker's handle (`None`
+    /// when the spawn failed: highlighting is then off for this store, and nothing panics).
+    fn start(
+        rest: Rest,
+        compute: impl FnMut(&Job) -> Vec<Option<Arc<Highlighted>>> + Send + 'static,
+    ) -> (Arc<MessageStore>, Option<std::thread::JoinHandle<()>>) {
+        let (tx, rx) = sync_channel(1);
+        let mut handle = None;
+        let store = Arc::new_cyclic(|weak| {
+            let weak = weak.clone();
+            handle = std::thread::Builder::new()
+                .name("velella-highlight".into())
+                .spawn(move || run(weak, rx, compute))
+                .ok();
+            Self::build(rest, handle.is_some().then_some(tx))
+        });
+        (store, handle)
+    }
+
+    /// A store without a thread; `wake` is what `bump` signals (the test seam).
+    #[cfg(test)]
+    pub(crate) fn with_wake(rest: Rest, wake: Option<SyncSender<()>>) -> Arc<MessageStore> {
+        Arc::new(Self::build(rest, wake))
+    }
+
+    fn build(rest: Rest, wake: Option<SyncSender<()>>) -> MessageStore {
         MessageStore {
             rest,
             inner: Mutex::default(),
             revision: watch::channel(0).0,
+            wake,
             #[cfg(test)]
             seen: Default::default(),
         }
@@ -678,6 +787,72 @@ impl MessageStore {
 
     fn bump(&self) {
         self.revision.send_modify(|r| *r += 1);
+        self.wake();
+    }
+
+    /// Never blocks: a full channel means a wake is already pending, a disconnected one that the
+    /// worker is gone (it is not restarted).
+    fn wake(&self) {
+        if let Some(wake) = &self.wake {
+            let _ = wake.try_send(());
+        }
+    }
+
+    /// The newest pending message of the open channel, its flag cleared, as a job: every code
+    /// block's (fence, code) in walk order. Echoes are never looked at.
+    fn next_job(&self) -> Option<Job> {
+        let mut inner = self.lock();
+        let m = inner
+            .open
+            .as_mut()?
+            .messages
+            .iter_mut()
+            .rev()
+            .find(|m| m.pending)?;
+        m.pending = false;
+        let mut blocks = Vec::new();
+        each_code_block(&mut m.body, &mut |fence, code, _| {
+            blocks.push((fence.map(str::to_owned), code.to_owned()))
+        });
+        Some(Job { id: m.id, blocks })
+    }
+
+    /// Applies a job's results if message `job.id` is still in the open channel with exactly the
+    /// job's code blocks, (fence, code) byte for byte; then each block takes only a result whose
+    /// spans spell its own code. No syntect here. Bumps once if anything changed.
+    fn apply(&self, job: &Job, results: Vec<Option<Arc<Highlighted>>>) {
+        let mut inner = self.lock();
+        let Some(m) = inner
+            .open
+            .as_mut()
+            .and_then(|o| o.messages.iter_mut().find(|m| m.id == job.id))
+        else {
+            return;
+        };
+        let mut seen = 0;
+        let mut same = results.len() == job.blocks.len();
+        each_code_block(&mut m.body, &mut |fence, code, _| {
+            same &= job
+                .blocks
+                .get(seen)
+                .is_some_and(|(f, c)| f.as_deref() == fence && c == code);
+            seen += 1;
+        });
+        if !same || seen != job.blocks.len() {
+            return;
+        }
+        let mut results = results.into_iter();
+        let mut changed = false;
+        each_code_block(&mut m.body, &mut |_, code, highlight| {
+            if let Some(h) = results.next().flatten().filter(|h| h.text() == code) {
+                *highlight = Some(h);
+                changed = true;
+            }
+        });
+        drop(inner);
+        if changed {
+            self.bump();
+        }
     }
 
     /// Makes `channel_id` the open channel (dropping the previous buffer and cancelling its fetch)
@@ -808,6 +983,7 @@ impl MessageStore {
                 roles: Vec::new(),
                 content: content.to_owned(),
                 body: markdown::parse(content),
+                pending: false, // an echo is never highlighted
                 edited: false,
                 attachments: Vec::new(),
                 mentions: Vec::new(),
@@ -863,6 +1039,34 @@ impl MessageStore {
             load: open.load.clone(),
             rows,
         })
+    }
+}
+
+/// The highlight worker of one store (plan K6 rev 3.1, Worker row). It holds only a `Weak` and the
+/// wake receiver, never an `Arc` across a computation, so it ends once the store is dropped.
+fn run(
+    store: Weak<MessageStore>,
+    wake: Receiver<()>,
+    mut compute: impl FnMut(&Job) -> Vec<Option<Arc<Highlighted>>>,
+) {
+    if highlight::warm().is_none() {
+        return;
+    }
+    while wake.recv().is_ok() {
+        loop {
+            let Some(strong) = store.upgrade() else {
+                return;
+            };
+            let Some(job) = strong.next_job() else {
+                break;
+            };
+            drop(strong);
+            let results = compute(&job);
+            let Some(strong) = store.upgrade() else {
+                return;
+            };
+            strong.apply(&job, results);
+        }
     }
 }
 

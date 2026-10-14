@@ -190,12 +190,12 @@ private let body = MarkdownText.bodySize
 }
 
 @Test func aBlockInsideASpoilerSplitsTheParagraphUnderTheSameCover() {
-    let body = MessageBody(blocks: [.paragraph([.text("a "), .spoiler(id: 0, [.block(.codeBlock(language: nil, code: "x"))]), .text(" b")])])
+    let body = MessageBody(blocks: [.paragraph([.text("a "), .spoiler(id: 0, [.block(.codeBlock(language: nil, code: "x", header: nil, highlight: nil))]), .text(" b")])])
     guard case .paragraph(let inlines) = body.blocks[0] else { Issue.record("not a paragraph"); return }
     let parts = InlinePart.split(inlines)
     #expect(parts == [
         .inlines([.text("a ")]),
-        .block(.codeBlock(language: nil, code: "x"), InlineStyle(spoilers: [0])),
+        .block(.codeBlock(language: nil, code: "x", header: nil, highlight: nil), InlineStyle(spoilers: [0])),
         .inlines([.text(" b")]),
     ])
     guard case .block(_, let style) = parts[1] else { return }

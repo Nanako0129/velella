@@ -22,7 +22,7 @@ fn token() -> Arc<Token> {
 fn store_for(mock: &MockHttp) -> Arc<MessageStore> {
     mock.install();
     let (tx, _rx) = mpsc::unbounded_channel();
-    Arc::new(MessageStore::new(Rest::new(token(), 7, tx)))
+    MessageStore::with_wake(Rest::new(token(), 7, tx), None)
 }
 
 async fn serve(responses: &[String]) -> (MockHttp, Arc<MessageStore>) {
@@ -582,7 +582,7 @@ async fn leaving_the_channel_cancels_the_in_flight_get() {
     let base = format!("http://{}", listener.local_addr().unwrap());
     TEST_REST_BASE.with(|b| *b.borrow_mut() = Some(base));
     let (tx, _rx) = mpsc::unbounded_channel();
-    let store = Arc::new(MessageStore::new(Rest::new(token(), 7, tx)));
+    let store = MessageStore::with_wake(Rest::new(token(), 7, tx), None);
     let epoch = store.open(5);
     // The server takes the request and never answers.
     let (mut stream, _) = timeout(WAIT, listener.accept()).await.unwrap().unwrap();
@@ -796,4 +796,541 @@ fn a_name_cannot_close_or_hold_open_its_isolate_in_a_preview() {
     ] {
         assert_eq!(preview_of("<@{9}> xyz", nick), want, "nick {nick:?}");
     }
+}
+
+// ---- Highlight worker (K6 rev 3.1) ----
+
+/// `content` with one fenced block per (fence, code).
+fn fenced(blocks: &[(&str, &str)]) -> String {
+    blocks
+        .iter()
+        .map(|(f, c)| format!("```{f}\n{c}\n```"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Every code block's highlight in `body`, in walk order.
+fn highlights(body: &[markdown::Block]) -> Vec<Option<Arc<Highlighted>>> {
+    let mut body = body.to_vec();
+    let mut out = Vec::new();
+    each_code_block(&mut body, &mut |_, _, h| out.push(h.clone()));
+    out
+}
+
+/// No code block in the open channel's snapshot has a highlight.
+fn all_plain(store: &MessageStore, epoch: u64) -> bool {
+    now(store, epoch)
+        .rows
+        .iter()
+        .all(|r| highlights(&r.body).iter().all(Option::is_none))
+}
+
+/// `compute_job` with no budget.
+fn computed(job: &Job) -> Vec<Option<Arc<Highlighted>>> {
+    let t = std::time::Instant::now();
+    highlight::compute_job_with(job, &mut || t)
+}
+
+fn py_job(id: u64, code: &str) -> Job {
+    Job {
+        id,
+        blocks: vec![(Some("py".into()), code.into())],
+    }
+}
+
+/// A store (no worker) with channel 5 open and its history `page` loaded.
+async fn opened(page: Value) -> (MockHttp, Arc<MessageStore>, u64) {
+    let (mock, store) = serve(&[ok(&page)]).await;
+    let epoch = store.open(5);
+    settled(&store, epoch).await;
+    (mock, store, epoch)
+}
+
+#[tokio::test]
+async fn each_pending_site_queues_the_message_and_computes_nothing() {
+    let py = fenced(&[("py", "x = 1")]);
+    // MESSAGE_CREATE.
+    let (_m, store, epoch) = opened(json!([])).await;
+    store.observe("MESSAGE_CREATE", &msg(50, 5, &py));
+    assert!(all_plain(&store, epoch));
+    assert_eq!(store.next_job().map(|j| j.id), Some(50));
+    // `history` Ok.
+    let (_m, store, epoch) = opened(json!([msg(60, 5, &py)])).await;
+    assert!(all_plain(&store, epoch));
+    assert_eq!(store.next_job().map(|j| j.id), Some(60));
+    // `finish_send` Ok.
+    let (_m, store, epoch) = opened(json!([])).await;
+    let (_, nonce) = store.begin_send(5, &py, me()).unwrap();
+    let mut sent = msg(70, 5, &py);
+    sent["author"] = json!({"id": "1", "username": "me"});
+    sent["nonce"] = json!(nonce);
+    store.finish_send(epoch, &nonce, Ok(sent));
+    assert!(all_plain(&store, epoch));
+    assert_eq!(store.next_job().map(|j| j.id), Some(70));
+    // `merge` with changed content.
+    let (_m, store, epoch) = opened(json!([msg(80, 5, "plain")])).await;
+    assert_eq!(store.next_job(), None);
+    store.observe(
+        "MESSAGE_UPDATE",
+        &json!({"id": "80", "channel_id": "5", "content": py}),
+    );
+    assert!(all_plain(&store, epoch));
+    assert_eq!(store.next_job().map(|j| j.id), Some(80));
+}
+
+#[tokio::test]
+async fn nothing_is_pending_without_a_mapped_fence_in_the_message_itself() {
+    let py = fenced(&[("py", "x = 1")]);
+    let (_m, store, epoch) = opened(json!([msg(10, 5, &py)])).await;
+    assert_eq!(store.next_job().map(|j| j.id), Some(10));
+    // `merge` with equal content.
+    store.observe(
+        "MESSAGE_UPDATE",
+        &json!({"id": "10", "channel_id": "5", "content": py, "edited_timestamp": "x"}),
+    );
+    assert_eq!(store.next_job(), None);
+    // An echo with a `py` block. The worker never reads echoes, even one flagged by hand.
+    store.begin_send(5, &py, me()).unwrap();
+    assert_eq!(store.next_job(), None);
+    let echo_id = {
+        let mut inner = store.lock();
+        let echo = &mut inner.open.as_mut().unwrap().echoes[0].message;
+        echo.pending = true;
+        echo.id
+    };
+    assert_eq!(store.next_job(), None, "next_job searched the echoes");
+    let job = py_job(echo_id, "x = 1");
+    store.apply(&job, computed(&job));
+    let echo_body = store.lock().open.as_ref().unwrap().echoes[0]
+        .message
+        .body
+        .clone();
+    assert_eq!(highlights(&echo_body), [None], "apply searched the echoes");
+    // A reply whose only `py` block is in its referenced message.
+    let mut reply = msg(20, 5, "a reply");
+    reply["referenced_message"] = msg(15, 5, &py);
+    store.observe("MESSAGE_CREATE", &reply);
+    assert_eq!(store.next_job(), None);
+    // Only an unmapped fence.
+    store.observe(
+        "MESSAGE_CREATE",
+        &msg(30, 5, &fenced(&[("swift", "let x = 1")])),
+    );
+    assert_eq!(store.next_job(), None);
+    assert!(all_plain(&store, epoch));
+}
+
+#[tokio::test]
+async fn the_newest_pending_message_goes_first() {
+    let py = fenced(&[("py", "x = 1")]);
+    let (_m, store, _) = opened(json!([msg(20, 5, &py), msg(10, 5, &py)])).await;
+    assert_eq!(store.next_job().map(|j| j.id), Some(20));
+    assert_eq!(store.next_job().map(|j| j.id), Some(10));
+    assert_eq!(store.next_job(), None);
+}
+
+#[tokio::test]
+async fn history_inserts_a_pending_message_with_its_blocks() {
+    let content = fenced(&[("py", "x = 1"), ("swift", "let y = 2")]);
+    let (_m, store, _) = opened(json!([msg(10, 5, &content)])).await;
+    let job = store.next_job().unwrap();
+    assert_eq!(job.id, 10);
+    // Every block, mapped or not, in walk order.
+    assert_eq!(
+        job.blocks,
+        [
+            (Some("py".to_owned()), "x = 1".to_owned()),
+            (Some("swift".to_owned()), "let y = 2".to_owned())
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_result_for_a_channel_left_is_dropped_and_still_right_after_reopening() {
+    let a = json!([msg(10, 5, &fenced(&[("py", "x = 1")]))]);
+    let b = json!([msg(20, 6, &fenced(&[("rb", "y = 2")]))]);
+    let (_mock, store) = serve(&[ok(&a), ok(&b), ok(&a)]).await;
+    let ea = store.open(5);
+    settled(&store, ea).await;
+    let job = store.next_job().unwrap();
+    assert_eq!(job.id, 10);
+    let results = computed(&job);
+    let eb = store.open(6);
+    settled(&store, eb).await;
+    store.apply(&job, results.clone());
+    assert!(all_plain(&store, eb));
+    assert_eq!(store.next_job().map(|j| j.id), Some(20));
+    assert_eq!(store.next_job(), None);
+    // Back to A with the same message: A's old result is still that block's own, so it applies.
+    store.close(eb);
+    let ea = store.open(5);
+    settled(&store, ea).await;
+    store.apply(&job, results);
+    let h = highlights(&now(&store, ea).rows[0].body);
+    assert_eq!(h.len(), 1);
+    assert_eq!(h[0].as_ref().map(|h| h.text()).as_deref(), Some("x = 1"));
+}
+
+#[tokio::test]
+async fn an_edit_during_compute_drops_the_result_and_queues_the_new_code() {
+    // New code, and a fence-only edit (`py` → `rb`, same code).
+    for edited in [fenced(&[("py", "x = 2")]), fenced(&[("rb", "x = 1")])] {
+        let (_m, store, epoch) = opened(json!([msg(10, 5, &fenced(&[("py", "x = 1")]))])).await;
+        let job = store.next_job().unwrap();
+        let results = computed(&job);
+        assert!(results[0].is_some());
+        store.observe(
+            "MESSAGE_UPDATE",
+            &json!({"id": "10", "channel_id": "5", "content": edited}),
+        );
+        store.apply(&job, results);
+        assert!(all_plain(&store, epoch), "{edited}");
+        assert_eq!(store.next_job().map(|j| j.id), Some(10));
+    }
+}
+
+#[tokio::test]
+async fn a_result_for_a_deleted_or_evicted_message_is_dropped() {
+    let py = fenced(&[("py", "x = 1")]);
+    let (_m, store, epoch) = opened(json!([msg(10, 5, &py)])).await;
+    let job = store.next_job().unwrap();
+    let results = computed(&job);
+    store.observe("MESSAGE_DELETE", &json!({"id": "10", "channel_id": "5"}));
+    store.apply(&job, results);
+    assert!(now(&store, epoch).rows.is_empty());
+    // Pushed out past `CAP`.
+    let (_m, store, epoch) = opened(json!([msg(10, 5, &py)])).await;
+    let job = store.next_job().unwrap();
+    let results = computed(&job);
+    for id in 11..=(10 + CAP as u64) {
+        store.observe("MESSAGE_CREATE", &msg(id, 5, "x"));
+    }
+    assert!(!ids(&now(&store, epoch)).contains(&10));
+    store.apply(&job, results);
+    assert!(all_plain(&store, epoch));
+}
+
+#[tokio::test]
+async fn a_result_that_does_not_spell_the_code_is_not_applied() {
+    let (_m, store, epoch) = opened(json!([msg(10, 5, &fenced(&[("py", "x = 1")]))])).await;
+    let job = store.next_job().unwrap();
+    let other = computed(&py_job(10, "y = 2"));
+    assert!(other[0].is_some());
+    store.apply(&job, other);
+    assert!(all_plain(&store, epoch));
+    store.apply(&job, computed(&job));
+    assert!(!all_plain(&store, epoch));
+}
+
+#[tokio::test]
+async fn a_replacing_copy_keeps_colours_for_equal_content_only() {
+    let py = fenced(&[("py", "x = 1")]);
+    let (_m, store, epoch) = opened(json!([msg(10, 5, &py)])).await;
+    let job = store.next_job().unwrap();
+    store.apply(&job, computed(&job));
+    let first = |store: &MessageStore| highlights(&now(store, epoch).rows[0].body)[0].clone();
+    let before = first(&store).unwrap();
+    store.observe("MESSAGE_CREATE", &msg(10, 5, &py));
+    assert!(Arc::ptr_eq(&before, &first(&store).unwrap()));
+    assert_eq!(store.next_job(), None);
+    store.observe("MESSAGE_CREATE", &msg(10, 5, &fenced(&[("py", "x = 2")])));
+    assert_eq!(first(&store), None);
+    assert_eq!(store.next_job().map(|j| j.id), Some(10));
+}
+
+/// Plan K6-1 through `apply`: a hidden-spoiler block before a visible one; each block's spans
+/// join to its own code. The FFI half (each node converts with its own spans) is in velella-ffi.
+#[tokio::test]
+async fn a_hidden_spoiler_block_and_a_visible_one_each_get_their_own_spans() {
+    let content = "||```py\nsecret = 1\n```|| then\n```py\nshown = 2\n```";
+    let (_m, store, epoch) = opened(json!([msg(10, 5, content)])).await;
+    let job = store.next_job().unwrap();
+    store.apply(&job, computed(&job));
+    let mut body = now(&store, epoch).rows[0].body.clone();
+    let mut seen = Vec::new();
+    each_code_block(&mut body, &mut |_, code, h| {
+        seen.push((code.to_owned(), h.as_ref().map(|h| h.text())))
+    });
+    assert_eq!(
+        seen,
+        [
+            ("secret = 1".to_owned(), Some("secret = 1".to_owned())),
+            ("shown = 2".to_owned(), Some("shown = 2".to_owned()))
+        ]
+    );
+}
+
+#[tokio::test]
+async fn snapshots_share_the_highlight_instead_of_copying_it() {
+    let (_m, store, epoch) = opened(json!([msg(10, 5, &fenced(&[("py", "x = 1")]))])).await;
+    let job = store.next_job().unwrap();
+    store.apply(&job, computed(&job));
+    let a = highlights(&now(&store, epoch).rows[0].body)[0]
+        .clone()
+        .unwrap();
+    let b = highlights(&now(&store, epoch).rows[0].body)[0]
+        .clone()
+        .unwrap();
+    assert!(Arc::ptr_eq(&a, &b));
+}
+
+/// A store with the given wake sender and channel 5 open.
+async fn opened_with_wake(wake: SyncSender<()>) -> (MockHttp, Arc<MessageStore>, u64) {
+    let mock = MockHttp::start(vec![ok(&json!([]))]).await;
+    mock.install();
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let store = MessageStore::with_wake(Rest::new(token(), 7, tx), Some(wake));
+    let epoch = store.open(5);
+    settled(&store, epoch).await;
+    (mock, store, epoch)
+}
+
+#[tokio::test]
+async fn an_undrained_wake_never_blocks_and_pending_stays_within_cap() {
+    let (wake, _never_read) = std::sync::mpsc::sync_channel(1);
+    let (_m, store, _) = opened_with_wake(wake).await;
+    let py = fenced(&[("py", "x = 1")]);
+    for id in 1..=10_000u64 {
+        store.observe("MESSAGE_CREATE", &msg(id, 5, &py));
+    }
+    let inner = store.lock();
+    let open = inner.open.as_ref().unwrap();
+    assert_eq!(open.messages.len(), CAP);
+    assert!(open.messages.iter().filter(|m| m.pending).count() <= CAP);
+}
+
+#[tokio::test]
+async fn a_dead_worker_never_blocks_or_panics_the_store() {
+    let (wake, receiver) = std::sync::mpsc::sync_channel(1);
+    drop(receiver);
+    let (_m, store, epoch) = opened_with_wake(wake).await;
+    for id in 1..=3 {
+        store.observe("MESSAGE_CREATE", &msg(id, 5, &fenced(&[("py", "x = 1")])));
+    }
+    assert_eq!(ids(&now(&store, epoch)), [1, 2, 3]);
+}
+
+/// A liveness limit, not a timing bound: the worker first warms every grammar, which takes
+/// seconds in a debug build.
+const LIVENESS: Duration = Duration::from_secs(60);
+
+/// Polls `done` every 10 ms for up to `limit`.
+fn within(limit: Duration, mut done: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + limit;
+    while !done() {
+        if std::time::Instant::now() > deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    true
+}
+
+#[tokio::test]
+async fn the_worker_colours_a_message_and_ends_with_its_store() {
+    let mock = MockHttp::start(vec![ok(&json!([]))]).await;
+    mock.install();
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let started = std::time::Instant::now();
+    let (store, handle) = MessageStore::start(Rest::new(token(), 7, tx), highlight::compute_job);
+    let handle = handle.expect("the worker thread started");
+    let epoch = store.open(5);
+    settled(&store, epoch).await;
+    store.observe("MESSAGE_CREATE", &msg(10, 5, &fenced(&[("py", "x = 1")])));
+    assert!(
+        within(LIVENESS, || !all_plain(&store, epoch)),
+        "no colours within {LIVENESS:?}"
+    );
+    println!(
+        "end to end: colours {:.3} s after the store was created",
+        started.elapsed().as_secs_f64()
+    );
+    let h = highlights(&now(&store, epoch).rows[0].body);
+    assert_eq!(h[0].as_ref().map(|h| h.text()).as_deref(), Some("x = 1"));
+    drop(store);
+    assert!(
+        within(Duration::from_secs(5), || handle.is_finished()),
+        "the worker outlived its store"
+    );
+}
+
+#[tokio::test]
+async fn the_worker_holds_no_store_while_it_computes() {
+    let mock = MockHttp::start(vec![ok(&json!([]))]).await;
+    mock.install();
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let (started_tx, started) = std::sync::mpsc::channel();
+    let (release, release_rx) = std::sync::mpsc::channel::<()>();
+    let compute = move |job: &Job| {
+        started_tx.send(job.id).unwrap();
+        let _ = release_rx.recv();
+        vec![None; job.blocks.len()]
+    };
+    let (store, handle) = MessageStore::start(Rest::new(token(), 7, tx), compute);
+    let handle = handle.expect("the worker thread started");
+    let epoch = store.open(5);
+    settled(&store, epoch).await;
+    store.observe("MESSAGE_CREATE", &msg(10, 5, &fenced(&[("py", "x = 1")])));
+    assert_eq!(started.recv_timeout(LIVENESS), Ok(10));
+    let weak = Arc::downgrade(&store);
+    drop(store);
+    assert_eq!(
+        weak.strong_count(),
+        0,
+        "the worker holds the store while it computes"
+    );
+    release.send(()).unwrap();
+    assert!(
+        within(Duration::from_secs(5), || handle.is_finished()),
+        "the worker outlived its store"
+    );
+}
+
+// ---- Release measurements (K6 rev 3.1); run each alone, so the statics start cold ----
+
+/// One 1024-byte line of `(` in a `cs` block, 15 times: 15 × 1035 = 15,525 bytes, under the
+/// parser's 16,384-byte limit.
+fn cold_payload() -> String {
+    let content = format!("```cs\n{}\n```\n", "(".repeat(1024)).repeat(15);
+    assert_eq!(content.len(), 15_525);
+    content
+}
+
+#[tokio::test]
+#[ignore = "timing, release only: cargo test --release -p velella-core -- --ignored --exact messages::tests::release_cold_observe --test-threads=1 --nocapture"]
+async fn release_cold_observe() {
+    if cfg!(debug_assertions) {
+        panic!("run in release: the numbers are for the shipped build");
+    }
+    let content = cold_payload();
+    // The timed observes are the first calls in this process that reach `parse`, so nothing before
+    // them can have warmed the highlighting statics. `new()` starts the worker, which warms them
+    // concurrently; the worst single `observe` is measured.
+    let mock = MockHttp::start(vec![ok(&json!([]))]).await;
+    mock.install();
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let store = MessageStore::new(Rest::new(token(), 7, tx));
+    let epoch = store.open(5);
+    settled(&store, epoch).await;
+    let mut worst = Duration::ZERO;
+    for id in 1..=10u64 {
+        let m = msg(id, 5, &content);
+        let start = std::time::Instant::now();
+        store.observe("MESSAGE_CREATE", &m);
+        worst = worst.max(start.elapsed());
+    }
+    println!(
+        "cold observe: worst of 10 = {:.3} ms",
+        worst.as_secs_f64() * 1e3
+    );
+    // Only now, untimed, the precondition the timing rests on; it fails the test before the bound
+    // is checked. Each stored body holds 15 `cs` code blocks...
+    let fences_of = |store: &MessageStore| {
+        let mut inner = store.lock();
+        let open = inner.open.as_mut().unwrap();
+        assert_eq!(open.messages.len(), 10);
+        open.messages
+            .iter_mut()
+            .map(|m| {
+                let mut fences = Vec::new();
+                each_code_block(&mut m.body, &mut |f, _, _| {
+                    fences.push(f.map(str::to_owned))
+                });
+                (fences, m.pending)
+            })
+            .collect::<Vec<_>>()
+    };
+    let cs = vec![Some("cs".to_owned()); 15];
+    assert!(fences_of(&store).iter().all(|(f, _)| *f == cs));
+    // ...and the message is pending: shown on a twin store without a worker (the real one may
+    // have taken its jobs already).
+    let (_m, twin, _) = opened(json!([])).await;
+    for id in 1..=10u64 {
+        twin.observe("MESSAGE_CREATE", &msg(id, 5, &content));
+    }
+    assert!(fences_of(&twin)
+        .iter()
+        .all(|(f, pending)| *f == cs && *pending));
+    assert!(worst <= Duration::from_millis(5), "{worst:?}");
+}
+
+#[tokio::test]
+#[ignore = "timing, release only: cargo test --release -p velella-core -- --ignored --exact messages::tests::release_contended_observe --test-threads=1 --nocapture"]
+async fn release_contended_observe() {
+    if cfg!(debug_assertions) {
+        panic!("run in release: the numbers are for the shipped build");
+    }
+    // 200 messages, each one block of 64 lines × 64 characters with one span per character
+    // (4096 synthetic spans), applied through `apply`.
+    let code = vec!["x".repeat(64); 64].join("\n");
+    let spans = Arc::new(Highlighted {
+        lines: code
+            .split('\n')
+            .map(|l| {
+                l.chars()
+                    .map(|c| highlight::Span {
+                        text: c.to_string(),
+                        rgb: 0x9CDCFE,
+                        bold: false,
+                        italic: false,
+                        underline: false,
+                    })
+                    .collect()
+            })
+            .collect(),
+    });
+    let (_m, store, epoch) = opened(json!([])).await;
+    let content = fenced(&[("py", &code)]);
+    for id in 1001..=1200u64 {
+        store.observe("MESSAGE_CREATE", &msg(id, 5, &content));
+    }
+    while let Some(job) = store.next_job() {
+        store.apply(&job, vec![Some(spans.clone())]);
+    }
+    let rows = now(&store, epoch).rows;
+    assert_eq!(rows.len(), CAP);
+    assert!(rows
+        .iter()
+        .all(|r| highlights(&r.body)[0].as_ref().is_some_and(|h| h
+            .lines
+            .iter()
+            .map(Vec::len)
+            .sum::<usize>()
+            == 4096)));
+    // A thread looping `snapshot()`; each call's time bounds its lock hold.
+    let stop = Arc::new(AtomicU64::new(0));
+    let looping = {
+        let (store, stop) = (store.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let mut longest = Duration::ZERO;
+            let mut calls = 0u32;
+            while stop.load(Ordering::Relaxed) == 0 {
+                let start = std::time::Instant::now();
+                let s = store.snapshot(epoch, &Context::default());
+                longest = longest.max(start.elapsed());
+                drop(s);
+                calls += 1;
+            }
+            (longest, calls)
+        })
+    };
+    std::thread::sleep(Duration::from_millis(50));
+    // 100 CREATEs of older messages: each is parsed, inserted and evicted again, so the 200
+    // highlighted messages stay.
+    let mut worst = Duration::ZERO;
+    for id in 1..=100u64 {
+        let m = msg(id, 5, &fenced(&[("py", "x = 1")]));
+        let start = std::time::Instant::now();
+        store.observe("MESSAGE_CREATE", &m);
+        worst = worst.max(start.elapsed());
+    }
+    stop.store(1, Ordering::Relaxed);
+    let (longest, calls) = looping.join().unwrap();
+    println!(
+        "contended observe: worst of 100 = {:.3} ms; snapshot (lock hold bound): longest of {calls} = {:.3} ms",
+        worst.as_secs_f64() * 1e3,
+        longest.as_secs_f64() * 1e3
+    );
+    assert!(worst <= Duration::from_millis(5), "{worst:?}");
+    assert!(longest <= Duration::from_millis(5), "{longest:?}");
 }
