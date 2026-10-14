@@ -713,3 +713,46 @@ All four blockers were test falsifiability; the design stands. The user chose to
 | 3 | "`pending` set for an echo or a nested reply" is an equivalent mutant | FIX: replaced by "`next_job`/`apply` also search echoes" and "pending because the referenced message has a mapped fence", each with a killing Pending sites case |
 | 4 | The Channel switch test does not kill "`apply` without the epoch check" | FIX: the epoch check is deleted as a redundant guard (id + exact (fence, code) + join already decide correctness); its mutant is gone; the Channel switch test adds the reopen case showing the late result is applied and correct |
 
+
+## K6 rev 3.1 verification (merged 5dac025, 2026-10-15)
+
+A fresh verifier at 3a826b5 checked every contract row against the code. It traced the call graph for session-path isolation instead of relying on grep. 24 of 25 mutants were killed. The survivor (F1, P2) was `warm()` called from `parse`: the cold-observe test warmed the statics with untimed twin-store observes before timing. d33f27a moved the twin store after the timed loop. A second fresh verifier CONFIRMED the fix: the mutant failed 5 of 5 runs at 536-620 ms against the 5 ms bound, and the restored code passed at 0.06-0.37 ms. Integrated m1 at 5dac025 passes core 248 (3 ignored release tests), FFI 13, UI 124 and login 17.
+
+| Release measurement (loaded machine, each test run alone) | Value |
+|---|---|
+| Cold observe, worst of 10 (15 `cs` blocks of 1024 `(`) | 0.03-0.37 ms (bound 5 ms) |
+| Contended observe, worst of 100 | 0.072-0.198 ms (bound 5 ms) |
+| `snapshot()` lock hold, worst (upper bound: whole call) | 0.18-0.62 ms (bound 5 ms) |
+| `warm()` | about 0.5-0.6 s release; about 6 s debug (the end-to-end test's liveness limit is 60 s for that reason) |
+
+The corpus records the worst line per grammar after warm-up, from the verifier's run. It covers rev 2's adversarial lines plus heredoc, `[==[`, raw-string and fence openers. There is no bound; this only delays colours on the worker.
+
+| Grammar | ms |
+|---|---|
+| C# | 161 (executor: 200-270) |
+| JavaScript | 86 (executor: 134-141) |
+| Scala | 46 |
+| Makefile | 28 |
+| Ruby (heredoc) | 27 |
+| Rust | 25 |
+| Bash (heredoc) | 25 |
+| YAML | 15 |
+| PHP (heredoc) | 15 |
+| Markdown | 9 |
+| D | 9 |
+| C++ | 8 |
+| Perl | 7 |
+| every other grammar | < 6 |
+
+**Interpretations accepted by the verifier:**
+
+| Choice | Detail |
+|---|---|
+| Constructor | `new` uses `Arc::new_cyclic`, so a failed spawn really leaves `wake: None`. `with_wake` is test-only. `start(rest, compute)` returns the handle. |
+| Spoiler-order test | Split into a core half, through `apply`, and an FFI half, through the conversion. |
+| Contended observe | Uses ids that `CAP` evicts at once. |
+| Budget start | The budget starts at job start, after `warm`. |
+| Join failure | A failed join in `apply` leaves the block as it was. |
+| End-to-end test | Polls for liveness with a 60 s limit; the drop check stays at 5 s. |
+
+The executor dropped the per-grammar warm-up once, which would have let a heavy grammar's first block go plain for good under load. Main rejected that, and 3a826b5 restored it. **Live (user):** sample 2's Python block against Vencord's look; a message with code blocks shows its header at once and gains colours without moving.
