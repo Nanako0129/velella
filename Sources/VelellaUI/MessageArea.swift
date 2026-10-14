@@ -18,6 +18,7 @@ struct MessageArea: View {
     @Binding var reply: ReplyPreview?
     @Binding var draft: String
     var onSend: ((String) -> Void)?
+    @State private var columnWidth: CGFloat = 0
 
     var body: some View {
         if header != nil {
@@ -40,6 +41,10 @@ struct MessageArea: View {
                         }
                         .padding(.bottom, T.Spacing.lg)
                         .background(OverlayScrollerEnforcer())
+                        // Tooltips (v2) stay inside the column: its width, from the top of the content.
+                        .coordinateSpace(.named(TooltipSpace.name))
+                        .onGeometryChange(for: CGFloat.self, of: { $0.size.width }) { columnWidth = $0 }
+                        .environment(\.tooltipContainer, CGRect(x: 0, y: 0, width: columnWidth, height: 1e7))
                     }
                     .defaultScrollAnchor(.bottom)
                     // Messages pass under the toolbar through a glass band with a hard lower edge, on a
@@ -111,7 +116,7 @@ enum MessageGrouping {
     }
 }
 
-/// A hairline either side of the long date (`D` style, the account's locale). Discord draws one
+/// A hairline either side of the long date (`D` style, the shell locale). Discord draws one
 /// line under the label; the label sits on the chat background, which here is translucent, so the
 /// line stops at the label instead.
 struct DateDivider: View {
@@ -181,7 +186,7 @@ struct MessageRow: View {
                     Text(verbatim: DiscordTime.header(date: message.timestamp, now: renderContext.now, locale: renderContext.locale))
                         .font(T.Typography.timestamp)
                         .foregroundStyle(.secondary)
-                        .help(DiscordTime.tooltip(date: message.timestamp, locale: renderContext.locale, now: renderContext.now))
+                        .tooltip(DiscordTime.tooltip(date: message.timestamp, locale: renderContext.locale, now: renderContext.now))
                 }
                 .frame(height: M.headerLineHeight)
             }
@@ -222,7 +227,7 @@ struct MessageRow: View {
                     .foregroundStyle(.secondary)
                     .frame(width: M.gutterWidth, height: M.headerLineHeight, alignment: .trailing)
                     .padding(.top, M.rowPaddingVertical)
-                    .help(DiscordTime.tooltip(date: message.timestamp, locale: renderContext.locale, now: renderContext.now))
+                    .tooltip(DiscordTime.tooltip(date: message.timestamp, locale: renderContext.locale, now: renderContext.now))
             }
         }
         .onHover { hovered = $0 }

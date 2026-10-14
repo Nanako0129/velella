@@ -648,37 +648,6 @@ mod subscriptions {
         assert_eq!(timeout(WAIT, rx.recv()).await.unwrap(), None);
     }
 
-    /// Core half of the K5 locale route (the FFI `subscribe_locale` hop and AppModel are covered only by
-    /// reading and the live check): USER_SETTINGS_UPDATE reaches a locale subscription
-    /// on the same connection, and a later READY without a locale delivers `None`.
-    #[tokio::test]
-    async fn a_locale_subscription_follows_settings_updates_without_a_reconnect() {
-        let mut rig = Rig::start().await;
-        let mut d = two_guilds();
-        d["user_settings"]["locale"] = json!("zh-TW");
-        let mut conn = send_ready(&mut rig, d.clone()).await;
-        let (_sub, mut rx) = watch(&rig, |s| s.locale.clone());
-        assert_eq!(next(&mut rx).await.as_deref(), Some("zh-TW"));
-        conn.send(dispatch(
-            2,
-            "USER_SETTINGS_UPDATE",
-            json!({"locale": "en-GB"}),
-        ))
-        .await;
-        assert_eq!(next(&mut rx).await.as_deref(), Some("en-GB"));
-        conn.send(dispatch(
-            3,
-            "USER_SETTINGS_UPDATE",
-            json!({"theme": "dark"}),
-        ))
-        .await;
-        assert!(silent(&mut rx).await, "an unrelated setting fired it");
-        d["user_settings"].as_object_mut().unwrap().remove("locale");
-        conn.send(dispatch(4, "READY", d)).await;
-        assert_eq!(next(&mut rx).await, None);
-        assert!(no_connection(&rig.initial).await, "it reconnected");
-    }
-
     #[tokio::test]
     async fn a_subscription_ends_with_the_session() {
         let mut rig = Rig::start().await;
