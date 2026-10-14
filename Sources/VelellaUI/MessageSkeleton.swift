@@ -95,5 +95,5 @@ struct SkeletonRow: Equatable {
 }
 
 #Preview("Message skeleton") {
-    MessageSkeleton(seed: "1556391419621671022").frame(width: 640, height: 560)
+    MessageSkeleton(seed: "1100000000000000001").frame(width: 640, height: 560)
 }

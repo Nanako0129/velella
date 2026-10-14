@@ -72,9 +72,9 @@ private func live(
 }
 
 @Test func skeletonRowsAreStablePerConversationAndStayInV2Ranges() {
-    #expect(SkeletonRow.rows(seed: "1556391419621671022", count: 8) == SkeletonRow.rows(seed: "1556391419621671022", count: 8))
+    #expect(SkeletonRow.rows(seed: "1100000000000000001", count: 8) == SkeletonRow.rows(seed: "1100000000000000001", count: 8))
     #expect(SkeletonRow.rows(seed: "1", count: 8) != SkeletonRow.rows(seed: "2", count: 8))
-    let rows = SkeletonRow.rows(seed: "1523004250152501341", count: 500)
+    let rows = SkeletonRow.rows(seed: "1200000000000000002", count: 500)
     for row in rows {
         #expect((76...158).contains(row.nameWidth))
         #expect((34...52).contains(row.timeWidth))
