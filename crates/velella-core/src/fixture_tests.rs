@@ -395,8 +395,12 @@ fn locale_from_ready_and_user_settings_update() {
     assert_eq!(s.revision, rev + 1);
     // A later READY replaces it.
     r["user_settings"]["locale"] = json!("ja");
-    assert!(s.ap("READY", r));
+    assert!(s.ap("READY", r.clone()));
     assert_eq!(s.locale.as_deref(), Some("ja"));
+    // A READY without a locale clears the old one (K4 verification A1).
+    r["user_settings"].as_object_mut().unwrap().remove("locale");
+    assert!(s.ap("READY", r));
+    assert_eq!(s.locale, None);
 }
 
 #[test]

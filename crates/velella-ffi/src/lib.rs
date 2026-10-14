@@ -118,9 +118,15 @@ impl SessionHandle {
         self.0.generation()
     }
 
-    /// The account's locale tag (BCP 47) as of now, `None` until READY carried a valid one.
-    pub fn locale(&self) -> Option<String> {
-        self.0.snapshot().locale.clone()
+    /// The account's locale tag (BCP 47): the current value at once, then again whenever READY or
+    /// USER_SETTINGS_UPDATE changes it (`None` until READY carried a valid one, or after a READY
+    /// without one). Dropping the returned object stops the deliveries.
+    pub fn subscribe_locale(&self, listener: Arc<dyn LocaleListener>) -> Arc<SidebarSubscription> {
+        let _context = runtime().enter();
+        sidebar(self.0.subscribe(
+            |state| state.locale.clone(),
+            move |locale| listener.on_locale(locale),
+        ))
     }
 
     /// Rail entries (guilds and folders in display order): the current snapshot at once, then
@@ -179,6 +185,11 @@ pub trait GuildsListener: Send + Sync {
 #[uniffi::export(with_foreign)]
 pub trait ChannelsListener: Send + Sync {
     fn on_channels(&self, guild_id: u64, categories: Vec<SidebarCategory>);
+}
+
+#[uniffi::export(with_foreign)]
+pub trait LocaleListener: Send + Sync {
+    fn on_locale(&self, locale: Option<String>);
 }
 
 #[uniffi::export(with_foreign)]

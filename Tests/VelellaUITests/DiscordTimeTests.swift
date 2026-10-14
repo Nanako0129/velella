@@ -59,7 +59,8 @@ private func all(_ locale: String) -> [String] {
     #expect(DiscordTime.format(unix: instant, style: .relative, locale: en, now: fourYears) == "4 years ago")
     #expect(DiscordTime.format(unix: instant + 7200, style: .relative, locale: en, now: at) == "in 2 hours")
     #expect(DiscordTime.format(unix: instant, style: .relative, locale: en, now: at.addingTimeInterval(7200)) == "2 hours ago")
-    #expect(DiscordTime.format(unix: instant, style: .relative, locale: Locale(identifier: "zh-TW"), now: at.addingTimeInterval(7200)) == "2小時前")
+    // English whatever the account locale (K0: "5 years ago" in zh-TW).
+    #expect(DiscordTime.format(unix: instant, style: .relative, locale: Locale(identifier: "zh-TW"), now: at.addingTimeInterval(7200)) == "2 hours ago")
 }
 
 @Test func tooltipIsTheFullDate() {
@@ -114,7 +115,8 @@ private func header(_ locale: String, now: Date, timeZone: TimeZone = utc) -> St
 }
 
 @Test func headerTodayYesterdayOlderEnUS() {
-    #expect(header("en-US", now: at.addingTimeInterval(7200)) == "Today at 9:20\(nn)PM")
+    // Today: the time only (K0: `下午2:23`).
+    #expect(header("en-US", now: at.addingTimeInterval(7200)) == "9:20\(nn)PM")
     #expect(header("en-US", now: at.addingTimeInterval(86_400)) == "Yesterday at 9:20\(nn)PM")
     // PROVISIONAL (olderHeaderStyle), pending K0.
     #expect(header("en-US", now: at.addingTimeInterval(5 * 86_400)) == "4/20/21, 9:20\(nn)PM")
@@ -122,7 +124,7 @@ private func header(_ locale: String, now: Date, timeZone: TimeZone = utc) -> St
 
 /// ICU, pending K0.
 @Test func headerTodayYesterdayOlderZhTW() {
-    #expect(header("zh-TW", now: at.addingTimeInterval(7200)) == "今天 晚上9:20")
+    #expect(header("zh-TW", now: at.addingTimeInterval(7200)) == "晚上9:20")
     #expect(header("zh-TW", now: at.addingTimeInterval(86_400)) == "昨天 晚上9:20")
     #expect(header("zh-TW", now: at.addingTimeInterval(5 * 86_400)) == "2021/4/20\(thin)晚上9:20")
 }
@@ -130,11 +132,44 @@ private func header(_ locale: String, now: Date, timeZone: TimeZone = utc) -> St
 @Test func headerDayFollowsTheTimeZone() {
     // 21:20 UTC is 05:20 the next day in Taipei: "now" 1 h later is still the same Taipei day.
     let taipei = TimeZone(identifier: "Asia/Taipei")!
-    #expect(header("en-US", now: at.addingTimeInterval(3600), timeZone: taipei) == "Today at 5:20\(nn)AM")
+    #expect(header("en-US", now: at.addingTimeInterval(3600), timeZone: taipei) == "5:20\(nn)AM")
     // ... but yesterday in UTC terms is two Taipei days back from 2 days later.
     #expect(header("en-US", now: at.addingTimeInterval(2 * 86_400), timeZone: taipei) == "4/21/21, 5:20\(nn)AM")
 }
 
 @Test func headerOfAFutureMessageIsTheOlderForm() {
     #expect(header("en-US", now: at.addingTimeInterval(-3 * 86_400)) == "4/20/21, 9:20\(nn)PM")
+}
+
+// MARK: K0 capture (zh-TW, Asia/Taipei; refs/discord-ground-truth/captures/k0-times-markdown.png)
+
+/// The official client's strings for sample 1 at 05:20 Taipei. ICU's s/S separator is U+2009,
+/// which the capture cannot tell from a space at its size.
+@Test func everyStyleMatchesTheK0CaptureInTaipei() {
+    let taipei = TimeZone(identifier: "Asia/Taipei")!
+    let zh = Locale(identifier: "zh-TW")
+    let styles: [TimestampStyle] = [
+        .shortTime, .mediumTime, .shortDate, .longDate, .longDateShortTime, .fullDateShortTime,
+        .shortDateShortTime, .shortDateMediumTime,
+    ]
+    #expect(styles.map { DiscordTime.format(unix: instant, style: $0, locale: zh, now: at, timeZone: taipei) } == [
+        "清晨5:20", "清晨5:20:30", "2021/4/21", "2021年4月21日",
+        "2021年4月21日 清晨5:20", "2021年4月21日 星期三 清晨5:20",
+        "2021/4/21\(thin)清晨5:20", "2021/4/21\(thin)清晨5:20:30",
+    ])
+    // "f（下午）": 1618996830 is 17:20 in Taipei.
+    #expect(DiscordTime.format(unix: 1_618_996_830, style: .longDateShortTime, locale: zh, now: at, timeZone: taipei) == "2021年4月21日 下午5:20")
+    let fiveYears = Calendar(identifier: .gregorian).date(byAdding: .year, value: 5, to: at)!
+    #expect(DiscordTime.format(unix: instant, style: .relative, locale: zh, now: fiveYears, timeZone: taipei) == "5 years ago")
+}
+
+/// K4 verification A2: an `R` pill is built from `context.now`, not the wall clock. The instant is
+/// years before the real now, so a wall-clock build would read "years ago" and refresh every 15 min.
+@Test func relativeRefreshFollowsTheContextNow() {
+    let context = RenderContext(now: at.addingTimeInterval(30), locale: Locale(identifier: "zh-TW"))
+    let r = MarkdownText.timestamp(unix: instant, style: .relative, context: context)
+    #expect(r.text == "30 seconds ago")
+    #expect(r.refreshEvery == DiscordTime.secondRefresh)
+    let later = MarkdownText.timestamp(unix: instant, style: .relative, context: RenderContext(now: at.addingTimeInterval(59), locale: context.locale))
+    #expect(later.text == "59 seconds ago" && later.refreshEvery == DiscordTime.secondRefresh)
 }

@@ -524,15 +524,20 @@ mod tests {
     }
 
     /// What the Swift shell receives for the trap inputs of the plan's K2 acceptance: an
-    /// over-long list number, out-of-range timestamp and id stay text (K1 D2, D3, list grammar).
+    /// over-long list number arrives capped at 1_000_000_000 (K5, the official client's value);
+    /// out-of-range timestamp and id stay text (K1 D2, D3).
     #[test]
     fn trap_inputs_arrive_as_text_or_bounded_values() {
         let para = |c: Vec<MdInline>| vec![MdBlock::Paragraph { content: c }];
-        for input in [
-            "4294967295. a",
-            "<t:9223372036854775807>",
-            "<@99999999999999999999999>",
-        ] {
+        assert_eq!(
+            blocks(parse("4294967295. a")),
+            vec![MdBlock::List {
+                ordered: true,
+                start: 1_000_000_000,
+                items: vec![para(vec![mtext("a")])],
+            }]
+        );
+        for input in ["<t:9223372036854775807>", "<@99999999999999999999999>"] {
             assert_eq!(blocks(parse(input)), para(vec![mtext(input)]), "{input}");
         }
         assert_eq!(

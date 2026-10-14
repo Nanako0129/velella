@@ -9,6 +9,11 @@ enum DiscordTime {
     /// reaches a formatter is out of Foundation's `Date` range, and no `Int` conversion happens.
     static let unixLimit: Int64 = 8_640_000_000_000
 
+    /// `R` is English whatever the account locale: the official client shows "5 years ago" in
+    /// zh-TW (K0, `refs/discord-ground-truth/captures/k0-times-markdown.png`). Singular and "now"
+    /// wording stay ICU's until a capture shows Discord's.
+    static let relativeLocale = Locale(identifier: "en-US")
+
     static func date(unix: Int64) -> Date {
         Date(timeIntervalSince1970: Double(min(max(unix, -unixLimit), unixLimit)))
     }
@@ -30,7 +35,7 @@ enum DiscordTime {
         case .shortDateMediumTime: (dateStyle, timeStyle) = (.short, .medium)
         case .relative:
             let formatter = RelativeDateTimeFormatter()
-            formatter.locale = locale
+            formatter.locale = relativeLocale
             formatter.dateTimeStyle = .numeric
             formatter.unitsStyle = .full
             return formatter.localizedString(for: date, relativeTo: now)
@@ -69,8 +74,9 @@ enum DiscordTime {
     /// time>"). The one place to change once K0 records the real text or pattern.
     static let olderHeaderStyle: (date: DateFormatter.Style, time: DateFormatter.Style) = (.short, .short)
 
-    /// "Today at <short time>", "Yesterday at <short time>", else the older-day form, in `locale`.
-    /// `systemNow` is the clock ICU's relative words are measured against; only tests pass another.
+    /// "<short time>" today (the official client shows `下午2:23`, K0), "Yesterday at <short
+    /// time>", else the older-day form, in `locale`. `systemNow` is the clock ICU's relative words
+    /// are measured against; only tests pass another.
     static func header(date: Date, now: Date, locale: Locale, timeZone: TimeZone = .current, systemNow: Date = .now) -> String {
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = timeZone
@@ -80,6 +86,7 @@ enum DiscordTime {
         guard let daysBack else {
             return formatter(locale, timeZone, olderHeaderStyle.date, olderHeaderStyle.time).string(from: date)
         }
+        if daysBack == 0 { return formatter(locale, timeZone, .none, .short).string(from: date) }
         // ICU's "Today"/"Yesterday" follow the system clock, not `now`: format a stand-in at the same
         // time of day on the matching day of the system clock.
         let time = calendar.dateComponents([.hour, .minute, .second], from: date)
