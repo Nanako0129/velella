@@ -317,19 +317,28 @@ A narrow re-verification is CONFIRMED. The F1 fix holds under CoreText layout fo
 | Test gaps | K4 verifier A1 (READY clears an old locale) and A2 (R refresh uses `context.now`); K2 verifier A-2 (accessibility label attached) and A1's S12 (handler returns `.handled`). |
 | Acceptance | All suites, clippy, fmt; differential test still 0 mismatches (lists are D1, so filtered); a fresh verifier with mutants. **Live:** sample 3's `+`, ten-digit and mixed lists, and sample 2's links match the capture. |
 
-## K6 — Vencord-style code blocks (decision pending: highlighter)
+## K6 — Vencord-style code blocks with syntect highlighting
 
-The user chose Vencord's ShikiCodeblocks look as the default (2026-10-14). From `refs/vencord/src/plugins/shikiCodeblocks.desktop` (GPL-3.0):
-- **Container:** a `background-base-lower` fill with radius 4.
-- **Header:** the language name, bold and capitalised, with padding 0 5, 6 below, and a colourless devicon 8 before it.
-- **Code:** 0.875 rem with a 1.125 rem line height and 0.5 em padding. It wraps (`pre-wrap`, `overflow-wrap: anywhere`).
-- **Line numbers:** a column with padding 5 / 8, then 8 before the code, and 19 pt rows.
-- **Copy button:** appears on hover at the bottom right, with a 1 s cooldown.
-- **Highlighting:** Shiki, which uses TextMate grammars with the VS Code Dark+ theme.
+The user chose Vencord's ShikiCodeblocks look as the default and `syntect` as the highlighter (2026-10-14). **Owner:** pilotfish:security-executor (untrusted text through a regex engine; new dependency), after K5 merges. Main prepares the vendored theme before the slice branches.
 
-The highlighter is open. Options:
-- `syntect` with `fancy-regex`, in core, as Oxicord does: TextMate grammars plus a Dark+ theme, the closest to Shiki.
-- A port of SimpleAST's `CodeRules` (Apache-2.0): a few languages, no dependency.
-- No highlighting.
+### What Vencord does (`refs/vencord/src/plugins/shikiCodeblocks.desktop`, GPL-3.0)
 
-Whichever is chosen, highlighting runs in core on untrusted text, so it needs the same limits as K1: size cap, time budget, fallback to plain.
+| Part | Value |
+|---|---|
+| Container | Fill `background-base-lower`, radius 4. The highlighted root uses the theme's background. |
+| Header | Shown only when a language is given: the language name, bold and capitalised, with padding 0 5 and 6 below; a colourless devicon 8 before it (`Header.tsx`, `shiki.css`) |
+| Code | 0.875 rem with a 1.125 rem line height and 0.5 em padding. It wraps (`pre-wrap`, `overflow-wrap: anywhere`). |
+| Line numbers | A table with 19 px rows. The number cell has padding 5 left and 8 right, coloured in the theme's plain colour; the code cell has 8 left. |
+| Copy | Appears on hover at the bottom right; "Copy" turns to "Copied!" for a 1 s cooldown (`CopyButton.tsx`, `useCopyCooldown.ts`) |
+| Highlight | Shiki with TextMate grammars and the VS Code Dark+ theme. Unknown languages fall back to plain text in the theme's plain colour. |
+
+### Contract
+
+| Part | Contract |
+|---|---|
+| Dependency | `syntect = { version = "=5.3.0", default-features = false, features = ["parsing", "default-syntaxes", "regex-fancy"] }` in velella-core only. No onig, plist, yaml, html or themes features. `cargo tree` must show no C regex library. Its licence and its new transitive crates are listed in THIRD_PARTY_NOTICES.md. |
+| Theme | Main vendors VS Code's `extensions/theme-defaults/themes/dark_plus.json` and the `dark_vs.json` it includes (microsoft/vscode, MIT) at a pinned commit into `crates/velella-core/assets/`, with the SHA and licence in THIRD_PARTY_NOTICES.md. Core builds a syntect `Theme` from them once (`OnceLock`): merge `include`, then map every `tokenColors` entry's scope selectors, foreground and fontStyle. |
+| Core | New `highlight.rs`: `fn highlight(code: &str, language: Option<&str>) -> Option<Highlighted>`. `Highlighted` has the language display name plus lines of spans; each span carries `text`, `rgb` and `bold`/`italic`/`underline`. The language resolves through Discord's and highlight.js's common aliases (from Vencord's `api/languages.ts`) to a syntect syntax by token or extension. An unknown language, or none, gives `None` and the block renders plain. Computing happens once per message where `Stored.body` is computed (P1-1), stored per code block in document order, and passed through `MessageRow` as a side table. |
+| Limits (untrusted input) | Code ≤ 16384 bytes (already K1's cap) and ≤ 2000 lines; fancy-regex's backtracking limit is kept at its default or lower. A wall-clock budget of 50 ms per block is checked between lines. Any parse error, budget overrun or panic, caught with `catch_unwind` around the call, gives `None` (plain text). Nothing logs. |
+| Swift | `MarkdownView`'s code block view is replaced by the Vencord look in the table above:<br>• a header only when a language resolved, with the display name and an SF Symbol standing in for the devicon (the provisional `chevron.left.forwardslash.chevron.right`, since devicons are a web font);<br>• a line-number column;<br>• wrapped code at 0.875 × body with an 18 pt line height;<br>• the theme background and K3's radius 4;<br>• a hover Copy button writing the plain code to `NSPasteboard`, with a 1 s "Copied!" cooldown.<br>Spoiler cover, container rules and `Equatable` stay as K3 made them. |
+| Tests | Core:<br>• aliases → syntaxes (`py`, `js`, `ts`, `rs`, `swift`, `sh`, unknown);<br>• span colours for a fixed snippet against the Dark+ values;<br>• limits: 2001 lines, a pathological regex input under the budget, an injected panic → `None`;<br>• computed once (not in `row()`).<br>Swift:<br>• header shown only with a language;<br>• line numbers 1…n;<br>• wrapping;<br>• Copy writes the exact code and cools down;<br>• a covered block stays covered.<br>Verifier with mutants. **Live:** sample 2's Python block against Vencord's look (the user can compare with Vencord's ShikiCodeblocks enabled). |
