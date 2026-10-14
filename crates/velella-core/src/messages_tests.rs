@@ -1203,25 +1203,9 @@ async fn release_cold_observe() {
         panic!("run in release: the numbers are for the shipped build");
     }
     let content = cold_payload();
-    // Precondition, on a twin store without a worker (the real one may take a job at once): each
-    // stored body has 15 `cs` code blocks, and the message is pending.
-    let (_m, twin, _) = opened(json!([])).await;
-    for id in 1..=10u64 {
-        twin.observe("MESSAGE_CREATE", &msg(id, 5, &content));
-    }
-    {
-        let mut inner = twin.lock();
-        for m in &mut inner.open.as_mut().unwrap().messages {
-            let mut fences = Vec::new();
-            each_code_block(&mut m.body, &mut |f, _, _| {
-                fences.push(f.map(str::to_owned))
-            });
-            assert_eq!(fences, vec![Some("cs".to_owned()); 15]);
-            assert!(m.pending);
-        }
-    }
-    // The real store: `new()` starts the worker, which warms the statics while the session path
-    // runs. The worst single `observe`.
+    // The timed observes are the first calls in this process that reach `parse`, so nothing before
+    // them can have warmed the highlighting statics. `new()` starts the worker, which warms them
+    // concurrently; the worst single `observe` is measured.
     let mock = MockHttp::start(vec![ok(&json!([]))]).await;
     mock.install();
     let (tx, _rx) = mpsc::unbounded_channel();
@@ -1235,13 +1219,38 @@ async fn release_cold_observe() {
         store.observe("MESSAGE_CREATE", &m);
         worst = worst.max(start.elapsed());
     }
-    let stored = now(&store, epoch);
-    assert_eq!(stored.rows.len(), 10);
-    assert!(stored.rows.iter().all(|r| highlights(&r.body).len() == 15));
     println!(
         "cold observe: worst of 10 = {:.3} ms",
         worst.as_secs_f64() * 1e3
     );
+    // Only now, untimed, the precondition the timing rests on; it fails the test before the bound
+    // is checked. Each stored body holds 15 `cs` code blocks...
+    let fences_of = |store: &MessageStore| {
+        let mut inner = store.lock();
+        let open = inner.open.as_mut().unwrap();
+        assert_eq!(open.messages.len(), 10);
+        open.messages
+            .iter_mut()
+            .map(|m| {
+                let mut fences = Vec::new();
+                each_code_block(&mut m.body, &mut |f, _, _| {
+                    fences.push(f.map(str::to_owned))
+                });
+                (fences, m.pending)
+            })
+            .collect::<Vec<_>>()
+    };
+    let cs = vec![Some("cs".to_owned()); 15];
+    assert!(fences_of(&store).iter().all(|(f, _)| *f == cs));
+    // ...and the message is pending: shown on a twin store without a worker (the real one may
+    // have taken its jobs already).
+    let (_m, twin, _) = opened(json!([])).await;
+    for id in 1..=10u64 {
+        twin.observe("MESSAGE_CREATE", &msg(id, 5, &content));
+    }
+    assert!(fences_of(&twin)
+        .iter()
+        .all(|(f, pending)| *f == cs && *pending));
     assert!(worst <= Duration::from_millis(5), "{worst:?}");
 }
 
