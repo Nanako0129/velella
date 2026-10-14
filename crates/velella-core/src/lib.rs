@@ -6,6 +6,7 @@ mod compression;
 mod gateway;
 mod guild_settings;
 mod identify;
+pub mod markdown;
 mod member_list;
 mod messages;
 mod permissions;

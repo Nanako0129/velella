@@ -246,3 +246,26 @@ Every slice gets a fresh pilotfish:verifier with mutants. K1 and K2 security cla
 | 1 | A `TextRenderer` cannot see `AttributedString` keys, so the hover store stays empty and K2's lookup test cannot notice | FIX: segments become `Text(...).customAttribute(HoverTipAttribute)` joined by interpolation; K2 tests an offscreen render filling the store and hovers a stub tip manually |
 | 2 | `R` refresh redraws a finished string; no locale route; K4 would edit K2/K3 files | FIX: `ParagraphView(build: (RenderContext) -> [Segment])` evaluated per timeline tick; `RenderContext{now, locale}`; K2 owns `ShellState.locale`, the environment key and MessageArea's property; K4 owns only its listed lines |
 | notes | Grouping inside quotes/lists; predicate on velella output; canonicaliser at fixture time; LineBreak beside `Inline::Block`; `messages_tests.rs` ownership | FIX: grouping at every block-list level, compared pre-grouping at every level; predicate over input or oracle output only; Node `URL.href` (WHATWG, as the `url` crate); dropped by default, K0 may revise; ownership row added. `THIRD_PARTY_NOTICES.md` merges trivially between K3 and K4 |
+
+## K1 rulings (main, on the executor's report)
+
+The executor settled ten points the plan left open, each pinned by tests; main rules on them as follows.
+
+| # | Point | Ruling |
+|---|---|---|
+| 1 | Line start: previous capture text ends in `\n` (plan) vs the oracle's last-regex-group check | Keep the plan's rule; no fixture input distinguishes them; pinned by `line_start_follows_the_previous_capture_text_not_its_last_group` (`> a\n# h` heads, `` `\n`# h `` does not). K0 may revise |
+| 2 | List details (mixed bullets stay one list, ordered/unordered switch ends it, content column after marker spaces, shallower marker ends, deeper marker nests, spaces-only line is blank, `- ` alone is one empty item, code blocks allowed in items, item content starts a line so `- - a` nests, lists match at the start of a container that starts a line) | Accept as defaults; pinned in `list_cases_the_grammar_table_leaves_open`; K0 sample 3 may narrow |
+| 3 | "Next to an `Inline::Block`" | Immediate sibling in the same inline list: accept |
+| 4 | Inputs with blocks inside link labels | Filtered under D7: accept |
+| 5 | Preprocess | All of simple-markdown's (lone `\r`, form feed included): accept |
+| 6 | DEL in link targets | Not a C0/C1/Cf rejection; the url crate percent-encodes or rejects it: accept |
+| 7 | Limit and fallback measure the raw content | Accept |
+| 8 | Depth 16 allowed, the 17th nested parse aborts; step bound per (deepest level + 1) | Accept |
+| 9 | Slash-command name class as a table generated from Node 24 (ICU 78.3, Unicode 17) | Accept |
+| 10 | Emphasis uses deterministic walks, not memos (pairs depend on the walk's entry point) | Accept: the step test bounds it (worst 3.5 steps/byte/level, bound 64) |
+
+## K1 verification
+
+A fresh pilotfish:verifier found two P2 findings: `cargo fmt` drift in main's ruling test, and no test failing when the 8192-node limit was removed (the `wide` case tripped the input cap instead). Both are fixed, and a narrow re-verification is CONFIRMED: the node-limit and `>=` mutants now fail by assertion. Everything else was CONFIRMED with 38 mutants; two equivalent mutants survive (a scheme prefix and a host check that `url::Url` already enforces).
+
+Advisory A1 (P3, deferred): the step counter does not tick inside a few helper scans (the list `line_end` scan, the 512-byte token window, the code-block language count, `take_while` loops). The step-bound test therefore covers ticked work only, and a list mutant that went quadratic passed it while its own named tests caught it. The shipped parser measured linear: 52 adversarial 256 KiB patterns took 0.58 s in total in release, and no fuzz input among 400k exceeded the bound. Add ticks to those helpers when the counter is next touched.

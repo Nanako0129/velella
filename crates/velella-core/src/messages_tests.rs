@@ -457,6 +457,51 @@ async fn the_echo_is_reconciled_only_on_its_nonce_and_the_self_author() {
     assert_eq!(ids(&now(&store, epoch)), [50, 51]);
 }
 
+fn bold(s: &str) -> Vec<markdown::Block> {
+    use markdown::{Block, Inline};
+    vec![Block::Paragraph(vec![Inline::Bold(vec![Inline::Text(
+        s.into(),
+    )])])]
+}
+
+#[tokio::test]
+async fn a_local_echo_carries_its_parsed_body() {
+    let (_mock, store) = serve(&[ok(&json!([]))]).await;
+    let epoch = store.open(5);
+    settled(&store, epoch).await;
+    store.begin_send(5, "**b**", me()).unwrap();
+    let inner = store.lock();
+    assert_eq!(
+        inner.open.as_ref().unwrap().echoes[0].message.body,
+        bold("b")
+    );
+}
+
+/// The body is parsed when a message arrives and again only when an edit changes its content.
+#[tokio::test]
+async fn created_and_edited_messages_carry_their_parsed_body() {
+    let (_mock, store) = serve(&[ok(&json!([]))]).await;
+    let epoch = store.open(5);
+    settled(&store, epoch).await;
+    let body = |store: &MessageStore| store.lock().open.as_ref().unwrap().messages[0].body.clone();
+    store.observe("MESSAGE_CREATE", &msg(50, 5, "**a**"));
+    assert_eq!(body(&store), bold("a"));
+    store.observe(
+        "MESSAGE_UPDATE",
+        &json!({"id": "50", "channel_id": "5", "content": "**c**"}),
+    );
+    assert_eq!(body(&store), bold("c"));
+    store.observe(
+        "MESSAGE_UPDATE",
+        &json!({"id": "50", "channel_id": "5", "edited_timestamp": "x"}),
+    );
+    assert_eq!(
+        body(&store),
+        bold("c"),
+        "an edit without content keeps the body"
+    );
+}
+
 #[tokio::test]
 async fn sends_post_the_exact_body_with_a_fresh_nonce_each() {
     let reply = |id: u64, nonce: &str| {

@@ -12,6 +12,7 @@
 //! - Every failure is fixed text (`&'static str`): no REST error, body or header reaches a row.
 //! - Mentions are resolved in one pass over the content; replacement names are never rescanned.
 use crate::{
+    markdown,
     rest::{Rest, RestError},
     session::{SessionHandle, Subscription},
     sidebar::avatar_url,
@@ -179,6 +180,10 @@ struct Stored {
     nick: Option<String>,
     roles: Vec<u64>,
     content: String,
+    /// `content` parsed once, when it arrives or changes (never per snapshot).
+    // ponytail: read by row() once slice K2 lands; until then only the tests read it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    body: Vec<markdown::Block>,
     edited: bool,
     attachments: Vec<Attachment>,
     mentions: Vec<(u64, String)>,
@@ -189,6 +194,7 @@ struct Stored {
 /// A message object from the gateway or REST. A referenced message is parsed one level deep.
 fn parse(v: &Value, nested: bool) -> Option<Stored> {
     let member = v.get("member").filter(|m| m.is_object());
+    let content = text(v, "content").unwrap_or_default();
     Some(Stored {
         id: v.get("id").and_then(id)?,
         author: user(v.get("author")?)?,
@@ -197,7 +203,8 @@ fn parse(v: &Value, nested: bool) -> Option<Stored> {
             .and_then(|m| m.get("roles")?.as_array())
             .map(|r| r.iter().filter_map(id).collect())
             .unwrap_or_default(),
-        content: text(v, "content").unwrap_or_default(),
+        body: markdown::parse(&content),
+        content,
         edited: v.get("edited_timestamp").is_some_and(|t| !t.is_null()),
         attachments: attachments(v.get("attachments")),
         mentions: mentions(v.get("mentions")),
@@ -220,6 +227,9 @@ impl Stored {
     /// MESSAGE_UPDATE: only the fields the payload carries; absent `attachments` = unchanged.
     fn merge(&mut self, d: &Value) {
         if let Some(content) = text(d, "content") {
+            if content != self.content {
+                self.body = markdown::parse(&content);
+            }
             self.content = content;
         }
         if d.get("edited_timestamp").is_some_and(|t| !t.is_null()) {
@@ -608,6 +618,7 @@ impl MessageStore {
                 nick: None,
                 roles: Vec::new(),
                 content: content.to_owned(),
+                body: markdown::parse(content),
                 edited: false,
                 attachments: Vec::new(),
                 mentions: Vec::new(),
