@@ -355,6 +355,37 @@ enum DesignTokens {
         /// Legacy spring for the rail indicator and icon morph.
         static let railSpring = Animation.interpolatingSpring(stiffness: 500, damping: 30)
     }
+
+    /// Message skeleton while history loads (v2 MessageSkeletonView, refs/swiftcord-v2-teardown.md,
+    /// kept out of git; bar heights, offsets, pitch and row gap checked on the v2 capture of
+    /// 2026-10-14).
+    enum Skeleton {
+        /// Avatar circle 40 at x 16, two below the row top; bars start at 72 and stop 16 short
+        /// of the trailing edge.
+        static let inset: CGFloat = 16
+        static let avatar: CGFloat = 40
+        static let avatarTop: CGFloat = 2
+        static let textLeading: CGFloat = 72
+        /// Name bar 14 tall at +3; the timestamp bar 9 tall at +6, 8 after the name bar.
+        static let nameTop: CGFloat = 3
+        static let nameHeight: CGFloat = 14
+        static let timeTop: CGFloat = 6
+        static let timeHeight: CGFloat = 9
+        static let timeGap: CGFloat = 8
+        /// Body lines 12 tall every 17 from +23; a media block 3 under the last line, corner 8.
+        static let firstLineTop: CGFloat = 23
+        static let lineHeight: CGFloat = 12
+        static let linePitch: CGFloat = 17
+        static let mediaTop: CGFloat = 3
+        static let mediaRadius: CGFloat = 8
+        /// Rows are at least the avatar tall and 19 apart.
+        static let rowGap: CGFloat = 19
+        /// Secondary label colour at these alphas (v2 sets the alpha, it does not multiply it).
+        static let avatarAlpha: CGFloat = 0.2
+        static let barAlpha: CGFloat = 0.18
+        static let timeAlpha: CGFloat = 0.12
+        static let mediaAlpha: CGFloat = 0.14
+    }
 }
 
 // MARK: Contrast

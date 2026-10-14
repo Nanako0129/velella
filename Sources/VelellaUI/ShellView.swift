@@ -58,7 +58,8 @@ public struct ShellView: View {
             }
         } detail: {
             MessageArea(
-                header: state.header, isSignedIn: state.isSignedIn, messages: state.messages,
+                header: state.header, conversationID: state.openTarget ?? "",
+                isSignedIn: state.isSignedIn, messages: state.messages,
                 load: state.messageLoad, reply: $state.reply, draft: $state.draft, onSend: onSend
             )
                 // No minimum of its own: SwiftUI's `.inspector` adds the floating sidebar's current

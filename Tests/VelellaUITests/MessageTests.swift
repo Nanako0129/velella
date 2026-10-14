@@ -70,3 +70,33 @@ private func live(
     #expect(calls == 0)
     #expect(draft == "你好")
 }
+
+@Test func skeletonRowsAreStablePerConversationAndStayInV2Ranges() {
+    #expect(SkeletonRow.rows(seed: "1556391419621671022", count: 8) == SkeletonRow.rows(seed: "1556391419621671022", count: 8))
+    #expect(SkeletonRow.rows(seed: "1", count: 8) != SkeletonRow.rows(seed: "2", count: 8))
+    let rows = SkeletonRow.rows(seed: "1523004250152501341", count: 500)
+    for row in rows {
+        #expect((76...158).contains(row.nameWidth))
+        #expect((34...52).contains(row.timeWidth))
+        #expect((1...4).contains(row.lineWidths.count))
+        #expect((96...360).contains(row.lineWidths.last!))
+        #expect(row.lineWidths.dropLast().allSatisfy { (220...540).contains($0) })
+        if let media = row.media {
+            #expect((180...320).contains(media.width) && (92...184).contains(media.height))
+        }
+    }
+    // One row in five carries media.
+    let withMedia = rows.filter { $0.media != nil }.count
+    #expect((60...140).contains(withMedia))
+}
+
+@Test func skeletonRowHeightsMatchTheV2Capture() {
+    func row(lines: Int, media: CGSize? = nil) -> SkeletonRow {
+        SkeletonRow(nameWidth: 100, timeWidth: 40, lineWidths: Array(repeating: 200, count: lines), media: media)
+    }
+    // Two lines measured 50 tall in the capture; one line is held at the avatar's 40.
+    #expect(row(lines: 2).height == 50)
+    #expect(row(lines: 1).height == 40)
+    // v2: 17 × lines + 16, plus the media height + 8.
+    #expect(row(lines: 1, media: CGSize(width: 200, height: 100)).height == 141)
+}

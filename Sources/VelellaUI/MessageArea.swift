@@ -9,6 +9,8 @@ private typealias T = DesignTokens
 /// `Text(verbatim:)`: no Markdown, no link detection (plan M, F5).
 struct MessageArea: View {
     let header: ChannelHeader?
+    /// The open conversation's id: seeds the loading skeleton.
+    var conversationID = ""
     var isSignedIn = true
     let messages: [MessageItem]
     var load: MessageLoad = .idle
@@ -18,18 +20,25 @@ struct MessageArea: View {
 
     var body: some View {
         if header != nil {
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: T.Spacing.lg) {
-                    LoadStatus(load: load, isEmpty: messages.isEmpty)
-                    ForEach(messages) { MessageRow(message: $0) }
+            Group {
+                // Until the first page arrives (a switch empties the rows at once), as in v2.
+                if load == .loading && messages.isEmpty {
+                    MessageSkeleton(seed: conversationID)
+                } else {
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: T.Spacing.lg) {
+                            LoadStatus(load: load)
+                            ForEach(messages) { MessageRow(message: $0) }
+                        }
+                        .padding(T.Spacing.lg)
+                        .background(OverlayScrollerEnforcer())
+                    }
+                    .defaultScrollAnchor(.bottom)
+                    // Messages pass under the toolbar through a glass band with a hard lower edge, on a
+                    // darker pane than the translucent sidebar (Swiftcord v2, user's captures 2026-10-13).
+                    .scrollEdgeEffectStyle(.hard, for: .top)
                 }
-                .padding(T.Spacing.lg)
-                .background(OverlayScrollerEnforcer())
             }
-            .defaultScrollAnchor(.bottom)
-            // Messages pass under the toolbar through a glass band with a hard lower edge, on a
-            // darker pane than the translucent sidebar (Swiftcord v2, user's captures 2026-10-13).
-            .scrollEdgeEffectStyle(.hard, for: .top)
             .safeAreaInset(edge: .bottom) { Composer(reply: $reply, draft: $draft, onSend: onSend) }
             // Under the toolbar too, so the toolbar band carries the pane's tint (a band of bare
             // window material over the messages read as a separate, lighter strip).
@@ -46,21 +55,15 @@ struct MessageArea: View {
     }
 }
 
-/// Above the rows: a spinner while the first load runs, or the fixed failure text.
+/// Above the rows: the fixed failure text when a load failed.
 private struct LoadStatus: View {
     let load: MessageLoad
-    let isEmpty: Bool
 
     var body: some View {
-        switch load {
-        case .loading where isEmpty:
-            ProgressView().controlSize(.small).frame(maxWidth: .infinity)
-        case .failed(let text):
+        if case .failed(let text) = load {
             Label { Text(verbatim: text) } icon: { Image(systemName: "exclamationmark.triangle.fill") }
                 .font(T.Typography.messageBody)
                 .foregroundStyle(.secondary)
-        default:
-            EmptyView()
         }
     }
 }
