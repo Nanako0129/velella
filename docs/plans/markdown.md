@@ -755,4 +755,4 @@ The corpus records the worst line per grammar after warm-up, from the verifier's
 | Join failure | A failed join in `apply` leaves the block as it was. |
 | End-to-end test | Polls for liveness with a 60 s limit; the drop check stays at 5 s. |
 
-The executor dropped the per-grammar warm-up once, which would have let a heavy grammar's first block go plain for good under load. Main rejected that, and 3a826b5 restored it. **Live (user):** sample 2's Python block against Vencord's look; a message with code blocks shows its header at once and gains colours without moving.
+The executor dropped the per-grammar warm-up once, which would have let a heavy grammar's first block go plain for good under load. Main rejected that, and 3a826b5 restored it. **Live (user):** sample 2's Python block against Vencord's look; a message with code blocks shows its header at once and gains colours without moving. **Accepted by the user (2026-10-15: "K6驗收OK").**
