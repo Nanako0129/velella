@@ -560,10 +560,10 @@ Revision 3 put jobs on a bounded push queue. Its plan review (7 blockers) and se
 | Carrier | `Block::CodeBlock.highlight: Option<Arc<Highlighted>>`; the parser sets `None`. `row()` clones the `Arc`, never the spans. The FFI conversion copies the spans after `snapshot()` returned, off the lock. `Highlighted.name` is removed: the header comes from the table (Header row). |
 | Pending flag | `Stored` gains `pending: bool`, set to true exactly when a body is assigned to a message that goes into `open.messages` and at least one of its code blocks' fences maps in the language table: `parse(v, false)` (reaching the store through `observe` MESSAGE_CREATE, `history`, and `finish_send` Ok), and `merge` when `content` changed. A nested `referenced_message` (`parse(v, true)`) and an echo (`begin_send`) are never pending. The worker never reads `open.echoes`. `Open::insert` with `replace` keeps the existing copy's `body` and `pending` when the new copy's `content` is equal, so a re-delivered CREATE, or the gateway copy after `finish_send`, does not drop colours already shown (the body is a function of `content` alone). |
 | Worker | `MessageStore::new(rest) -> Arc<MessageStore>`. Session.rs's `get_or_init` drops its `Arc::new`; that one line is K6's. `new` creates `sync_channel::<()>(1)`, keeps the sender as `wake: Option<SyncSender<()>>`, and starts one thread with `std::thread::Builder::new().name("velella-highlight").spawn(...)`. A spawn error leaves `wake: None`: highlighting is off for that store, and nothing panics. The thread holds only a `Weak<MessageStore>` and the receiver, and runs `run(weak, receiver, compute_job)`:<br>1. `warm()`; if it returns `None`, the thread ends.<br>2. `recv()`; an error (the store and its sender were dropped) ends the thread.<br>3. Loop: upgrade the `Weak` (failure ends the thread); `next_job()`, and on `None` go back to 2; drop the `Arc`; compute; upgrade again (failure ends the thread); `apply`.<br>`bump()` calls `wake()`, which is `try_send(())` ignoring `Full` (a wake is already pending) and `Disconnected` (the worker is gone). Every change, including the worker's own `apply`, therefore leads to a recheck for pending messages, and no enqueue site can be missed. |
-| `next_job` | `fn next_job(&self) -> Option<Job>`, with `Job { epoch: u64, id: u64, blocks: Vec<(Option<String>, String)> }` holding each code block's (fence, code) in walk order, mapped or not. Under the lock: take the newest message in the open channel with `pending` set, clear its flag, and copy its blocks. |
+| `next_job` | `fn next_job(&self) -> Option<Job>`, with `Job { id: u64, blocks: Vec<(Option<String>, String)> }` holding each code block's (fence, code) in walk order, mapped or not. Under the lock: take the newest message in the open channel with `pending` set, clear its flag, and copy its blocks. |
 | Walk order | Checking for a mapped fence, collecting a job's blocks, and applying results all use one visitor over `&mut [Block]` (rev 2's `each_code_block`, which descends into quotes, list items and `Inline::Block`). So the order is the same by construction. |
 | Computing and limits | `compute_job(&Job) -> Vec<Option<Arc<Highlighted>>>`, one entry per block, on the worker. Per block, as rev 2: a line over 1024 bytes, more than 2000 lines, or an unmapped fence gives `None`; `catch_unwind` wraps each block. Per job (one message): one 250 ms budget, checked before each line, and one allowance of 4096 spans. A block that would take the message past 4096 spans gets `None`, and so does every later block in that message. Once the budget is spent, every remaining block is `None`. A single line can overrun the budget, since fancy-regex cannot be interrupted; that costs only the worker's time. |
-| `apply` | `fn apply(&self, job: &Job, results: Vec<Option<Arc<Highlighted>>>)`. Under the lock, with no syntect:<br>• the open channel's epoch must equal `job.epoch`;<br>• message `job.id` must be in `open.messages` (echoes are not searched);<br>• its code blocks must equal `job.blocks` in count and in each (fence, code), byte for byte.<br>Otherwise nothing is applied. An edited message is already pending again and gets its own job. Each block then takes its result only when the result's spans join to exactly that block's code; otherwise it stays `None`. `apply` bumps once if anything changed. There is no content fingerprint and no hash, so no crate is added. |
+| `apply` | `fn apply(&self, job: &Job, results: Vec<Option<Arc<Highlighted>>>)`. Under the lock, with no syntect:<br>• message `job.id` must be in the open channel's `open.messages` (echoes are not searched);<br>• its code blocks must equal `job.blocks` in count and in each (fence, code), byte for byte.<br>Otherwise nothing is applied. An edited message is already pending again and gets its own job. Each block then takes its result only when the result's spans join to exactly that block's code; otherwise it stays `None`. `apply` bumps once if anything changed. There is no content fingerprint and no hash, so no crate is added. There is no epoch check either: id plus exact (fence, code) equality plus the join check already make any applied result that block's own highlight, so a result landing after the channel was closed and reopened is still correct (closing review, blocker 4). |
 | Header | FFI `MdBlock::CodeBlock` gains `header: Option<String>`, set in the `From` conversion by `highlight::header(language)`, the same pure lookup. Swift's `MarkdownBlock.codeBlock` carries it. `CodeBlockModel` shows the header from that field whether or not a highlight is present, so a block's layout does not change when its colours arrive. `MdHighlighted.name` and `CodeHighlight.name` are removed. |
 | Dead worker | Not restarted. A panic outside the per-block `catch_unwind` (in `warm`, `next_job` or `apply`) ends the thread. The store's mutex poison is already recovered (`lock()`), a partly applied body is still valid (each block was checked on its own), and `wake()` ignores `Disconnected`. That session's code blocks then stay plain. A deterministic failure would repeat on every restart; the end-to-end test catches a worker that never colours anything. |
 | Thread QoS | DEFER: std's default. Utility QoS through `pthread_set_qos_class_self_np` waits for a flood test showing UI contention. |
@@ -574,10 +574,10 @@ Revision 3 put jobs on a bounded push queue. Its plan review (7 blockers) and se
 
 | Test (core, deterministic) | Checks |
 |---|---|
-| Pending sites | One test per site: MESSAGE_CREATE, `history` Ok, `finish_send` Ok, and `merge` with changed content each make `next_job` return that id. `merge` with equal content, a nested reply, an echo, and a body whose only fence is unmapped (`swift`) make it return `None`. After each, every `CodeBlock.highlight` in the snapshot is `None`: nothing was computed on the path. |
+| Pending sites | One test per site: MESSAGE_CREATE, `history` Ok, `finish_send` Ok, and `merge` with changed content each make `next_job` return that id. `merge` with equal content, an echo with a `py` block, a reply whose only `py` block is in its `referenced_message`, and a body whose only fence is unmapped (`swift`) make it return `None`. After each, every `CodeBlock.highlight` in the snapshot is `None`: nothing was computed on the path. |
 | Newest first | With two pending messages, `next_job` returns the newer. |
-| Channel switch | Take a job in channel A; open B; `apply(A's job)` changes nothing; `next_job` returns only B's messages. |
-| History race | `history` inserts a pending message, and `next_job` returns it: the flag is set before the message is visible. |
+| Channel switch | Take a job in channel A; open B; `apply(A's job)` changes nothing; `next_job` returns only B's messages. Then close B and reopen A with the same message: `apply(A's old job)` colours it: the result is still that block's own. |
+| History insert | `history` inserts a message with a mapped block, and `next_job` returns it. The ordering itself is structural, not tested: `pending` is assigned only inside `parse` and `merge`, before the `Stored` reaches `insert`, so no thread can see the message without its flag. |
 | Edited during compute | Take a job; a MESSAGE_UPDATE changes the code; `apply` changes nothing; `next_job` returns the edited message. The same holds for a fence-only edit (`py` → `rb`, same code). |
 | Evicted | Take a job; delete the message (and, separately, push it out past `CAP`); `apply` changes nothing and does not panic. |
 | Join mismatch | `apply` with a result whose spans do not join to the block's code leaves `None`. |
@@ -602,7 +602,7 @@ cargo test --release -p velella-core -- --ignored --exact <name> --test-threads=
 
 | Release test | Bound |
 |---|---|
-| Cold observe | Fresh process. `new()` starts the warm-up; then 10 MESSAGE_CREATEs, each holding 20 code blocks with the fence `cs` and one line of 1024 `(` characters. The worst single `observe` call (measured with `Instant`) is ≤ 5 ms. |
+| Cold observe | Fresh process. `new()` starts the warm-up; then 10 MESSAGE_CREATEs, each holding 15 code blocks with the fence `cs` and one line of 1024 `(` characters (15,525 bytes, under the parser's `MAX_INPUT` of 16,384). **Precondition, asserted before the timing is trusted:** each stored body has 15 `CodeBlock`s with fence `cs`, and the message is pending. The worst single `observe` call (measured with `Instant`) is ≤ 5 ms. |
 | Contended observe | A store of 200 messages, each holding one block with 4096 spans (applied through `apply`, synthetic spans), and a thread looping `snapshot()`. Over 100 `observe` calls, the worst is ≤ 5 ms. The longest `snapshot()` lock hold is recorded, with a bound of ≤ 5 ms. |
 | Corpus | Rev 2's adversarial corpus plus backref grammars: heredoc `<<EOF` in bash, Ruby, Perl and PHP; Lua `[==[`; C# raw strings; Markdown fences. Each syntax's worst line is recorded in this plan; there is no bound. The `MAX_LINE_BYTES` comment is corrected: the cap limits a line's length, not its cost. |
 
@@ -611,9 +611,10 @@ cargo test --release -p velella-core -- --ignored --exact <name> --test-threads=
 | Mutant | Expected killer |
 |---|---|
 | syntect (`compute`/`warm`) called from `parse`, `merge`, `observe`, `history` or `finish_send` | Cold observe; pending-site snapshot `None` checks |
-| `pending` not set at one site (each site separately), or set for an echo or a nested reply | Pending sites |
-| `pending` set after the insert is visible (`history` sets it after the lock) | History race |
-| `apply` without the epoch check | Channel switch |
+| `pending` not set at one site (each site separately) | Pending sites |
+| `history` inserting with `pending: false` | History insert |
+| `next_job`/`apply` also searching `open.echoes` | Pending sites (echo case) |
+| a message pending because its `referenced_message` has a mapped fence | Pending sites (a nested-reply case where only the referenced message has a `py` block) |
 | `apply` comparing code without the fence | Edited during compute (fence-only edit) |
 | `apply` without the join check | Join mismatch |
 | an `Arc<MessageStore>` held across compute | End to end (`strong_count`) |
@@ -700,3 +701,15 @@ Main reads the merge commit's conflict hunks at integration.
 | 5 | Rev 2 items unmapped; no rev 3 mutants | FIX: Rev 2 items table; Verifier mutants table |
 | 6 | Timing and flood checks not falsifiable | FIX: exact payload (20 × one 1024-byte `cs` line of `(`), run command, worst-of-N measurement; the `with_wake` seam; the 64/9,936 overflow count no longer applies (there is no job queue), replaced by the undrained-wake test (10,000 CREATEs return, at most `CAP` pending) |
 | 7 | No Files line or ownership; merge order with P1 | FIX: Files and order (P1 first, the executor merges m1 and resolves the two files) |
+
+### Closing review dispositions (closing review of rev 3.1, 3373286)
+
+All four blockers were test falsifiability; the design stands. The user chose to fix them and start without another review round (2026-10-14: "修正後直接開工").
+
+| # | Blocker | Disposition |
+|---|---|---|
+| 1 | Cold observe's 20 × 1035-byte payload exceeds `MAX_INPUT` (16,384), so it parses as plain text and the bound proves nothing | FIX: 15 blocks (15,525 bytes) plus a precondition assertion (15 `cs` `CodeBlock`s, pending) |
+| 2 | "`pending` set after the insert is visible" cannot be killed by a sequential test | FIX: the ordering is stated as structural (assigned only in `parse`/`merge`, before `insert`); the mutant is replaced by "`history` inserting with `pending: false`" |
+| 3 | "`pending` set for an echo or a nested reply" is an equivalent mutant | FIX: replaced by "`next_job`/`apply` also search echoes" and "pending because the referenced message has a mapped fence", each with a killing Pending sites case |
+| 4 | The Channel switch test does not kill "`apply` without the epoch check" | FIX: the epoch check is deleted as a redundant guard (id + exact (fence, code) + join already decide correctness); its mutant is gone; the Channel switch test adds the reopen case showing the late result is applied and correct |
+
