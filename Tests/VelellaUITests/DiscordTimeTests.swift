@@ -59,7 +59,7 @@ private func all(_ locale: String) -> [String] {
     #expect(DiscordTime.format(unix: instant, style: .relative, locale: en, now: fourYears) == "4 years ago")
     #expect(DiscordTime.format(unix: instant + 7200, style: .relative, locale: en, now: at) == "in 2 hours")
     #expect(DiscordTime.format(unix: instant, style: .relative, locale: en, now: at.addingTimeInterval(7200)) == "2 hours ago")
-    // English whatever the account locale (K0: "5 years ago" in zh-TW).
+    // English whatever the locale (K0: "5 years ago" in zh-TW).
     #expect(DiscordTime.format(unix: instant, style: .relative, locale: Locale(identifier: "zh-TW"), now: at.addingTimeInterval(7200)) == "2 hours ago")
 }
 

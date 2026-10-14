@@ -12,7 +12,7 @@ import SwiftUI
 /// What a paragraph's segments are built from on each timeline tick.
 struct RenderContext: Equatable, Sendable {
     var now: Date
-    /// The Discord account's locale (`ShellState.locale`), not the system's.
+    /// The shell locale (`ShellState.locale`: the macOS preferred language).
     var locale: Locale
 }
 
@@ -84,11 +84,6 @@ struct ParagraphView: View {
     @State private var delay: Task<Void, Never>?
     private let images = EmojiImages.shared
 
-    /// Tips appear after the pointer rests this long (plan K2).
-    static let tipDelay: Duration = .milliseconds(500)
-    /// The tip bubble's corner, as the tag pills (no v2 source for a tooltip).
-    static let tipRadius: CGFloat = T.Radius.tagPill
-
     init(frames: TipFrames = TipFrames(), build: @escaping (RenderContext) -> [Segment]) {
         _frames = State(initialValue: frames)
         self.build = build
@@ -128,7 +123,7 @@ struct ParagraphView: View {
             .textRenderer(SegmentRenderer(frames: frames))
             .accessibilityLabel(Text(verbatim: Self.spoken(segments)))
             .onContinuousHover(perform: hover)
-            .overlay(alignment: .topLeading) { bubble }
+            .tooltipOverlay(shown.map { TooltipRequest(text: $0.tip, rect: $0.rect) })
             .task(id: segments.compactMap(\.image?.url)) {
                 for segment in segments { if let url = segment.image?.url { images.load(url) } }
             }
@@ -174,28 +169,13 @@ struct ParagraphView: View {
             delay?.cancel()
             guard let hit else { return }
             delay = Task {
-                try? await Task.sleep(for: Self.tipDelay)
+                try? await Task.sleep(for: TooltipStyle.showDelay)
                 if !Task.isCancelled { shown = hit }
             }
         case .ended:
             armed = nil
             shown = nil
             delay?.cancel()
-        }
-    }
-
-    /// Above the run, so later rows (drawn after this one) cannot cover it.
-    @ViewBuilder private var bubble: some View {
-        if let shown {
-            Text(verbatim: shown.tip)
-                .font(T.Typography.messageBody)
-                .padding(.horizontal, T.Spacing.sm)
-                .padding(.vertical, T.Spacing.xs)
-                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: Self.tipRadius, style: .continuous))
-                .fixedSize()
-                .alignmentGuide(.leading) { _ in -shown.rect.minX }
-                .alignmentGuide(.top) { d in d.height + T.Spacing.xs - shown.rect.minY }
-                .allowsHitTesting(false)
         }
     }
 }
@@ -245,6 +225,18 @@ enum InlinePart: Equatable {
         return trimmingBreaks(parts)
     }
 
+    /// The parts a paragraph renders. HTML ignores a lone `<br>` at the end of a block, so the
+    /// final line break is not drawn (P1): `> single\n` is one line, two trailing breaks are one
+    /// empty line. Render side only; the core AST keeps the break.
+    static func paragraph(_ inlines: [MarkdownInline], style: InlineStyle = InlineStyle()) -> [InlinePart] {
+        var parts = split(inlines, style: style)
+        if case .inlines(var run)? = parts.last, run.last == .lineBreak {
+            run.removeLast()
+            if run.isEmpty { parts.removeLast() } else { parts[parts.count - 1] = .inlines(run) }
+        }
+        return parts
+    }
+
     /// A line break where the paragraph is cut is dropped (plan, block grouping): K1 drops those
     /// beside an `Inline::Block`, this the ones beside a container holding one (`a\n||```x```||`).
     private static func trimmingBreaks(_ parts: [InlinePart]) -> [InlinePart] {
@@ -275,7 +267,7 @@ struct InlineFlow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: T.Spacing.xs) {
-            ForEach(Array(InlinePart.split(inlines, style: style).enumerated()), id: \.offset) { _, part in
+            ForEach(Array(InlinePart.paragraph(inlines, style: style).enumerated()), id: \.offset) { _, part in
                 switch part {
                 case .inlines(let run):
                     ParagraphView { [text, style] context in text.segments(run, style: style, context: context) }

@@ -341,7 +341,7 @@ struct MarkdownText {
 
     // MARK: The timestamp case (K4)
 
-    /// A timestamp's text in the account locale, its hover tip (the `F` style) and, for `R`, how
+    /// A timestamp's text in the shell locale, its hover tip (the `F` style) and, for `R`, how
     /// often to rebuild it.
     static func timestamp(unix: Int64, style: TimestampStyle, context: RenderContext) -> (text: String, hoverTip: String?, refreshEvery: TimeInterval?) {
         (
