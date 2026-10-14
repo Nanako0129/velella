@@ -261,7 +261,12 @@ final class AppModel {
         case .subtext(let content): .subtext(content.map(inline))
         case .quote(let blocks): .quote(blocks.map(Self.block))
         case .list(let ordered, let start, let items): .list(ordered: ordered, start: start, items: items.map { $0.map(Self.block) })
-        case .codeBlock(let language, let code): .codeBlock(language: language, code: code)
+        case .codeBlock(let language, let code, let highlight):
+            .codeBlock(language: language, code: code, highlight: highlight.map { h in
+                CodeHighlight(name: h.name, lines: h.lines.map { line in
+                    line.map { CodeSpan(text: $0.text, rgb: $0.rgb, bold: $0.bold, italic: $0.italic, underline: $0.underline) }
+                })
+            })
         }
     }
 

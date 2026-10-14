@@ -27,7 +27,28 @@ public indirect enum MarkdownBlock: Hashable, Sendable {
     /// Never contains a quote.
     case quote([MarkdownBlock])
     case list(ordered: Bool, start: UInt32, items: [[MarkdownBlock]])
-    case codeBlock(language: String?, code: String)
+    /// `highlight` comes from core, computed from this block's own `code` (K6); nil renders plain.
+    case codeBlock(language: String?, code: String, highlight: CodeHighlight?)
+}
+
+/// A code block's highlight from core: `name` is the header (core's language table, never the
+/// fence text); `lines` joined with "\n" should give the block's code, which the view checks.
+public struct CodeHighlight: Hashable, Sendable {
+    public var name: String
+    public var lines: [[CodeSpan]]
+    public init(name: String, lines: [[CodeSpan]]) {
+        self.name = name; self.lines = lines
+    }
+}
+
+/// A run of one style; `rgb` is 0xRRGGBB.
+public struct CodeSpan: Hashable, Sendable {
+    public var text: String
+    public var rgb: UInt32
+    public var bold: Bool, italic: Bool, underline: Bool
+    public init(text: String, rgb: UInt32, bold: Bool = false, italic: Bool = false, underline: Bool = false) {
+        self.text = text; self.rgb = rgb; self.bold = bold; self.italic = italic; self.underline = underline
+    }
 }
 
 public indirect enum MarkdownInline: Hashable, Sendable {
@@ -406,7 +427,7 @@ struct MarkdownText {
         case .paragraph(let c), .heading(_, let c), .subtext(let c): plainText(c)
         case .quote(let blocks): blocks.map(plainText).joined(separator: "\n")
         case .list(_, _, let items): items.map { $0.map(plainText).joined(separator: "\n") }.joined(separator: "\n")
-        case .codeBlock(_, let code): code
+        case .codeBlock(_, let code, _): code
         }
     }
 }

@@ -674,6 +674,72 @@ async fn created_and_edited_messages_carry_their_parsed_body() {
     );
 }
 
+/// The text of the first code block's highlight in `body`, top level or inside a spoiler.
+fn highlight_text(body: &[markdown::Block]) -> Option<String> {
+    use markdown::{Block, Inline};
+    body.iter().find_map(|b| match b {
+        Block::CodeBlock { highlight, .. } => highlight.as_ref().map(|h| h.text()),
+        Block::Paragraph(c) => c.iter().find_map(|i| match i {
+            Inline::Spoiler(c) => highlight_text(&[Block::Paragraph(c.clone())]),
+            Inline::Block(b) => highlight_text(std::slice::from_ref(b)),
+            _ => None,
+        }),
+        _ => None,
+    })
+}
+
+/// K6: code blocks are highlighted where the body is assigned (history before the lock, a
+/// created message, an edit, a local echo), never in a nested reply, and `row()` passes the body
+/// through as stored.
+#[tokio::test]
+async fn code_blocks_are_highlighted_where_the_body_is_assigned_and_not_in_row() {
+    // Compile the Python grammar's regexes first, so a debug build stays inside the budget.
+    let frozen = std::time::Instant::now();
+    highlight::fill_with(&mut markdown::parse("```py\nx = 1\n```"), &mut || frozen);
+    let page = json!([msg(10, 5, "```py\nh = 1\n```")]);
+    let (_mock, store) = serve(&[ok(&page)]).await;
+    let epoch = store.open(5);
+    let s = settled(&store, epoch).await;
+    assert_eq!(highlight_text(&s.rows[0].body).as_deref(), Some("h = 1"));
+
+    let mut created = msg(50, 5, "||```py\nc = 1\n```||");
+    created["referenced_message"] = msg(40, 5, "```py\nr = 1\n```");
+    store.observe("MESSAGE_CREATE", &created);
+    let stored = |id| {
+        let inner = store.lock();
+        let open = inner.open.as_ref().unwrap();
+        open.messages.iter().find(|m| m.id == id).unwrap().clone()
+    };
+    let m = stored(50);
+    assert_eq!(highlight_text(&m.body).as_deref(), Some("c = 1"));
+    let reply = m.reply.as_ref().unwrap();
+    assert!(matches!(
+        reply.body.as_slice(),
+        [markdown::Block::CodeBlock {
+            highlight: None,
+            ..
+        }]
+    ));
+
+    store.observe(
+        "MESSAGE_UPDATE",
+        &json!({"id": "50", "channel_id": "5", "content": "```py\nu = 2\n```"}),
+    );
+    assert_eq!(highlight_text(&stored(50).body).as_deref(), Some("u = 2"));
+
+    store.begin_send(5, "```py\ns = 3\n```", me()).unwrap();
+    let echo = store.lock().open.as_ref().unwrap().echoes[0]
+        .message
+        .clone();
+    assert_eq!(highlight_text(&echo.body).as_deref(), Some("s = 3"));
+
+    // `row()` computes nothing: a body stored without a highlight (a nested copy) stays so.
+    let nested = parse(&msg(60, 5, "```py\nn = 4\n```"), true).unwrap();
+    let r = row(&nested, &Context::default(), false, None);
+    assert_eq!(r.body, nested.body);
+    assert_eq!(highlight_text(&r.body), None);
+}
+
 #[tokio::test]
 async fn sends_post_the_exact_body_with_a_fresh_nonce_each() {
     let reply = |id: u64, nonce: &str| {

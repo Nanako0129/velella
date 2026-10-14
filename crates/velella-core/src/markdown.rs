@@ -17,6 +17,7 @@
 //! next-candidate tables built once per level and memos that persist across the attempts of one
 //! level (the link rule's label walk, target and validation). Nesting is checked before each
 //! recursive call. Nothing here logs.
+use crate::highlight::Highlighted;
 use std::{collections::HashMap, ops::Range};
 
 /// Content longer than this (bytes) falls back without parsing (4000 characters × 4).
@@ -52,6 +53,9 @@ pub enum Block {
     CodeBlock {
         language: Option<String>,
         code: String,
+        /// The parser leaves it `None`; every `Stored.body` assignment fills it in place from this
+        /// block's own `code` (`highlight::fill`, plan K6).
+        highlight: Option<Highlighted>,
     },
 }
 
@@ -277,7 +281,11 @@ fn block(n: Node) -> Block {
         },
         Node::Subtext(c) => Block::Subtext(inlines(c)),
         Node::Quote(c) => Block::Quote(blocks(c)),
-        Node::CodeBlock { language, code } => Block::CodeBlock { language, code },
+        Node::CodeBlock { language, code } => Block::CodeBlock {
+            language,
+            code,
+            highlight: None,
+        },
         Node::List {
             ordered,
             start,

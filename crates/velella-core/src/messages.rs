@@ -12,9 +12,13 @@
 //! - Every failure is fixed text (`&'static str`): no REST error, body or header reaches a row.
 //! - The body is parsed once, when content arrives or changes (K1); `row()` never re-parses.
 //!   Mentions are resolved by walking that AST into side data, so a resolved name is never parsed.
+//! - Code blocks are highlighted in place where the body is assigned (K6), each from its own code
+//!   under one per-message budget; a nested `referenced_message` never is, and `history()` parses
+//!   and highlights before taking the store lock.
 //! - A reply preview is flattened from the replied message's AST: a spoiler and everything in it
 //!   become one placeholder, so a preview never shows spoiler text.
 use crate::{
+    highlight,
     markdown::{self, Block, Inline, NavTarget, TimestampStyle},
     rest::{Rest, RestError},
     session::{SessionHandle, Subscription},
@@ -216,6 +220,16 @@ fn mentions(v: Option<&Value>) -> Vec<(u64, String)> {
         .unwrap_or_default()
 }
 
+/// `content` parsed, with its code blocks highlighted in place unless it is a reply's nested copy,
+/// which only feeds the one-line preview.
+fn body(content: &str, highlighted: bool) -> Vec<Block> {
+    let mut body = markdown::parse(content);
+    if highlighted {
+        highlight::fill(&mut body);
+    }
+    body
+}
+
 #[derive(Clone, Debug)]
 struct Stored {
     id: u64,
@@ -244,7 +258,7 @@ fn parse(v: &Value, nested: bool) -> Option<Stored> {
             .and_then(|m| m.get("roles")?.as_array())
             .map(|r| r.iter().filter_map(id).collect())
             .unwrap_or_default(),
-        body: markdown::parse(&content),
+        body: body(&content, !nested),
         content,
         edited: v.get("edited_timestamp").is_some_and(|t| !t.is_null()),
         attachments: attachments(v.get("attachments")),
@@ -269,7 +283,7 @@ impl Stored {
     fn merge(&mut self, d: &Value) {
         if let Some(content) = text(d, "content") {
             if content != self.content {
-                self.body = markdown::parse(&content);
+                self.body = body(&content, true);
             }
             self.content = content;
         }
@@ -663,6 +677,8 @@ pub(crate) struct MessageStore {
 
 impl MessageStore {
     pub(crate) fn new(rest: Rest) -> MessageStore {
+        // The syntax set and theme are built off the lock and off the session task.
+        std::thread::spawn(highlight::warm);
         MessageStore {
             rest,
             inner: Mutex::default(),
@@ -723,6 +739,12 @@ impl MessageStore {
     }
 
     fn history(&self, epoch: u64, result: Result<Vec<Value>, RestError>) {
+        // Parsed and highlighted before the lock: a page of slow bodies never holds the store.
+        let result = result.map(|list| {
+            list.iter()
+                .filter_map(|v| parse(v, false))
+                .collect::<Vec<_>>()
+        });
         let mut inner = self.lock();
         let Some(open) = inner.open.as_mut().filter(|o| o.epoch == epoch) else {
             return;
@@ -730,7 +752,7 @@ impl MessageStore {
         open.fetch = None;
         match result {
             Ok(list) => {
-                for m in list.iter().filter_map(|v| parse(v, false)) {
+                for m in list {
                     if !open.deleted.contains(&m.id) {
                         open.insert(m, false);
                     }
@@ -807,7 +829,7 @@ impl MessageStore {
                 nick: None,
                 roles: Vec::new(),
                 content: content.to_owned(),
-                body: markdown::parse(content),
+                body: body(content, true),
                 edited: false,
                 attachments: Vec::new(),
                 mentions: Vec::new(),

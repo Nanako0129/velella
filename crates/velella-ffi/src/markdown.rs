@@ -1,7 +1,10 @@
 //! The message-body AST across FFI (docs/plans/markdown.md, K2): a field-for-field mirror of
 //! `velella_core::markdown`, plus the resolved mentions and emoji images a row carries. Names
 //! carry an `Md` prefix so the Swift shell's own `MarkdownBlock`/`MarkdownInline` do not clash.
-use velella_core::markdown::{Block, Inline, NavTarget, TimestampStyle};
+use velella_core::{
+    highlight::{Highlighted, Span},
+    markdown::{Block, Inline, NavTarget, TimestampStyle},
+};
 
 #[derive(Debug, PartialEq, uniffi::Enum)]
 pub enum MdBlock {
@@ -25,10 +28,30 @@ pub enum MdBlock {
         start: u32,
         items: Vec<Vec<MdBlock>>,
     },
+    /// `highlight` was computed in core from this block's own `code` (K6); `None` renders plain.
     CodeBlock {
         language: Option<String>,
         code: String,
+        highlight: Option<MdHighlighted>,
     },
+}
+
+/// A code block's highlight: `name` is the header (from core's language table, never the fence
+/// text); `lines` joined with `\n` give the block's code.
+#[derive(Debug, PartialEq, uniffi::Record)]
+pub struct MdHighlighted {
+    pub name: String,
+    pub lines: Vec<Vec<MdSpan>>,
+}
+
+/// A run of one style; `rgb` is 0xRRGGBB.
+#[derive(Debug, PartialEq, uniffi::Record)]
+pub struct MdSpan {
+    pub text: String,
+    pub rgb: u32,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
 }
 
 #[derive(Debug, PartialEq, uniffi::Enum)]
@@ -173,7 +196,15 @@ impl From<Block> for MdBlock {
                 start,
                 items: items.into_iter().map(blocks).collect(),
             },
-            Block::CodeBlock { language, code } => Self::CodeBlock { language, code },
+            Block::CodeBlock {
+                language,
+                code,
+                highlight,
+            } => Self::CodeBlock {
+                language,
+                code,
+                highlight: highlight.map(Into::into),
+            },
         }
     }
 }
@@ -253,6 +284,31 @@ impl From<NavTarget> for MdNavTarget {
             NavTarget::Browse => Self::Browse,
             NavTarget::Guide => Self::Guide,
             NavTarget::LinkedRoles(role) => Self::LinkedRoles { role },
+        }
+    }
+}
+
+impl From<Highlighted> for MdHighlighted {
+    fn from(h: Highlighted) -> Self {
+        Self {
+            name: h.name,
+            lines: h
+                .lines
+                .into_iter()
+                .map(|l| l.into_iter().map(Into::into).collect())
+                .collect(),
+        }
+    }
+}
+
+impl From<Span> for MdSpan {
+    fn from(s: Span) -> Self {
+        Self {
+            text: s.text,
+            rgb: s.rgb,
+            bold: s.bold,
+            italic: s.italic,
+            underline: s.underline,
         }
     }
 }
@@ -363,6 +419,7 @@ mod tests {
                 Inline::Spoiler(vec![Inline::Block(Box::new(Block::CodeBlock {
                     language: None,
                     code: "x".into(),
+                    highlight: None,
                 }))]),
                 Inline::Code("c".into()),
                 Inline::Link {
@@ -413,6 +470,7 @@ mod tests {
                         block: MdBlock::CodeBlock {
                             language: None,
                             code: "x".into(),
+                            highlight: None,
                         },
                     }],
                 },
@@ -463,7 +521,20 @@ mod tests {
             },
             Block::CodeBlock {
                 language: Some("rs".into()),
-                code: "fn".into(),
+                code: "fn\n".into(),
+                highlight: Some(Highlighted {
+                    name: "Rust".into(),
+                    lines: vec![
+                        vec![Span {
+                            text: "fn".into(),
+                            rgb: 0x569CD6,
+                            bold: true,
+                            italic: false,
+                            underline: true,
+                        }],
+                        vec![],
+                    ],
+                }),
             },
         ];
         let md = vec![
@@ -494,7 +565,20 @@ mod tests {
             },
             MdBlock::CodeBlock {
                 language: Some("rs".into()),
-                code: "fn".into(),
+                code: "fn\n".into(),
+                highlight: Some(MdHighlighted {
+                    name: "Rust".into(),
+                    lines: vec![
+                        vec![MdSpan {
+                            text: "fn".into(),
+                            rgb: 0x569CD6,
+                            bold: true,
+                            italic: false,
+                            underline: true,
+                        }],
+                        vec![],
+                    ],
+                }),
             },
         ];
         assert_eq!(blocks(core), md);
@@ -514,12 +598,64 @@ mod tests {
                         content: vec![MdInline::Block {
                             block: MdBlock::CodeBlock {
                                 language: None,
-                                code: "x".into()
+                                code: "x".into(),
+                                highlight: None,
                             }
                         }]
                     }
                 ]
             }]
+        );
+    }
+
+    /// The text of a converted code block's spans, lines joined with `\n`.
+    fn joined(h: &MdHighlighted) -> String {
+        let lines: Vec<String> = h
+            .lines
+            .iter()
+            .map(|l| l.iter().map(|s| s.text.as_str()).collect())
+            .collect();
+        lines.join("\n")
+    }
+
+    /// Plan K6-1 (closing review): a hidden-spoiler code block before a visible one. Each
+    /// converted `MdBlock::CodeBlock` carries the spans of its own code only, so the visible block
+    /// never shows the hidden one's text.
+    #[test]
+    fn a_hidden_spoiler_code_block_never_lends_its_spans_to_a_visible_one() {
+        let mut body = parse("||```py\nsecret = 1\n```|| then\n```py\nshown = 2\n```");
+        // A frozen clock: this is about which spans land where, not about time.
+        let frozen = std::time::Instant::now();
+        velella_core::highlight::fill_with(&mut body, &mut || frozen);
+        let md = blocks(body);
+        let [MdBlock::Paragraph { content }, MdBlock::CodeBlock {
+            code: visible_code,
+            highlight: Some(visible),
+            ..
+        }] = md.as_slice()
+        else {
+            panic!("unexpected shape {md:?}");
+        };
+        assert_eq!(visible_code, "shown = 2");
+        assert_eq!(joined(visible), "shown = 2");
+        assert!(!format!("{visible:?}").contains("secret"));
+        let [MdInline::Spoiler { content: hidden }, ..] = content.as_slice() else {
+            panic!("no spoiler first: {content:?}");
+        };
+        let [MdInline::Block {
+            block:
+                MdBlock::CodeBlock {
+                    code: hidden_code,
+                    highlight: Some(hidden),
+                    ..
+                },
+        }] = hidden.as_slice()
+        else {
+            panic!("no hidden code block: {hidden:?}");
+        };
+        assert_eq!(
+            (hidden_code.as_str(), joined(hidden).as_str()),
+            ("secret = 1", "secret = 1")
         );
     }
 
