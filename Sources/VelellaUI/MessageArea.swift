@@ -94,9 +94,10 @@ struct MessageRow: View {
                         .font(T.Typography.authorName)
                         .displayNameStyle(message.displayNameStyle)
                         .foregroundStyle(message.authorColor.map(Color.init) ?? Color.primary)
-                    Text(message.timestamp.formatted(date: .omitted, time: .shortened))
+                    Text(verbatim: DiscordTime.header(date: message.timestamp, now: renderContext.now, locale: renderContext.locale))
                         .font(T.Typography.timestamp)
                         .foregroundStyle(.secondary)
+                        .help(DiscordTime.tooltip(date: message.timestamp, locale: renderContext.locale, now: renderContext.now))
                     if message.edited {
                         Text("(edited)").font(T.Typography.timestamp).foregroundStyle(.secondary)
                     }

@@ -326,17 +326,15 @@ struct MarkdownText {
         return out
     }
 
-    // MARK: The timestamp case (K4 replaces this function)
+    // MARK: The timestamp case (K4)
 
-    /// A timestamp's text, hover tip and refresh interval. TEMPORARY until K4: a fixed en-US `f`
-    /// form for every style and a stub tip (the en-US full date); no refresh.
+    /// A timestamp's text in the account locale, its hover tip (the `F` style) and, for `R`, how
+    /// often to rebuild it.
     static func timestamp(unix: Int64, style: TimestampStyle, context: RenderContext) -> (text: String, hoverTip: String?, refreshEvery: TimeInterval?) {
-        let date = Date(timeIntervalSince1970: TimeInterval(unix))
-        let enUS = Locale(identifier: "en_US")
-        return (
-            date.formatted(Date.FormatStyle(date: .long, time: .shortened).locale(enUS)),
-            date.formatted(Date.FormatStyle(date: .complete, time: .shortened).locale(enUS)),
-            nil
+        (
+            DiscordTime.format(unix: unix, style: style, locale: context.locale, now: context.now),
+            DiscordTime.tooltip(unix: unix, locale: context.locale, now: context.now),
+            style == .relative ? DiscordTime.refreshInterval(for: unix, now: context.now) : nil
         )
     }
 
