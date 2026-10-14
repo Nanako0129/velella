@@ -247,18 +247,31 @@ fn build_theme(top: &str, included: &str) -> Option<(Theme, usize)> {
 
 static SYNTAXES: OnceLock<SyntaxSet> = OnceLock::new();
 static THEME: OnceLock<Option<Theme>> = OnceLock::new();
+static GRAMMARS: OnceLock<()> = OnceLock::new();
 
-/// Builds the syntax set and the theme once; later calls return them. The worker calls it first;
-/// nothing on the session path does. `None` only if the vendored theme does not build (the build
-/// test pins that it does).
+/// Run once through every grammar in the table. syntect builds a grammar's contexts and regexes on
+/// first use (measured in release: up to ~200 ms for one grammar); without this, that cost would
+/// land in the first message's 250 ms budget, and a block that ran out would stay plain for good,
+/// since its message is no longer pending.
+const WARM_SAMPLE: &str = "import os\n# c\ndef f(x, y=1):\n    \"\"\"d\"\"\"\n    return 'a' + \"b\" if x else [1, 2.0, 0x1F]\nclass A(B):\n    pass\n// c /* d */ { let s = `t ${u}`; fn g<T>(a: &str) -> i32 { 0 } }\n<a href=\"x\">y</a> $v @w %z";
+
+/// Builds the syntax set and the theme once, then runs `WARM_SAMPLE` through each grammar of the
+/// table; later calls return at once. The worker calls it first, before it waits for any job;
+/// nothing on the session path does, so its cost (seconds in a debug build) is the worker's alone.
+/// `None` only if the vendored theme does not build (the build test pins that it does).
 pub(crate) fn warm() -> Option<(&'static SyntaxSet, &'static Theme)> {
     let theme = THEME
         .get_or_init(|| build_theme(DARK_PLUS, DARK_VS).map(|(theme, _)| theme))
         .as_ref()?;
-    Some((
-        SYNTAXES.get_or_init(SyntaxSet::load_defaults_newlines),
-        theme,
-    ))
+    let set = SYNTAXES.get_or_init(SyntaxSet::load_defaults_newlines);
+    GRAMMARS.get_or_init(|| {
+        for (_, name, _) in LANGUAGES {
+            if let Some(syntax) = set.find_syntax_by_name(name) {
+                guarded(WARM_SAMPLE, syntax, set, theme, MAX_SPANS, &mut || false);
+            }
+        }
+    });
+    Some((set, theme))
 }
 
 /// One result per block of `job`, in order: each block computed from its own code, under one

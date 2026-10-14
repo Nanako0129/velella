@@ -1110,9 +1110,13 @@ async fn a_dead_worker_never_blocks_or_panics_the_store() {
     assert_eq!(ids(&now(&store, epoch)), [1, 2, 3]);
 }
 
-/// Polls `done` every 10 ms for up to 5 s.
-fn within_5s(mut done: impl FnMut() -> bool) -> bool {
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+/// A liveness limit, not a timing bound: the worker first warms every grammar, which takes
+/// seconds in a debug build.
+const LIVENESS: Duration = Duration::from_secs(60);
+
+/// Polls `done` every 10 ms for up to `limit`.
+fn within(limit: Duration, mut done: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + limit;
     while !done() {
         if std::time::Instant::now() > deadline {
             return false;
@@ -1124,25 +1128,28 @@ fn within_5s(mut done: impl FnMut() -> bool) -> bool {
 
 #[tokio::test]
 async fn the_worker_colours_a_message_and_ends_with_its_store() {
-    // Build the Python grammar's regexes first, so a debug build stays inside the 250 ms budget.
-    computed(&py_job(1, "x = 1"));
     let mock = MockHttp::start(vec![ok(&json!([]))]).await;
     mock.install();
     let (tx, _rx) = mpsc::unbounded_channel();
+    let started = std::time::Instant::now();
     let (store, handle) = MessageStore::start(Rest::new(token(), 7, tx), highlight::compute_job);
     let handle = handle.expect("the worker thread started");
     let epoch = store.open(5);
     settled(&store, epoch).await;
     store.observe("MESSAGE_CREATE", &msg(10, 5, &fenced(&[("py", "x = 1")])));
     assert!(
-        within_5s(|| !all_plain(&store, epoch)),
-        "no colours within 5 s"
+        within(LIVENESS, || !all_plain(&store, epoch)),
+        "no colours within {LIVENESS:?}"
+    );
+    println!(
+        "end to end: colours {:.3} s after the store was created",
+        started.elapsed().as_secs_f64()
     );
     let h = highlights(&now(&store, epoch).rows[0].body);
     assert_eq!(h[0].as_ref().map(|h| h.text()).as_deref(), Some("x = 1"));
     drop(store);
     assert!(
-        within_5s(|| handle.is_finished()),
+        within(Duration::from_secs(5), || handle.is_finished()),
         "the worker outlived its store"
     );
 }
@@ -1164,7 +1171,7 @@ async fn the_worker_holds_no_store_while_it_computes() {
     let epoch = store.open(5);
     settled(&store, epoch).await;
     store.observe("MESSAGE_CREATE", &msg(10, 5, &fenced(&[("py", "x = 1")])));
-    assert_eq!(started.recv_timeout(Duration::from_secs(5)), Ok(10));
+    assert_eq!(started.recv_timeout(LIVENESS), Ok(10));
     let weak = Arc::downgrade(&store);
     drop(store);
     assert_eq!(
@@ -1174,7 +1181,7 @@ async fn the_worker_holds_no_store_while_it_computes() {
     );
     release.send(()).unwrap();
     assert!(
-        within_5s(|| handle.is_finished()),
+        within(Duration::from_secs(5), || handle.is_finished()),
         "the worker outlived its store"
     );
 }
