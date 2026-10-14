@@ -12,9 +12,9 @@ Revision 2 folds in the plan review of rev 1 (REVISE, 9 blockers, all FIX) and t
 |---|---|
 | Outcome | Message content renders as the official Discord client renders it: bold, italic, underline, strike, spoilers, inline code, fenced code blocks, headings 1-3, subtext, quotes (`>` and `>>>`), bullet and numbered lists, masked links, plain and `<…>` links, escapes, user/role/channel mentions as pills with names and colours, @everyone/@here, custom emoji as images, unicode emoji, slash-command mentions, guild navigation tokens and `<t:…>` timestamps in all nine styles with a full-date hover. Message header times use the Discord account's locale and Discord's formats. |
 | How it is seen working | The user compares velella with the official client on the three samples posted in the dev thread (`1559813791384870953` time styles, `1559813797764669537` markdown, `1559816987192852531` edge cases) and on ordinary channel history. |
-| Non-goals | Syntax highlighting inside code blocks (later; SimpleAST `CodeRules`, Apache-2.0). Embeds, reactions, stickers, other gap-report items. Composer markdown. Mention profiles, channel-mention navigation. |
+| Non-goals | (Syntax highlighting moved into K6 on 2026-10-14.) Embeds, reactions, stickers, other gap-report items. Composer markdown. Mention profiles, channel-mention navigation. |
 | Traffic added | Custom emoji images: `https://cdn.discordapp.com/emojis/{id}.{webp|gif}?size=48`, built in core from the parsed id, loaded by the views without credentials when a row is on screen, at most 64 distinct ids per row. Links open in the default browser only when the user clicks them. Nothing else. |
-| Order | **K0** (ground truth; user + main) → checkpoint commit → **K1** (parser) → **K2** (FFI, resolution, inline rendering, links) → **K3** (blocks) and **K4** (times) in parallel worktrees. |
+| Order | **K0** (ground truth; user + main) → checkpoint commit → **K1** (parser) → **K2** (FFI, resolution, inline rendering, links) → **K3** (blocks) and **K4** (times) in parallel worktrees. Then **K5** (K0 adjustments) → **K6** (code blocks), sequentially. |
 | Ownership | Exactly one slice owns each file (table below). No slice consumes the output of a slice running in parallel with it. |
 | External actions by agents | None. No Discord connection, no git, no publishing, no installs. Main posts K0 samples (done) under the standing thread authority. |
 | Checkpoints | One commit of the current uncommitted work before K1 (asks the user). One commit per slice after its verifier (asks each time). No push. |
@@ -303,42 +303,152 @@ A narrow re-verification is CONFIRMED. The F1 fix holds under CoreText layout fo
 | Code block | Language header, line numbers, highlighting | K3: plain block (v2) | K6, styled after Vencord's ShikiCodeblocks (user, 2026-10-14) |
 | Still to capture | Timestamp hover text; plain and masked link click warnings; yesterday and older headers | | K0b |
 
-## K5 — K0 adjustments (SECURITY slice: parser grammar and link display)
+## K5 — K0 adjustments (SECURITY slice: parser grammar and link display), revision 2
 
-**Owner:** pilotfish:security-executor, after K3 merges. **Files:** core `markdown.rs` and `markdown_tests.rs` (list grammar only), core `state.rs` plus a locale subscription in FFI and AppModel (live locale updates), `MarkdownText.swift` (plain-link label, R locale), `DiscordTime.swift` (R in en-US, today header), `MessageArea.swift` (`.equatable()` on the body if `MarkdownView` gets a content-only `==`), tests.
+**Owner:** pilotfish:security-executor, after K3 (merged). **Files:**
+- core `markdown.rs`: `list_marker`, the list trigger set, the mixed-kind rule, step ticks in `list_marker` and `line_end`;
+- `markdown_tests.rs`: list tests, the `d1_lists` predicate, step patterns;
+- core `state.rs` with the smallest FFI and AppModel addition, for live locale updates;
+- `MarkdownText.swift`: the plain-link label in `Numbering`;
+- `MarkdownView.swift`: only the Q5 clause deletion and the stale marker comment at ~180;
+- `DiscordTime.swift`: R in en-US, today header;
+- tests.
 
 | Part | Contract |
 |---|---|
-| Lists | `+` is never a marker. Ordered markers take any number of digits; `start` saturates at 1_000_000_000 (Discord's display), so no overflow and no trap. A marker of the other kind continues the current list, and the list's kind is its first item's. Named tests per row of the K0 table; K1's affected tests updated with the capture as the source. |
-| Plain links | Non-masked links render `Link.url` as their text (canonical, with the empty-path `/`); Q5's visible-equals-canonical check then always holds for them. Masked links unchanged. |
-| R | Always `en-US` regardless of the account locale. |
-| Header | Today → short time only; yesterday/older unchanged until K0b. |
-| Locale updates | USER_SETTINGS_UPDATE reaches `ShellState.locale` without a reconnect (a session event or subscription the app already polls; smallest addition). Also confirm whether Discord sends USER_SETTINGS_UPDATE or only USER_SETTINGS_PROTO_UPDATE under capabilities 253 (K4 verifier A3); if only the proto event, note it and keep READY as the source. |
-| Test gaps | K4 verifier A1 (READY clears an old locale) and A2 (R refresh uses `context.now`); K2 verifier A-2 (accessibility label attached) and A1's S12 (handler returns `.handled`). |
-| Acceptance | All suites, clippy, fmt; differential test still 0 mismatches (lists are D1, so filtered); a fresh verifier with mutants. **Live:** sample 3's `+`, ten-digit and mixed lists, and sample 2's links match the capture. |
+| Lists | `+` leaves both the list trigger set and `list_marker`. Ordered markers take any number of digits: `number = digits.fold(0u32, \|n, d\| n.saturating_mul(10).saturating_add(d)).min(1_000_000_000)`, with no shortcut on digit count and leading zeros counted, as JS `parseInt` does. A marker of the other kind continues the current list; the list's kind is its first item's. `list_marker` and `line_end` tick the step counter, which closes K1 advisory A1 for lists. |
+| Differential predicate | `d1_lists` matches a line-start marker of `-`/`*` + space, or **one or more** digits + `. `. It reads the input text only. The edge sample's `1234567890. 十位數編號` line is counted under D1, and the run still reports 0 mismatches. Reverting to `1..=9` makes the run fail on that line. |
+| Plain links | In `Numbering.inline`'s `.link` case, a non-masked link's label becomes `[.text(url)]` once, used by both `visibleText` and the returned node. The `visibleText + "/" == url` clause in `needsConfirmation` is deleted (now dead). Core labels are unchanged, so the differential fixture stays literal. |
+| R | Always `en-US`, whatever the account locale (K0). |
+| Header | Today → short time only (K0). Yesterday and older unchanged until K0b. |
+| Locale updates | USER_SETTINGS_UPDATE reaches `ShellState.locale` without a reconnect, by the smallest addition (a session event or subscription). If a live session shows Discord sends only USER_SETTINGS_PROTO_UPDATE under capabilities 253, record it and keep READY as the source; add no protobuf decoder. |
+| Test gaps closed | K4 A1 (READY clears an old locale); K4 A2 (R refresh from `context.now`, with now within 60 s); K2 A-2 (accessibility label attached: removing it fails a test); K2 S12 (the handler returns `.handled`). |
+| Named tests | `1234567890. a` → start 1_000_000_000; `00000000000001. a` → 1; 16 KiB of digits + `. a` → 1_000_000_000 with no trap; `+ a` → text; `- b\n1. a` → one unordered list of 2 items; `1. a\n- b` → one ordered list; `https://a.b` shows `https://a.b/`; `https://a.b/ñ` shows `https://a.b/%C3%B1`; an IDN host shows `xn--…` and confirms; a masked link still confirms. Step patterns: a 1 MiB digit run + `. a`, and alternating `- a` / `1. a` lines. |
+| Acceptance | All suites, clippy and fmt pass; differential 0 mismatches; a fresh verifier with mutants (no saturation, `+` back, kind switch ending the list, `visibleText` not using the url, predicate back to 1-9). **Live:** sample 3's `+`, ten-digit and mixed lists, and sample 2's links match the capture. |
 
-## K6 — Vencord-style code blocks with syntect highlighting
+### K5 security dispositions (security review of K5/K6, commit f05eec6)
 
-The user chose Vencord's ShikiCodeblocks look as the default and `syntect` as the highlighter (2026-10-14). **Owner:** pilotfish:security-executor (untrusted text through a regex engine; new dependency), after K5 merges. Main prepares the vendored theme before the slice branches.
+| # | Finding | Disposition |
+|---|---|---|
+| P3-K5-1 | Any-length numbers: the fold must saturate, `+` must leave the trigger set, A1 ticks | FIX (Lists row, tests, step patterns) |
+| P3-K5-2 | Plain links showing `Link.url`: no Q5 exploit (WHATWG output is ASCII, and IDN still confirms); trap if only `visibleText` or only the rendering changes | FIX (Plain links row); ASCII look-alikes REJECT, as in the official client |
+| P4 | Live locale adds no new input; R in en-US has no security effect; stale marker comment | ACCEPT; comment updated in K5 |
+
+## K6 — Vencord-style code blocks with syntect highlighting, revision 2
+
+The user chose Vencord's ShikiCodeblocks look as the default and `syntect` as the highlighter (2026-10-14); the envelope's non-goal "syntax highlighting" is lifted for K6. **Order:** after K5 merges. **Owner:** pilotfish:security-executor. **Files:**
+- `Cargo.toml` and `Cargo.lock` (velella-core only);
+- `crates/velella-core/src/highlight.rs` and `highlight_tests.rs` (new);
+- `crates/velella-core/assets/vscode-dark-plus/` (main vendors it; read-only to the executor);
+- `messages.rs`: `Stored.highlights` at the three body assignments, `history()` parsing before the lock, `row()` attaching highlights to nodes;
+- FFI `markdown.rs`: `MdBlock::CodeBlock` gains `highlight`;
+- `AppModel.swift` mapping;
+- `MarkdownView.swift`: the code-block view only;
+- `THIRD_PARTY_NOTICES.md`.
 
 ### What Vencord does (`refs/vencord/src/plugins/shikiCodeblocks.desktop`, GPL-3.0)
 
 | Part | Value |
 |---|---|
-| Container | Fill `background-base-lower`, radius 4. The highlighted root uses the theme's background. |
-| Header | Shown only when a language is given: the language name, bold and capitalised, with padding 0 5 and 6 below; a colourless devicon 8 before it (`Header.tsx`, `shiki.css`) |
-| Code | 0.875 rem with a 1.125 rem line height and 0.5 em padding. It wraps (`pre-wrap`, `overflow-wrap: anywhere`). |
-| Line numbers | A table with 19 px rows. The number cell has padding 5 left and 8 right, coloured in the theme's plain colour; the code cell has 8 left. |
-| Copy | Appears on hover at the bottom right; "Copy" turns to "Copied!" for a 1 s cooldown (`CopyButton.tsx`, `useCopyCooldown.ts`) |
-| Highlight | Shiki with TextMate grammars and the VS Code Dark+ theme. Unknown languages fall back to plain text in the theme's plain colour. |
+| Container | `background-base-lower` fill, radius 4; the highlighted root uses the theme's background |
+| Header | Shown only when a language resolved: its display name, bold, padding 0 5, 6 below, with a colourless devicon 8 before it (`Header.tsx`, `shiki.css`) |
+| Code | 0.875 rem, line height 1.125 rem, padding 0.5 em; wraps (`pre-wrap`, `overflow-wrap: anywhere`) |
+| Line numbers | Table with 19 px rows; the number cell has padding 5 left and 8 right in the theme's plain colour; the code cell has 8 left |
+| Copy | Appears on hover at the bottom right; "Copy" turns to "Copied!" for a 1 s cooldown |
+
+### Language table (syntect 5.3.0 `load_defaults_newlines()` names, checked 2026-10-14)
+
+| Fence aliases (case-insensitive) | syntect syntax | Header name |
+|---|---|---|
+| `py`, `python`, `py3` | Python | Python |
+| `js`, `javascript`, `jsx`, `mjs`, `cjs` | JavaScript | JavaScript |
+| `ts`, `typescript`, `tsx` | JavaScript (no TypeScript grammar is bundled; closest match) | TypeScript |
+| `rs`, `rust` | Rust | Rust |
+| `sh`, `bash`, `shell`, `zsh`, `console` | Bourne Again Shell (bash) | Shell |
+| `c`, `h` | C | C |
+| `cpp`, `c++`, `cc`, `hpp`, `cxx` | C++ | C++ |
+| `cs`, `csharp`, `c#` | C# | C# |
+| `go`, `golang` | Go | Go |
+| `java` | Java | Java |
+| `json`, `jsonc` | JSON | JSON |
+| `html`, `htm`, `xhtml` | HTML | HTML |
+| `css` | CSS | CSS |
+| `sql` | SQL | SQL |
+| `yaml`, `yml` | YAML | YAML |
+| `xml`, `svg` | XML | XML |
+| `rb`, `ruby` | Ruby | Ruby |
+| `php` | PHP | PHP |
+| `lua` | Lua | Lua |
+| `diff`, `patch` | Diff | Diff |
+| `md`, `markdown` | Markdown | Markdown |
+| `hs`, `haskell` | Haskell | Haskell |
+| `scala` | Scala | Scala |
+| `pl`, `perl` | Perl | Perl |
+| `r` | R | R |
+| `makefile`, `make`, `mk` | Makefile | Makefile |
+| `tex`, `latex` | LaTeX | LaTeX |
+| `clj`, `clojure` | Clojure | Clojure |
+| `erl`, `erlang` | Erlang | Erlang |
+| `ml`, `ocaml` | OCaml | OCaml |
+| `m`, `objc`, `objective-c` | Objective-C | Objective-C |
+| `groovy`, `gradle` | Groovy | Groovy |
+| `bat`, `cmd`, `batch` | Batch File | Batch |
+| `d` | D | D |
+| `pas`, `pascal` | Pascal | Pascal |
+| `tcl` | Tcl | Tcl |
+| `lisp`, `el`, `scm` | Lisp | Lisp |
+| anything else (`swift`, `kotlin`, `toml`, `dockerfile`, …) or none | none | no header; plain text in the theme's plain colour |
+
+Header names come only from this table, never from the fence text (shown with `Text(verbatim:)`). A test asserts that every mapped syntax name exists in `load_defaults_newlines()`.
 
 ### Contract
 
 | Part | Contract |
 |---|---|
-| Dependency | `syntect = { version = "=5.3.0", default-features = false, features = ["parsing", "default-syntaxes", "regex-fancy"] }` in velella-core only. No onig, plist, yaml, html or themes features. `cargo tree` must show no C regex library. Its licence and its new transitive crates are listed in THIRD_PARTY_NOTICES.md. |
-| Theme | Main vendors VS Code's `extensions/theme-defaults/themes/dark_plus.json` and the `dark_vs.json` it includes (microsoft/vscode, MIT) at a pinned commit into `crates/velella-core/assets/`, with the SHA and licence in THIRD_PARTY_NOTICES.md. Core builds a syntect `Theme` from them once (`OnceLock`): merge `include`, then map every `tokenColors` entry's scope selectors, foreground and fontStyle. |
-| Core | New `highlight.rs`: `fn highlight(code: &str, language: Option<&str>) -> Option<Highlighted>`. `Highlighted` has the language display name plus lines of spans; each span carries `text`, `rgb` and `bold`/`italic`/`underline`. The language resolves through Discord's and highlight.js's common aliases (from Vencord's `api/languages.ts`) to a syntect syntax by token or extension. An unknown language, or none, gives `None` and the block renders plain. Computing happens once per message where `Stored.body` is computed (P1-1), stored per code block in document order, and passed through `MessageRow` as a side table. |
-| Limits (untrusted input) | Code ≤ 16384 bytes (already K1's cap) and ≤ 2000 lines; fancy-regex's backtracking limit is kept at its default or lower. A wall-clock budget of 50 ms per block is checked between lines. Any parse error, budget overrun or panic, caught with `catch_unwind` around the call, gives `None` (plain text). Nothing logs. |
-| Swift | `MarkdownView`'s code block view is replaced by the Vencord look in the table above:<br>• a header only when a language resolved, with the display name and an SF Symbol standing in for the devicon (the provisional `chevron.left.forwardslash.chevron.right`, since devicons are a web font);<br>• a line-number column;<br>• wrapped code at 0.875 × body with an 18 pt line height;<br>• the theme background and K3's radius 4;<br>• a hover Copy button writing the plain code to `NSPasteboard`, with a 1 s "Copied!" cooldown.<br>Spoiler cover, container rules and `Equatable` stay as K3 made them. |
-| Tests | Core:<br>• aliases → syntaxes (`py`, `js`, `ts`, `rs`, `swift`, `sh`, unknown);<br>• span colours for a fixed snippet against the Dark+ values;<br>• limits: 2001 lines, a pathological regex input under the budget, an injected panic → `None`;<br>• computed once (not in `row()`).<br>Swift:<br>• header shown only with a language;<br>• line numbers 1…n;<br>• wrapping;<br>• Copy writes the exact code and cools down;<br>• a covered block stays covered.<br>Verifier with mutants. **Live:** sample 2's Python block against Vencord's look (the user can compare with Vencord's ShikiCodeblocks enabled). |
+| Dependency | `syntect = { version = "=5.3.0", default-features = false, features = ["parsing", "default-syntaxes", "regex-fancy"] }` in velella-core only, with `Cargo.lock` committed. Only `SyntaxSet::load_defaults_newlines()` is called: no `from_dump_file`, `from_binary`, `load_from_folder`, `ThemeSet` loading or `find_syntax_by_first_line`. Only the fence selects the grammar. Recorded checks: `cargo tree -p velella-core -e features -i syntect`; `cargo tree -i onig` and `-i onig_sys` empty; `cargo tree -i bincode` shows 1.3.3 via syntect only. THIRD_PARTY_NOTICES rows: syntect; fancy-regex with bit-set/bit-vec; bincode, noting RUSTSEC-2025-0141 (unmaintained; only the bundled dump goes through it); walkdir; fnv; regex-syntax; the sublimehq/Packages grammars; Vencord (`shikiCodeblocks`, GPL-3.0); VS Code (MIT). |
+| Theme | Main vendors `dark_plus.json` and `dark_vs.json` from microsoft/vscode at `1b92929b5683438c738ded7708c5418e9ff476ec` (MIT), converted to strict JSON with comments and trailing commas removed and nothing else changed. Both SHA-256 values go in the assets README and THIRD_PARTY_NOTICES. Core embeds them with `include_str!` and resolves `include` only to the other embedded file. A `scope` may be a string or an array; a selector syntect cannot parse skips that entry only. Background and default foreground come from `colors.editor.background` / `editor.foreground`. The theme is held in a `OnceLock<Option<Theme>>`. Test: the shipped assets build a theme with 0 skipped entries and at least 60 rules, with `#569CD6` on `keyword`. |
+| Computing | `highlight(code, language) -> Option<Highlighted>`, where `Highlighted{name, lines: Vec<Vec<Span{text, rgb, bold, italic, underline}>>}` and adjacent same-style spans are merged. It is computed at every `Stored.body` assignment (`parse`, `merge`, `begin_send`) into `Stored.highlights`, one per code block in core's pre-order walk (blocks, then `Inline::Block`). A nested `referenced_message` is never highlighted. `row()` attaches each highlight to its own `CodeBlock` node while converting that node, so no index table crosses FFI. A core property test, over the corpus and a fuzz set, checks that the spans' concatenated text equals the block's `code`. |
+| Limits (untrusted input) | A block with a line longer than 1024 bytes, more than 2000 lines, or more than 4096 spans after merging gets `None`. One wall-clock budget of 25 ms per message, shared by its blocks, is checked before each line; once it is spent, every remaining block is `None`. The clock starts after the syntax set and theme exist; `highlight::warm()` builds them on a background thread when the message store is created, so the first block is not starved. fancy-regex keeps its default limit of 1,000,000 backtrack steps per search: syntect 5.3.0 has no setter and maps a limit error to no match. That bounds one search, not one line, so the line cap is the real bound. `history()` parses and highlights the fetched list **before** taking the store lock; `observe()` stays under the lock, bounded by the per-message budget. Measured acceptance, in release: on the adversarial corpus (1024-byte runs of `(`, `"\"`, `/*`, `/[`, `a=`, `<a `, `${`, backticks, `\\`, and one long word), through every aliased syntax and through `md`, the worst capped line takes ≤ 10 ms. If it doesn't, lower the cap and record the measured value. A message of 20 maximum-cost blocks finishes under 40 ms in total. |
+| Panics | `catch_unwind(AssertUnwindSafe(...))` wraps only the computation, which writes to locals and returns its value. No velella state is mutated inside it, and a panic discards the whole result (`None`). The workspace never sets `panic = "abort"`. The default panic hook's stderr line is accepted: there is no logger, and stderr is not persisted. Tests: every syntax in `load_defaults_newlines()` highlights a 3-line sample without panicking; an injected panic gives `None`. |
+| Swift view | `MarkdownView`'s code-block view takes the Vencord look:<br>• the header (name from the table, and the SF Symbol `chevron.left.forwardslash.chevron.right`, provisional, standing in for devicons, which are a web font);<br>• a line-number column, only for blocks of ≤ 2000 lines (longer ones keep K3's plain block);<br>• wrapped code at 0.875 × body with an 18 pt line height, on the theme background, radius 4;<br>• for display only, C0 except `\n` and `\t`, DEL, C1 and the bidi controls U+061C, U+200E, U+200F, U+202A-202E and U+2066-2069 drawn as `\u{XXXX}`, as `LinkConfirmation.escaped` does, with ZWJ untouched.<br>Spans are used only when their concatenated text equals the block's `code`; otherwise the block renders plain. Spoiler cover, container rules and `Equatable` stay as K3 left them. |
+| Copy | A hover button at the bottom right writes the AST's `code` exactly: `clearContents()` then `setString(_:forType: .string)`. It never reads the pasteboard and shows "Copied!" for 1 s. There is no Copy control while the block is covered. |
+| Tests | **Core:**<br>• the alias table, every row, including `ts` → JavaScript with the name TypeScript, and `swift` → `None`;<br>• the theme build;<br>• Dark+ colours for a fixed Python snippet;<br>• the concatenation property;<br>• limits: 1025-byte line, 2001 lines, 4097 spans, two slow blocks sharing one budget, injected panic;<br>• the all-syntaxes sweep;<br>• highlights computed at the three assignments and not in `row()`;<br>• the release timing corpus (`#[ignore]`d in debug, run by the verifier in release).<br>**Swift:**<br>• header only with a language;<br>• line numbers 1…n;<br>• wrapping;<br>• escapes shown;<br>• Copy writes the exact code, cools down, and is absent while covered;<br>• a hidden-spoiler code block before a visible one: the visible one shows only its own text.<br>**Verifier mutants:** no line cap, per-block instead of per-message budget, no `catch_unwind`, a Swift index without the equality check, Copy while covered. **Live:** sample 2's Python block against Vencord's look. |
+
+### K6 security dispositions (security review of K5/K6, commit f05eec6)
+
+| # | Finding | Disposition |
+|---|---|---|
+| P1-K6-1 | Highlight cost unbounded, under the store lock | FIX: 1024-byte line cap, 25 ms per-message budget, `history()` before the lock, warm-up off the lock, measured release bounds |
+| P2-K6-2 | The JSONC theme would fail and silently disable highlighting | FIX: strict JSON vendored with SHA-256; string-or-array scopes; colours from `colors`; `OnceLock`; build test |
+| P2-K6-3 | An index side table could attach a hidden block's spans to a visible one | FIX: highlights travel on their own `CodeBlock` node; the concatenation property in core; the equality check in Swift; spoiler-order test |
+| P3-K6-4 | Panic handling conditions | FIX: Panics row |
+| P3-K6-5 | Output size and view count | FIX: 4096-span cap; line-number layout only up to 2000 lines |
+| P3-K6-6 | Copy and invisible control characters | FIX: exact code copied, escapes for display, no Copy while covered |
+| P3-K6-7 | Supply chain | FIX: Dependency row (calls allowed, checks, notices, lockfile) |
+| P4 | Header name source; first-use cost; test timing | FIX: names from the table; `warm()`; release timing tests |
+| P4 | Grammar recursion, deep nesting | REJECT: trusted bundled grammars; syntect caps the stack at 100 |
+
+### Plan review dispositions (plan review of K5/K6 at f05eec6)
+
+| # | Blocker | Disposition |
+|---|---|---|
+| K5-1, K6-1 | No security dispositions | FIX: the two tables above |
+| K5-2 | `d1_lists` would miss the ten-digit line | FIX: Differential predicate row |
+| K6-2 | Outside the envelope; no Files line or ownership | FIX: non-goal lifted, order and Files line added, ownership rows below |
+| K6-3 | No alias table | FIX: language table, with every target checked against syntect's names |
+| K6-4 | Limits do not bound the work | FIX: Limits row |
+| K6-5 | Side-table index alignment | FIX: highlights on the node; equality checks |
+
+### File ownership (K5, K6)
+
+| File | K5 | K6 |
+|---|---|---|
+| `markdown.rs`, `markdown_tests.rs` | list grammar, predicate, ticks | — |
+| `state.rs`, FFI locale route, AppModel locale line | live locale | — |
+| `MarkdownText.swift` | plain-link label | — |
+| `MarkdownView.swift` | Q5 clause, marker comment | code-block view |
+| `DiscordTime.swift` | R, today header | — |
+| `Cargo.toml`/`Cargo.lock`, `highlight.rs`, `highlight_tests.rs`, `assets/` (main vendors) | — | yes |
+| `messages.rs` | — | `Stored.highlights`, `history()` order, `row()` attachment |
+| FFI `markdown.rs`, AppModel mapping | — | `highlight` on `CodeBlock` |
+| `THIRD_PARTY_NOTICES.md` | — | rows above |
