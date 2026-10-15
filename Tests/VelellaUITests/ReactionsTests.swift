@@ -46,7 +46,8 @@ private func pixel(_ image: CGImage, _ x: Int, _ y: Int) -> [UInt8]? {
 @MainActor @Test func aPillIsEmojiThenCountWithTheSpecifiedWidth() throws {
     // Unicode: 6 + 20 + 6 + count + 6. A custom emoji pill has the same frame around its image.
     let text = try #require(render([ReactionItem(name: "\u{1F44D}", count: 5)], width: 200))
-    let image = try #require(render([ReactionItem(name: "x", imageURL: URL(string: "https://cdn.discordapp.com/emojis/1.webp?size=48"), count: 5)], width: 200))
+    // Not a Discord host, so the pill's `.task` never fetches: tests never reach the CDN.
+    let image = try #require(render([ReactionItem(name: "x", imageURL: URL(string: "https://emoji.invalid/1.webp"), count: 5)], width: 200))
     let digit = NSAttributedString(string: "5", attributes: [.font: NSFont.systemFont(ofSize: R.countSize, weight: .semibold)]).size().width
     // The pill's right edge is the last non-transparent column of the render.
     func rightEdge(_ img: CGImage) -> Int {

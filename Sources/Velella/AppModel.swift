@@ -160,6 +160,8 @@ final class AppModel {
         shell.messageLoad = .idle
         shell.older = .idle
         shell.typing = []
+        // A reply target belongs to the conversation it was picked in.
+        shell.reply = nil
     }
 
     /// Follows the shell's own selection binding (the window calls this when it changes).
@@ -216,6 +218,8 @@ final class AppModel {
         shell.messageLoad = .idle
         shell.older = .idle
         shell.typing = []
+        // A reply target belongs to the conversation it was picked in.
+        shell.reply = nil
         guard let target, let handle, let generation else { return }
         messagesChannel = target
         shell.messageLoad = .loading

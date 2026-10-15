@@ -264,6 +264,29 @@ mod tests {
             matches!(&s.older, MessageOlder::Failed { text } if text == "Couldn't load older messages")
         );
         assert_eq!(s.typing, ["Ann", "Bob"]);
+        // Every older state maps to its own case (only Failed is in the snapshot above).
+        let older = |o| {
+            MessagesSnapshot::from(velella_core::MessagesSnapshot {
+                channel_id: 9,
+                load: velella_core::LoadState::Loaded,
+                rows: vec![],
+                older: o,
+                typing: vec![],
+            })
+            .older
+        };
+        assert!(matches!(
+            older(velella_core::OlderState::Idle),
+            MessageOlder::Idle
+        ));
+        assert!(matches!(
+            older(velella_core::OlderState::Loading),
+            MessageOlder::Loading
+        ));
+        assert!(matches!(
+            older(velella_core::OlderState::ReachedStart),
+            MessageOlder::ReachedStart
+        ));
         let r = &s.rows[0];
         assert_eq!(
             (
