@@ -19,6 +19,10 @@ private func splitViews(in view: NSView) -> [NSSplitView] {
         contentRect: NSRect(x: 0, y: 0, width: minWidth, height: 800),
         styleMask: [.titled, .resizable, .fullSizeContentView], backing: .buffered, defer: false
     )
+    // A window made in code defaults to releasing itself on close; under ARC that is one release
+    // too many, and the over-release crashed the suite in an autorelease pool pop (shown with
+    // NSZombieEnabled by the N0 spike, 2026-10-15).
+    window.isReleasedWhenClosed = false
     window.contentViewController = NSHostingController(rootView: ShellView(state: .constant(.demo)))
     // Suspends instead of pumping RunLoop.main: a pump inside this main-actor job ran other
     // main-actor tests' jobs nested in it, and the suite crashed (EXC_BAD_ACCESS in an
