@@ -53,7 +53,7 @@ Main merged the three track branches into `wave3-int` and resolved their conflic
 | K6 snapshot lock hold at CAP 1000 measured 2.3-3.9 ms against 5 ms (A5, P4) | Noted |
 | Swift cost at 1000 rows: `MessageItem.live` 1.61 ms, `MessageGrouping.entries` 3.85 ms (debug) | Measured |
 
-## E — Embeds and media (SECURITY slice), revision 1.1
+## E — Embeds and media (SECURITY slice), revision 1.2
 
 Revision 1.1 folds in E's plan review (REVISE, 2 blockers) and security review (E-1 … E-17, no P0/P1); both tables follow the contract. F11 (the image host allow-list deferred from M2 to "the embeds milestone") is closed here for attachments too.
 
@@ -110,3 +110,20 @@ Revision 1.1 folds in E's plan review (REVISE, 2 blockers) and security review (
 | E-16 (P4) | Colour | FIX: What is parsed row |
 | E-17 (P4) | Emoji and mentions in embeds | FIX: Budgets row (emoji cap); mentions resolve by the AST walk |
 | Privacy | Proxy-only matches the official client | ACCEPT; User-Agent difference DEFER |
+
+## E verification (merged into m1 at 99068d3, 2026-10-15)
+
+A fresh verifier CONFIRMED E: every contract row, the Tests cell and the disposition tables; all eleven planned mutants killed (plus cookie, attachment-host and Swift-port mutants); no Discord host contacted during `swift test` (probes in `MediaImages` and `EmojiImages`); the streaming cap runs off the main thread. Core 306, FFI 13, UI 174, login 17.
+
+| Advisory (not blocking) | Status |
+|---|---|
+| A1 (P4): the 20000 × 20000 PNG is header-only, so only the 8000 × 8000 test catches a missing pixel cap | Open |
+| A2 (P4): the test seam rewrites the foreign redirect target too, so "never contacts it" can't fail; the image expectations kill the mutant | Open |
+| A3 (P3): no test covers the attachment spoiler cover in the view itself (needs a loader parameter on `ImageAttachmentView`) | Open |
+| A4 (P4): `provider.name` and image alt text are uncapped and outside the 6000 budget | Open |
+| A5 (P4): `@State revealed` in `EmbedView` / `ImageAttachmentView` is keyed by `ForEach` offset, so an edit swapping one spoilered embed for another could show it revealed | Open, fix with the next touch of those views |
+| A6 (P4): the byte cap streams one byte per iteration (~1 s CPU per 16 MiB, off the main thread) | Open |
+| A7 (P4): the no-`evil.test` assertion runs on core's row, not the FFI row (the conversion copies field for field) | Noted |
+| Descriptions render at 16 pt (`MarkdownView` has no size parameter), Discord uses 14 | With N1 |
+| Live (user): spoilered-link embeds, markdown in titles and field names, display maxima, proxy resize parameters, the 80 pt cover, the card look | Pending |
+
