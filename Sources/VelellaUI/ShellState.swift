@@ -382,6 +382,8 @@ public struct ShellState: Equatable, Sendable {
     /// environment as `discordLocale`. Not the Discord account's: READY's legacy
     /// `user_settings.locale` was stale against the official client (P1).
     public var locale: String
+    /// Older-history state of the open channel's messages (wave 3 P).
+    public var older: OlderState = .idle
 
     public init(
         rail: [RailItem] = [], selectedRailID: String? = nil, serverName: String? = nil,

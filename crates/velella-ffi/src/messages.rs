@@ -21,6 +21,18 @@ pub enum MessageLoad {
     },
 }
 
+/// Older-history state of the open channel.
+#[derive(uniffi::Enum)]
+pub enum MessageOlder {
+    Idle,
+    Loading,
+    ReachedStart,
+    /// Fixed text.
+    Failed {
+        text: String,
+    },
+}
+
 #[derive(uniffi::Record)]
 pub struct MessageImage {
     pub url: String,
@@ -62,11 +74,23 @@ pub struct MessageRow {
 pub struct MessagesSnapshot {
     pub load: MessageLoad,
     pub rows: Vec<MessageRow>,
+    pub older: MessageOlder,
 }
 
 /// Dropping this leaves the channel: deliveries stop and an in-flight history fetch is cancelled.
 #[derive(uniffi::Object)]
-pub struct MessageSubscription(#[allow(dead_code)] velella_core::MessageSubscription);
+pub struct MessageSubscription(velella_core::MessageSubscription);
+
+#[uniffi::export]
+impl MessageSubscription {
+    /// Asks for the 50 messages before the oldest buffered one. Core ignores it unless the first
+    /// page is in and no older page is loading or the start reached; the result arrives as a
+    /// snapshot.
+    pub fn load_older(&self) {
+        let _context = runtime().enter();
+        self.0.load_older();
+    }
+}
 
 #[uniffi::export]
 impl SessionHandle {
@@ -105,6 +129,14 @@ impl From<velella_core::MessagesSnapshot> for MessagesSnapshot {
                 },
             },
             rows: s.rows.into_iter().map(Into::into).collect(),
+            older: match s.older {
+                velella_core::OlderState::Idle => MessageOlder::Idle,
+                velella_core::OlderState::Loading => MessageOlder::Loading,
+                velella_core::OlderState::ReachedStart => MessageOlder::ReachedStart,
+                velella_core::OlderState::Failed(text) => MessageOlder::Failed {
+                    text: text.to_owned(),
+                },
+            },
         }
     }
 }
@@ -187,9 +219,13 @@ mod tests {
             channel_id: 9,
             load: velella_core::LoadState::Failed("Couldn't load messages"),
             rows: vec![row],
+            older: velella_core::OlderState::Failed("Couldn't load older messages"),
         });
         assert!(
             matches!(&s.load, MessageLoad::Failed { text } if text == "Couldn't load messages")
+        );
+        assert!(
+            matches!(&s.older, MessageOlder::Failed { text } if text == "Couldn't load older messages")
         );
         let r = &s.rows[0];
         assert_eq!(

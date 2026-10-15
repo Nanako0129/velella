@@ -166,18 +166,19 @@ async fn a_delete_during_the_fetch_is_not_undone_by_the_history() {
 }
 
 #[tokio::test]
-async fn the_201st_message_evicts_the_oldest() {
+async fn the_1001st_message_evicts_the_oldest() {
     let (_mock, store) = serve(&[ok(&json!([]))]).await;
     let epoch = store.open(5);
     settled(&store, epoch).await;
-    for id in 1..=200 {
+    assert_eq!(CAP, 1000);
+    for id in 1..=1000 {
         store.observe("MESSAGE_CREATE", &msg(id, 5, "x"));
     }
-    assert_eq!(now(&store, epoch).rows.len(), 200);
-    store.observe("MESSAGE_CREATE", &msg(201, 5, "x"));
+    assert_eq!(now(&store, epoch).rows.len(), 1000);
+    store.observe("MESSAGE_CREATE", &msg(1001, 5, "x"));
     let s = now(&store, epoch);
-    assert_eq!(s.rows.len(), 200);
-    assert_eq!((s.rows[0].id, s.rows[199].id), (2, 201));
+    assert_eq!(s.rows.len(), 1000);
+    assert_eq!((s.rows[0].id, s.rows[999].id), (2, 1001));
 }
 
 #[tokio::test]
@@ -1260,7 +1261,7 @@ async fn release_contended_observe() {
     if cfg!(debug_assertions) {
         panic!("run in release: the numbers are for the shipped build");
     }
-    // 200 messages, each one block of 64 lines × 64 characters with one span per character
+    // `CAP` messages, each one block of 64 lines × 64 characters with one span per character
     // (4096 synthetic spans), applied through `apply`.
     let code = vec!["x".repeat(64); 64].join("\n");
     let spans = Arc::new(Highlighted {
@@ -1281,7 +1282,7 @@ async fn release_contended_observe() {
     });
     let (_m, store, epoch) = opened(json!([])).await;
     let content = fenced(&[("py", &code)]);
-    for id in 1001..=1200u64 {
+    for id in 1001..(1001 + CAP as u64) {
         store.observe("MESSAGE_CREATE", &msg(id, 5, &content));
     }
     while let Some(job) = store.next_job() {
@@ -1315,7 +1316,7 @@ async fn release_contended_observe() {
         })
     };
     std::thread::sleep(Duration::from_millis(50));
-    // 100 CREATEs of older messages: each is parsed, inserted and evicted again, so the 200
+    // 100 CREATEs of older messages: each is parsed, inserted and evicted again, so the `CAP`
     // highlighted messages stay.
     let mut worst = Duration::ZERO;
     for id in 1..=100u64 {
@@ -1333,4 +1334,210 @@ async fn release_contended_observe() {
     );
     assert!(worst <= Duration::from_millis(5), "{worst:?}");
     assert!(longest <= Duration::from_millis(5), "{longest:?}");
+}
+
+// ---- Older history (wave 3 P) ----
+
+/// A full page of 50 messages, newest first, ids `newest` down to `newest - 49`.
+fn page_down_from(newest: u64) -> Value {
+    Value::Array(
+        (0..PAGE as u64)
+            .map(|i| msg(newest - i, 5, "old"))
+            .collect(),
+    )
+}
+
+/// Channel 5 open with a full first page of ids 51..=100 (so the start is not reached) and the
+/// scripted `next` responses behind it.
+async fn full_first_page(next: &[String]) -> (MockHttp, Arc<MessageStore>, u64) {
+    let mut script = vec![ok(&page_down_from(100))];
+    script.extend_from_slice(next);
+    let (mock, store) = serve(&script).await;
+    let epoch = store.open(5);
+    let s = settled(&store, epoch).await;
+    assert_eq!((s.rows.len(), s.older), (50, OlderState::Idle));
+    (mock, store, epoch)
+}
+
+/// The snapshot once the older fetch is no longer running.
+async fn older_settled(store: &MessageStore, epoch: u64) -> MessagesSnapshot {
+    let mut revision = store.revision.subscribe();
+    timeout(WAIT, async {
+        loop {
+            let s = now(store, epoch);
+            if s.older != OlderState::Loading {
+                return s;
+            }
+            revision.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("older page never settled")
+}
+
+#[tokio::test]
+async fn the_older_get_carries_before_the_oldest_buffered_id_and_the_token_once() {
+    let (mock, store, epoch) = full_first_page(&[ok(&json!([]))]).await;
+    store.load_older(epoch);
+    assert_eq!(now(&store, epoch).older, OlderState::Loading);
+    older_settled(&store, epoch).await;
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests[0].starts_with("GET /api/v9/channels/5/messages?limit=50 HTTP/1.1\r\n"),
+        "{}",
+        requests[0]
+    );
+    assert!(
+        requests[1].starts_with("GET /api/v9/channels/5/messages?limit=50&before=51 HTTP/1.1\r\n"),
+        "{}",
+        requests[1]
+    );
+    assert_eq!(requests[1].matches(MARKER).count(), 1);
+}
+
+#[tokio::test]
+async fn an_older_page_merges_ascending_without_duplicates() {
+    // Newest first, with a repeated id and one id already buffered (51).
+    let mut older = page_down_from(51).as_array().unwrap().clone();
+    older.insert(3, older[3].clone());
+    let (_mock, store, epoch) = full_first_page(&[ok(&Value::Array(older))]).await;
+    // A live copy of 51 is the one kept: the older page must not overwrite it.
+    store.observe("MESSAGE_CREATE", &msg(51, 5, "live"));
+    store.load_older(epoch);
+    let s = older_settled(&store, epoch).await;
+    assert_eq!(ids(&s), (2..=100).collect::<Vec<u64>>());
+    assert_eq!(s.rows[49].content, "live");
+    assert_eq!(s.rows[0].content, "old");
+    assert_eq!(s.older, OlderState::Idle, "a full page: more may be older");
+}
+
+#[tokio::test]
+async fn an_id_deleted_while_the_older_page_loads_does_not_come_back() {
+    let (_mock, store, epoch) = full_first_page(&[ok(&page_down_from(50))]).await;
+    store.load_older(epoch);
+    store.observe("MESSAGE_DELETE", &json!({"id": "30", "channel_id": "5"}));
+    let s = older_settled(&store, epoch).await;
+    assert_eq!(s.rows.len(), 99);
+    assert!(!ids(&s).contains(&30));
+    // The skip list is per fetch: a later delete-free page is not affected by it.
+    assert!(store.lock().open.as_ref().unwrap().deleted.is_empty());
+}
+
+#[tokio::test]
+async fn a_short_page_marks_the_start_and_nothing_more_is_requested() {
+    let short = json!([msg(50, 5, "a"), msg(49, 5, "b")]);
+    let (mock, store, epoch) = full_first_page(&[ok(&short)]).await;
+    store.load_older(epoch);
+    let s = older_settled(&store, epoch).await;
+    assert_eq!((s.rows.len(), s.older), (52, OlderState::ReachedStart));
+    store.load_older(epoch);
+    store.load_older(epoch);
+    tokio::task::yield_now().await;
+    assert_eq!(mock.count(), 2);
+    assert_eq!(now(&store, epoch).older, OlderState::ReachedStart);
+}
+
+#[tokio::test]
+async fn a_short_first_page_is_already_the_start() {
+    let (mock, store, epoch) = opened(json!([msg(10, 5, "a")])).await;
+    assert_eq!(now(&store, epoch).older, OlderState::ReachedStart);
+    store.load_older(epoch);
+    tokio::task::yield_now().await;
+    assert_eq!(mock.count(), 1);
+}
+
+#[tokio::test]
+async fn no_second_request_while_loading_and_none_before_the_first_page() {
+    let (mock, store, epoch) = full_first_page(&[ok(&page_down_from(50))]).await;
+    store.load_older(epoch);
+    store.load_older(epoch);
+    store.load_older(epoch);
+    older_settled(&store, epoch).await;
+    assert_eq!(mock.count(), 2, "one older GET for three asks");
+    // While the first page is still loading nothing is asked.
+    let (mock, store) = serve(&[ok(&page_down_from(100))]).await;
+    let epoch = store.open(5);
+    store.load_older(epoch);
+    assert_eq!(now(&store, epoch).older, OlderState::Idle);
+    settled(&store, epoch).await;
+    assert_eq!(mock.count(), 1);
+}
+
+#[tokio::test]
+async fn a_buffer_without_room_for_another_page_is_not_asked_and_counts_as_the_start() {
+    let (mock, store, epoch) = full_first_page(&[]).await;
+    // 50 buffered, + 900 live = 950: exactly room for one more page of 50.
+    for id in 101..=1000 {
+        store.observe("MESSAGE_CREATE", &msg(id, 5, "x"));
+    }
+    assert_eq!(now(&store, epoch).rows.len(), CAP - PAGE);
+    // 951 buffered: 951 + 50 > CAP.
+    store.observe("MESSAGE_CREATE", &msg(1001, 5, "x"));
+    assert_eq!(now(&store, epoch).rows.len(), CAP - PAGE + 1);
+    store.load_older(epoch);
+    tokio::task::yield_now().await;
+    assert_eq!(now(&store, epoch).older, OlderState::ReachedStart);
+    assert_eq!(mock.count(), 1, "the page was not requested");
+}
+
+#[tokio::test]
+async fn a_buffer_with_room_for_exactly_one_page_asks_and_stays_within_the_cap() {
+    let (mock, store, epoch) = full_first_page(&[ok(&page_down_from(50))]).await;
+    for id in 101..=1000 {
+        store.observe("MESSAGE_CREATE", &msg(id, 5, "x"));
+    }
+    assert_eq!(now(&store, epoch).rows.len(), CAP - PAGE);
+    store.load_older(epoch);
+    let s = older_settled(&store, epoch).await;
+    assert_eq!((s.rows.len(), s.older), (CAP, OlderState::Idle));
+    assert_eq!((s.rows[0].id, s.rows[CAP - 1].id), (1, 1000));
+    assert_eq!(mock.count(), 2);
+    // Now full: the next ask is the start.
+    store.load_older(epoch);
+    assert_eq!(now(&store, epoch).older, OlderState::ReachedStart);
+}
+
+#[tokio::test]
+async fn a_failed_older_page_keeps_the_rows_and_a_retry_succeeds() {
+    let failing = response(500, "", "");
+    let (mock, store, epoch) = full_first_page(&[failing, ok(&page_down_from(50))]).await;
+    store.load_older(epoch);
+    let s = older_settled(&store, epoch).await;
+    assert_eq!(s.older, OlderState::Failed("Couldn't load older messages"));
+    assert_eq!(s.rows.len(), 50, "the rows stay");
+    assert_eq!(s.load, LoadState::Loaded);
+    store.load_older(epoch);
+    assert_eq!(now(&store, epoch).older, OlderState::Loading);
+    let s = older_settled(&store, epoch).await;
+    assert_eq!((s.rows.len(), s.older), (100, OlderState::Idle));
+    assert_eq!(mock.count(), 3);
+    assert!(
+        mock.requests()[2].contains("&before=51 "),
+        "retry asks for the same page"
+    );
+}
+
+#[tokio::test]
+async fn an_older_result_for_a_closed_epoch_is_dropped() {
+    let (mock, store, epoch) = full_first_page(&[]).await;
+    store.load_older(epoch);
+    // Leave, then open another channel; the late result of the first one arrives afterwards.
+    store.close(epoch);
+    let other = store.open(6);
+    store.older_page(epoch, Ok(vec![msg(40, 5, "late")]));
+    store.older_page(epoch, Err(RestError::Failed));
+    let s = now(&store, other);
+    assert_eq!((s.channel_id, s.older), (6, OlderState::Idle));
+    assert!(s.rows.is_empty());
+    store.load_older(epoch);
+    // Leaving cancelled the in-flight older GET before it ran, and the closed epoch's ask is
+    // ignored: the only requests are the first page and the other channel's history.
+    settled(&store, other).await;
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests.iter().all(|r| !r.contains("before=")),
+        "{requests:?}"
+    );
 }
