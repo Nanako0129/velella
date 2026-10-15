@@ -243,3 +243,14 @@ private let box = CGSize(width: 100, height: 50)
     let under = MediaImages.decode(png(width: 7000, height: 7000), maxSide: 200)
     #expect(under.map { Swift.max($0.width, $0.height) } == 200)
 }
+
+@Test func aURLFailingTheCheckIsNeverFetched() async throws {
+    // The seam would carry any of these to the local server: the loader must refuse first.
+    let server = try LocalServer(Array(repeating: response(body: png(width: 10, height: 10)), count: 3))
+    let loader = MediaImages(rewrite: server.rewrite)
+    for raw in ["https://evil.test/a.png", "http://media.discordapp.net/a.png", "https://media.discordapp.net:8443/a.png"] {
+        #expect(await loader.image(URL(string: raw)!, box: box, scale: 2) == nil, "\(raw)")
+    }
+    try await Task.sleep(for: .milliseconds(100))
+    #expect(server.requests.isEmpty)
+}
