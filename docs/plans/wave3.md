@@ -40,6 +40,19 @@ Repo: /Users/nanako/side-project/velella, branch `m1`. The user asked for faster
 | FFI/Swift | `MessageRow.reactions` → `MessageItem.reactions`. A new `ReactionsView` under the message (after attachments and embeds): pills with radius 8, padding 2×6, emoji 20 pt, count 14 pt semibold with 6 before it, 4 between pills; `me` pills use Discord's brand-tinted fill and border; custom emoji through `EmojiImages`, unicode emoji as verbatim text; read-only (no click) |
 | Tests | Parse; each live event; `me` from self events only; zero removes; cap 20; events for other channels or unbuffered messages ignored. Swift: pill layout values; `me` styling; verbatim emoji name |
 
+## P, R, X verification (merged into m1 at f587cb0, 2026-10-15)
+
+Main merged the three track branches into `wave3-int` and resolved their conflicts by hand (snapshot, store and FFI fields, `ShellView`/`MessageArea` parameters, `VelellaApp` wiring, the test files). A fresh verifier at 5a3f209 found every row's tests present and passing, 21 of 25 mutants killed, and the hand-resolved spots correct, but REFUTED on F1 (P2): `ReactionsTests` rendered a pill with a Discord CDN emoji URL, so every `swift test` sent a real GET to the CDN. f587cb0 moved that test to a non-Discord host, added an FFI assertion for every older state (its surviving mutant is now killed) and clears `shell.reply` wherever the conversation resets. A second fresh verifier CONFIRMED: no `EmojiImages.load` call during `swift test` (probe, with a positive control), the mutant killed, core 285, FFI 13, UI 149, login 17.
+
+| Advisory (not blocking) | Status |
+|---|---|
+| The reply bar's `Text(verbatim:)` half has no test (A1, P3) | Open; read correct |
+| The typing expiry timer's wiring has no test (A2, P3) | Open; read correct |
+| `VelellaApp`'s `onLoadOlder` wiring has no automated test (A3) | Main's live check |
+| No entry point sets `shell.reply`, so replying can't be reached live | Open; the C1 menu (selection plan) adds Reply, or a stopgap |
+| K6 snapshot lock hold at CAP 1000 measured 2.3-3.9 ms against 5 ms (A5, P4) | Noted |
+| Swift cost at 1000 rows: `MessageItem.live` 1.61 ms, `MessageGrouping.entries` 3.85 ms (debug) | Measured |
+
 ## E — Embeds and media (SECURITY slice), revision 1.1
 
 Revision 1.1 folds in E's plan review (REVISE, 2 blockers) and security review (E-1 … E-17, no P0/P1); both tables follow the contract. F11 (the image host allow-list deferred from M2 to "the embeds milestone") is closed here for attachments too.
