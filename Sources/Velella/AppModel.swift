@@ -158,6 +158,7 @@ final class AppModel {
         messagesChannel = nil
         shell.messages = []
         shell.messageLoad = .idle
+        shell.older = .idle
     }
 
     /// Follows the shell's own selection binding (the window calls this when it changes).
@@ -197,6 +198,12 @@ final class AppModel {
 
     // MARK: Messages
 
+    /// The user reached the top: asks core for the page before the oldest shown. Core ignores it
+    /// unless that is useful (first page in, no older GET running, start not reached).
+    func loadOlder() {
+        messagesSub?.loadOlder()
+    }
+
     /// Opens `target`'s messages (nil: none) unless it is already open.
     private func openMessages(_ target: UInt64?) {
         guard !isDemo, target != messagesChannel else { return }
@@ -205,6 +212,7 @@ final class AppModel {
         messagesChannel = nil
         shell.messages = []
         shell.messageLoad = .idle
+        shell.older = .idle
         guard let target, let handle, let generation else { return }
         messagesChannel = target
         shell.messageLoad = .loading
@@ -229,6 +237,12 @@ final class AppModel {
         shell.messageLoad = switch snapshot.load {
         case .loading: .loading
         case .loaded: .loaded
+        case .failed(let text): .failed(text)
+        }
+        shell.older = switch snapshot.older {
+        case .idle: .idle
+        case .loading: .loading
+        case .reachedStart: .reachedStart
         case .failed(let text): .failed(text)
         }
     }

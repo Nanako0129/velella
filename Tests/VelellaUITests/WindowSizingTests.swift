@@ -19,6 +19,8 @@ private func splitViews(in view: NSView) -> [NSSplitView] {
         contentRect: NSRect(x: 0, y: 0, width: minWidth, height: 800),
         styleMask: [.titled, .resizable, .fullSizeContentView], backing: .buffered, defer: false
     )
+    // ARC owns the window: the default (released when closed) would release it once more at `close()`.
+    window.isReleasedWhenClosed = false
     window.contentViewController = NSHostingController(rootView: ShellView(state: .constant(.demo)))
     // Suspends instead of pumping RunLoop.main: a pump inside this main-actor job ran other
     // main-actor tests' jobs nested in it, and the suite crashed (EXC_BAD_ACCESS in an

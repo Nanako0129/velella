@@ -18,7 +18,13 @@ struct MessageArea: View {
     @Binding var reply: ReplyPreview?
     @Binding var draft: String
     var onSend: ((String) -> Void)?
+    /// Older-history state and the request for the next page (wave 3 P); see `OlderMessages.swift`.
+    var older: OlderState = .idle
+    var onLoadOlder: (() -> Void)?
     @State private var columnWidth: CGFloat = 0
+    /// The topmost message row (or divider) in view, kept by SwiftUI as the list scrolls. Binding it
+    /// makes the scroll view hold that row at its place when older rows are prepended.
+    @State private var topID: String?
 
     var body: some View {
         if header != nil {
@@ -29,15 +35,23 @@ struct MessageArea: View {
                 } else {
                     ScrollView {
                         // Rows carry their own 16 pt inset, padding and group spacing (T1).
-                        LazyVStack(alignment: .leading, spacing: 0) {
+                        VStack(alignment: .leading, spacing: 0) {
+                            // Outside the scroll target layout: a position kept across a prepend is
+                            // always a message row's, never this fixed-height header's.
                             LoadStatus(load: load)
-                            ForEach(MessageGrouping.entries(messages)) { entry in
-                                switch entry {
-                                case .divider(_, let date): DateDivider(date: date)
-                                case .row(let message, let startsGroup, let afterDivider):
-                                    MessageRow(message: message, startsGroup: startsGroup, afterDivider: afterDivider)
+                            OlderRow(older: older, onRetry: onLoadOlder)
+                            LazyVStack(alignment: .leading, spacing: 0) {
+                                let entries = MessageGrouping.entries(messages)
+                                ForEach(entries) { entry in
+                                    switch entry {
+                                    case .divider(_, let date): DateDivider(date: date)
+                                    case .row(let message, let startsGroup, let afterDivider):
+                                        MessageRow(message: message, startsGroup: startsGroup, afterDivider: afterDivider)
+                                            .onAppear { if entry.id == entries.first?.id, older == .idle { onLoadOlder?() } }
+                                    }
                                 }
                             }
+                            .scrollTargetLayout()
                         }
                         .padding(.bottom, T.Spacing.lg)
                         .background(OverlayScrollerEnforcer())
@@ -47,11 +61,14 @@ struct MessageArea: View {
                         .environment(\.tooltipContainer, CGRect(x: 0, y: 0, width: columnWidth, height: 1e7))
                     }
                     .defaultScrollAnchor(.bottom)
+                    .scrollPosition(id: $topID, anchor: .top)
                     // Messages pass under the toolbar through a glass band with a hard lower edge, on a
                     // darker pane than the translucent sidebar (Swiftcord v2, user's captures 2026-10-13).
                     .scrollEdgeEffectStyle(.hard, for: .top)
                 }
             }
+            // Another conversation starts at its bottom, not at a row of the last one.
+            .onChange(of: conversationID) { topID = nil }
             .safeAreaInset(edge: .bottom) { Composer(reply: $reply, draft: $draft, onSend: onSend) }
             // Under the toolbar too, so the toolbar band carries the pane's tint (a band of bare
             // window material over the messages read as a separate, lighter strip).
