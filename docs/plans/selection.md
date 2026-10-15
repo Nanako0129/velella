@@ -1,4 +1,4 @@
-# velella Selection and Copy Plan (revision 1.1)
+# velella Selection and Copy Plan (revision 1.2)
 
 Repo: /Users/nanako/side-project/velella, branch `m1`. `docs/plans/markdown.md` still applies: its F5 rendering rules, link confirmation, spoiler and bidi rules, and every K/T/P contract this plan moves to a new renderer. The ground truth is `docs/element-map.md` (captures in git-excluded `refs/`).
 
@@ -11,7 +11,7 @@ The user asked for message copy (2026-10-15: "現在都沒辦法複製對吧？"
 - N0 builds both a configured NSTextView and a custom TextKit 2 view, and the user picks from the numbers ("N0 兩種都做，看數字決定");
 - the copied header follows the official line breaks ("照官方換行").
 
-Revision 1.1 folds in the plan review of rev 1 (REVISE, 7 blockers) and the security review of rev 1 (1 P1, 9 P2, 7 P3, 3 P4); both disposition tables are at the end.
+Revision 1.1 folds in the plan review of rev 1 (REVISE, 7 blockers) and the security review of rev 1 (1 P1, 9 P2, 7 P3, 3 P4). Revision 1.2 folds in the plan review of rev 1.1 (REVISE, 10 blockers on N0's harness); at that review cap the user chose to fix and start N0 without another round (2026-10-15: "修正後直接做 N0"). All disposition tables are at the end.
 
 ## Envelope
 
@@ -27,7 +27,7 @@ Revision 1.1 folds in the plan review of rev 1 (REVISE, 7 blockers) and the secu
 | Checkpoints | One commit per slice after its verifier; main merges into m1 and pushes main (auto-commit workflow). |
 | Rollback | Each slice is a merge commit; `git revert -m 1`. |
 | Budget | At most 2 executor passes per slice, then main takes over or asks. |
-| Stops | N0 shows that neither prototype can hold N0-1, N0-7 or N0-10, or that both are more than 2× slower than today on an N0-6 metric: main brings the options to the user before revision 2. |
+| Stops | No prototype is eligible (N0's eligibility rule), or every eligible one is more than 2× slower than today on an N0-6 metric: main brings the options to the user before revision 2. |
 
 ## Decisions
 
@@ -38,15 +38,23 @@ Revision 1.1 folds in the plan review of rev 1 (REVISE, 7 blockers) and the secu
 | D3 | A selection that crosses into a message emits its header as two lines, `name` then ` — time` (the displayed header time), as the official client does without the badge line velella doesn't show; then the body. Messages are separated by one newline | User ("照官方換行") |
 | D4 | Every copy path writes plain text only: one writer does `clearContents()` then `setString(_:forType: .string)` (`CopyFeedback.copy`); no RTF, RTFD, URL or attributed type | Security (S-6) |
 | D5 | Menu row pitch 36 pt (measured at 1× in `e0-menu-other.png`); CSS: label row min-height 32, padding 8, item radius 2, separators 1 pt with 8 above and below; icons as SF Symbols sized from the capture; on a glass panel | User + E0 |
-| D6 | The text view is either **A**, a configured `NSTextView(usingTextLayoutManager: true)`, or **B**, a custom `NSView` driving `NSTextLayoutManager` + `NSTextContentStorage` itself. N0 builds both; the user picks from N0's report | User |
+| D6 | The text view is either **A**, a configured `NSTextView(usingTextLayoutManager: true)`, or **B**, a custom `NSView` driving `NSTextLayoutManager` + `NSTextContentStorage` itself. N0 builds both; the user picks among the eligible ones (N0's eligibility rule) from N0's report | User |
 
 ## N0 — Spike (no merge)
 
-**Goal:** answer every question below for both A and B, with numbers. **Owner:** pilotfish:executor in a worktree; nothing from it merges. **Files:** a throwaway `Sources/VelellaUI/Spike/` folder and throwaway `Tests/VelellaUITests/Spike*Tests.swift`; everything else is read-only.
+**Goal:** answer every question below for both A and B, with numbers. **Owner:** pilotfish:executor in a worktree; nothing from it merges. **Files** (all throwaway): a `Sources/VelellaUI/Spike/` folder; `Tests/VelellaUITests/Spike*Tests.swift`; a seam in `ParagraphView.swift` that inserts an image into `EmojiImages.loaded` for a URL (no fetch); a `--spike A|B` launch switch in `Sources/Velella/VelellaApp.swift` that opens a window over the N0-6 corpus with the N0-16 coordinator and no Discord connection. Everything else is read-only.
 
-**Harness.** Every measurement runs under `swift test` in an offscreen borderless `NSWindow` hosting an `NSHostingView` (the precedent is `MarkdownTests.swift:494-495`), never a launched app. Pixels are read with `cacheDisplay(in:to:)` on the hosting view. Mouse input is synthesized as `NSEvent`s sent to that window; where a tracking loop cannot be driven that way, the report says so and the case moves to main's live check U3.
+**Harness.**
+- Every measurement runs under `swift test` in an offscreen `NSWindow` subclass hosting an `NSHostingView` (precedent: `MarkdownTests.swift:494-495`), never a launched app.
+- **Key state:** the subclass's `canBecomeKey` and `isKeyWindow` are switchable; the test sets the text view first responder with `makeFirstResponder`; every row that depends on the state asserts `isKeyWindow` and the first responder, never assumes them.
+- **Copy:** "⌘C" and native copy mean `copy:` sent to an explicit target (the text view or the coordinator), never `NSApp.sendAction(_:to: nil, …)`. Every copy writes to a pasteboard injected by the test (production default `.general`); `NSPasteboard.general.changeCount` is recorded before and after the whole suite and must not change.
+- **No system side effects:** no test calls a default that speaks, prints, writes the find pasteboard or opens a panel (`startSpeaking`, `print`, `takeFindStringFromSelection`, `quickLook(with:)`, `performTextFinderAction`, `performFindPanelAction`). Those are observed only through validation results and override hit counters (N0-11); anything that needs a real call goes to U1.
+- **No network:** corpus emoji use URLs on a non-Discord host, so `EmojiImages.fetchable` is false and no fetch starts; their images come from the seam, for today's renderer and for A and B alike.
+- Pixels are read with `cacheDisplay(in:to:)` on the hosting view. Mouse input is synthesized as `NSEvent`s sent to that window; where a tracking loop cannot be driven that way, the report says so and the case moves to U3.
 
 **Release run.** `swift test -c release -Xswiftc -enable-testing --filter Spike`. If SwiftPM rejects it, the report records the error and runs every timing in debug instead, with the same N on every side.
+
+**Eligibility.** A prototype is eligible for D6 only if it passes N0-1, N0-7, N0-10, N0-12 and N0-13, and for A also N0-11. Each failed eligibility row goes to the user as a named revision-2 blocker. The stop fires when no prototype is eligible; the user picks only among eligible ones.
 
 **Corpus for N0-6** (built in the test from `MessageItem`; 200 rows in this repeating order):
 
@@ -67,13 +75,13 @@ Revision 1.1 folds in the plan review of rev 1 (REVISE, 7 blockers) and the secu
 | N0-3 | Block layout | One message with a heading, subtext, a quote, a nested ordered and bullet list and a trailing break: (a) in one text view without `NSTextBlock`/`NSTextTable`, (b) as one text view per block inside today's SwiftUI block layout. Name the technique for quote bars, list markers and block margins | Height within 1 pt of today's `MarkdownView` for at least one of (a)/(b); N0-1 still holds |
 | N0-4 | Code block | 12 wrapped lines at width 320: line-number positions aligned to wrapped first lines, the 18 pt line and 19 pt minimum row; and the technique for the >2000-line plain block that scrolls sideways | Positions and height within 1 pt of `CodeBlockView` |
 | N0-5 | Sizing in the stack | The N0-2..4 rows hosted in the `LazyVStack` at column widths 600 and 900, then resized from 900 to 600 | Heights equal the standalone values; `WindowSizingTests` still pass; off-screen rows are not re-laid on a width change (count layouts) |
-| N0-6 | Performance | First frame: from assigning the root view to the end of `layoutSubtreeIfNeeded()` + `displayIfNeeded()` on a 1200 × 800 window. Scroll: from the bottom, 20 programmatic scrolls of 400 pt on the enclosing `NSScrollView`, each followed by layout and display; time per step. Median of 7 runs per side: today's SwiftUI rows, A, B. Adversarial rows (S-12), each alone: 3200 `||a||`; 2300 ```` ```x``` ```` blocks; a base plus 16 KiB of combining marks; one 16 KiB line; 64 emoji; alternating RTL and LTR runs | Each metric ≤ 2× today, per side; adversarial times recorded with an absolute bound for N1 |
-| N0-7 | Hidden spoilers are never drawn | Which glyph runs are hidden comes from `Segment.covered`. The fragment clips out each hidden run's segment rects before drawing, then fills the cover. Record A's default `linkTextAttributes` and `selectedTextAttributes` on macOS 26. Pixels inside every cover rect, in four states: unselected, selected with the window key, selected with it not key, pointer hovering | Uniform (max channel delta ≤ 2) in all four states; removing the clip makes the test fail |
-| N0-8 | Inline images | A custom emoji as an `NSTextAttachment` whose `image` comes from `EmojiImages.loaded` (no file wrapper, contents or cell), sized to the 22 pt box, swapped in when loaded; a copy over it emits `:name:` | Fits the box; copy emits `:name:` |
+| N0-6 | Performance | First frame: from assigning the root view to the end of `layoutSubtreeIfNeeded()` + `displayIfNeeded()` on a 1200 × 800 window. Scroll: from the bottom, 20 programmatic scrolls of 400 pt on the enclosing `NSScrollView`, each followed by layout and display; a run's scroll value is the total of its 20 steps. One warm-up run per side is discarded; then 7 runs per side, sides alternating within one process (today, A, B, today, …); the report lists the 7 per-run values per side and compares medians. Sides: today's SwiftUI rows, A, B. Adversarial rows (S-12), each alone: 3200 `||a||`; 2300 ```` ```x``` ```` blocks; a base plus 16 KiB of combining marks; one 16 KiB line; 64 emoji; alternating RTL and LTR runs | Each metric ≤ 2× today, per side; adversarial times recorded with an absolute bound for N1 |
+| N0-7 | Hidden spoilers are never drawn | Which glyph runs are hidden comes from `Segment.covered`. Layer 1: the fragment clips out each hidden run's segment rects before drawing, then fills the cover. Layer 2: the hidden runs' own attributes make their glyphs invisible, and A's `linkTextAttributes` and `selectedTextAttributes` carry no foreground (record A's macOS 26 defaults). Cases: an inline `||secret||`, and a hidden `||```secret```||` whose code text view sits under today's `SpoilerCover`. Sample each cover rect inset by `spoilerRadius` (3), in four states: unselected, selected with `isKeyWindow == true`, selected with `isKeyWindow == false`, pointer hovering; assert the key state in each and that selection pixels outside the cover differ between the key and not-key states. Mutations, each alone, for A and B: layer 1 only, layer 2 only (clip off, or for A a forced TextKit 1 fallback), neither; and for the block, its text view un-hidden | Uniform (max channel delta ≤ 2) in all four states with both layers; each single layer's result recorded (S-2's wording follows it: a prototype without a working second layer drops that claim); neither layer, or the un-hidden block, fails the test |
+| N0-8 | Inline images | A custom emoji as an `NSTextAttachment` whose `image` comes from `EmojiImages.loaded` (no file wrapper, contents or cell), sized to the 22 pt box; the seam inserts the image after first layout and the view swaps it in; a copy over it emits `:name:`; no fetch starts | Fits the box; the swap is observed; copy emits `:name:` |
 | N0-9 | Hover tip | Character index under the pointer → the run's tip → a rect for `TooltipOverlay` | Rect within 1 pt of the run |
 | N0-10 | Accessibility | On a row holding `||secret||` and `||```secret```||`: walk `accessibilityChildren()` recursively; on every element read value, label, title, `accessibilityString(for:)` and `accessibilityAttributedString(for:)` over the full range, `selectedText` after a selection spanning the spoiler, the number of characters, the visible range and link children. Also: does SwiftUI `.accessibilityLabel` on a representable replace or sit beside its NSView subtree, and is a representable under `.hidden()` in the tree | `secret` appears in no output; the report lists every attribute queried with its output |
-| N0-11 | NSTextView defaults (A) | With `isEditable` false and the view first responder: enumerate `NSApp.mainMenu` validation; `validRequestor(forSendType:returnType:)` with and without a selection; `writingToolsBehavior` default; what `menu(for:)`, `quickLook(with:)`, `startSpeaking(_:)`, `takeFindStringFromSelection(_:)`, `performTextFinderAction(_:)` and `print(_:)` do; then the same with the overrides switched on | Report before and after; after: only Copy and Select All validate among text items, `validRequestor` is nil, Writing Tools is `.none`, the menu hook is ours |
-| N0-12 | Pasteboard | Native `copy:` through `NSApp.sendAction(#selector(NSText.copy(_:)), to: nil, from: nil)` and `writeSelection(to:types: [.rtf, .rtfd, .URL])`, on a private `NSPasteboard(name:)`, before and after the overrides (A); B's copy path | After: `types == [.string]` exactly |
+| N0-11 | NSTextView defaults (A) | With `isEditable` false and the view first responder (asserted), validate each of these selectors through `validateUserInterfaceItem(_:)` with an `NSMenuItem` built in the test: `copy:`, `selectAll:`, `cut:`, `paste:`, `delete:`, `print:`, `startSpeaking:`, `stopSpeaking:`, `takeFindStringFromSelection:`, `performFindPanelAction:`, `performTextFinderAction:`, `centerSelectionInVisibleArea:`, `showWritingTools:`, `orderFrontSharingServicePicker:`, `orderFrontSubstitutionsPanel:`, `checkSpelling:`. Also: `validRequestor(forSendType: .string, returnType: .string)` and `(.string, nil)` with and without a selection; `writingToolsBehavior`; `menu(for:)` and `quickLook(with:)` through override hit counters (the default is never run). Before and after the overrides | One row per selector with before and after; after: only `copy:` and `selectAll:` validate true, both `validRequestor` calls return nil, Writing Tools is `.none`, `menu(for:)` reaches our hook |
+| N0-12 | Pasteboard | A before: `writeSelection(to: private, types: writablePasteboardTypes)` records the default types. A after and B: the overridden `copy:` sent to the view with the injected private pasteboard; then A's `writeSelection(to: private, types: [.rtf, .rtfd, .URL])` | After: `types == [.string]` exactly on the private board; `NSPasteboard.general.changeCount` unchanged |
 | N0-13 | Links without `.link` | Storage holds a velella-private attribute with the link or spoiler index and no `.link` and no `URL` value anywhere; a synthesized click resolves the index and calls `LinkRouter.handle`; a drag starting on a link opens nothing | Enumeration finds no `.link`/`URL`; recorder opener called once for a plain link, a confirmation for a masked one, a reveal and no open for a hidden spoiler |
 | N0-14 | Hit-testing | Index and segment-frame containment for a point 40 pt past the end of a line ending in a link | The point is outside every segment frame of the link |
 | N0-15 | Edits under selection and covers | Select across two rows, replace the second's content with `""` then with a shorter text, ⌘C; render `a ||secret||`, update the same view to `aaaaaaaa ||secret||`, rerun N0-7's pixel check | No trap, only the first row's part copied; the new cover is uniform |
@@ -86,9 +94,9 @@ Revision 1.1 folds in the plan review of rev 1 (REVISE, 7 blockers) and the secu
 
 | ID | Check | By |
 |---|---|---|
-| U1 | On a spike build launched by main: force-click, three-finger tap and ⌃⌘D on a hidden word and on a link; VO-Shift-M on a text view; Edit › Speech with an empty selection; ⌘E then ⌘G in another app; the Services menu over a selection | Main, announced input takeover |
+| U1 | On the spike build (`--spike A` and `--spike B`; the N0 report gives the exact build and launch commands), launched by main: force-click, three-finger tap and ⌃⌘D on a hidden word and on a link; VO-Shift-M on a text view; Edit › Speech with an empty selection; ⌘E then ⌘G in another app; the Services menu over a selection | Main, announced input takeover |
 | U2 | The default button of `confirmationDialog` for a link, and whether a held Return from a menu item repeats into it | Main |
-| U3 | Every N0-16 drag case the harness could not drive | Main |
+| U3 | Every N0-16 drag case the harness could not drive, on the same spike build | Main |
 | E1 | Official client: does ⌘C of a selection keep the author's U+001B and U+202E? (blobhaj posts a labelled sample in the dev thread) | Main |
 
 ## N1 — Message text on TextKit 2 (SECURITY slice), outline
@@ -108,7 +116,7 @@ Right-click anywhere on a message row opens a glass panel at the cursor in Disco
 | # | Finding | Disposition |
 |---|---|---|
 | S-1 (P1) | Today's hiding (SwiftUI-scoped colours, a cover drawn instead of glyphs) does not survive NSTextView: SwiftUI attributes drop, `linkTextAttributes` and `selectedTextAttributes` repaint, the translucent cover shows glyphs | FIX: hidden glyphs are clipped out, never drawn; hidden runs from `Segment.covered`; no foreground colour in link or selection attributes; N0-7 four-state pixel test |
-| S-2 (P2) | A TextKit 1 fallback silently drops the fragment drawing | FIX: N0-1 notification observer through every N0 row; N1 tests keep it; hiding also holds without the fragment |
+| S-2 (P2) | A TextKit 1 fallback silently drops the fragment drawing | FIX: N0-1 notification observer through every N0 row; N1 tests keep it; a second hiding layer (attributes) is tested alone in N0-7, and a prototype without a working second layer drops this claim |
 | S-3 (P2) | `.link` brings NSTextView's link defaults (workspace open, styling, URL drag, previews, AX links) | FIX: no `.link` in storage; a private index attribute; clicks call `LinkRouter.handle`; N0-13 |
 | S-4 (P2) | Accessibility beyond the value exposes hidden text; `.hidden()` representables | FIX: N0-10 full walk; N1 contract per its result |
 | S-5 (P2) | Writing Tools, `AXShowMenu`/`menu(for:)`, Look Up, Speech with no selection, the find pasteboard, the find indicator, print | FIX: N0-11 (A) and U1; editing-only features stay off through `isEditable == false` without per-feature switches |
@@ -141,6 +149,21 @@ Right-click anywhere on a message row opens a glass panel at the cursor in Disco
 | 5 | S7 checked only the value | FIX: N0-10 full accessibility walk |
 | 6 | Pixels of AppKit views in tests | FIX: harness reads pixels with `cacheDisplay(in:to:)`; N0-7 test fails without the clip |
 | 7 | No security dispositions; Writing Tools missing | FIX: the table above; Writing Tools in N0-11 |
+
+## Plan review dispositions (plan review of rev 1.1, 768f7bc)
+
+| # | Blocker | Disposition |
+|---|---|---|
+| 1 | No key or first-responder state; `sendAction` finds no target | FIX: harness key state (switchable subclass, asserted); copy sent to an explicit target |
+| 2 | Native `copy:` writes the general pasteboard | FIX: injected pasteboard; A's default types via `writeSelection`; `NSPasteboard.general.changeCount` unchanged |
+| 3 | Calling speech, print, find or Quick Look defaults changes real state | FIX: harness rule; validation and hit counters only; real calls in U1 |
+| 4 | No main menu under `swift test`; undefined item list | FIX: N0-11 named selectors validated with test-built menu items |
+| 5 | Emoji images only load from the CDN | FIX: throwaway `EmojiImages.loaded` seam, non-Discord URLs, no fetch, same images for all sides |
+| 6 | S-2's second layer contradicted N0-7 and was untested | FIX: N0-7 mutates each layer alone and both; S-2 reworded |
+| 7 | No hidden code block case; rounded corners in sampling | FIX: N0-7 block case and un-hidden mutation; samples inset by `spoilerRadius` |
+| 8 | Scroll statistic | FIX: total of 20 steps per run, warm-up discarded, alternating sides, 7 per-run values reported |
+| 9 | Security rows not required for D6 | FIX: eligibility rule (N0-1, N0-7, N0-10, N0-12, N0-13, plus N0-11 for A); stop and D6 reworded |
+| 10 | No launchable spike build for U1 and U3 | FIX: throwaway `--spike A|B` switch in the worktree app, no Discord connection; the report gives the commands |
 
 ## Deferred items found during E0
 
