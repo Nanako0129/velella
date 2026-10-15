@@ -3,11 +3,13 @@
 //! `Session::connect` spawns onto the current tokio runtime; velella-ffi calls it from its owned
 //! runtime. Nothing here owns a runtime.
 mod compression;
+pub mod embeds;
 mod gateway;
 mod guild_settings;
 pub mod highlight;
 mod identify;
 pub mod markdown;
+mod media;
 mod member_list;
 mod messages;
 mod permissions;

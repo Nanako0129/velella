@@ -143,8 +143,6 @@ enum DesignTokens {
         /// DM top rows (Friends, ...) use a larger glyph than channel rows.
         static let dmTopIcon: CGFloat = 28
         static let messageAvatar: CGFloat = 40
-        /// Images under messages are scaled down to at most this width.
-        static let messageImageMaxWidth: CGFloat = 400
         static let memberAvatar: CGFloat = 32
         /// Member rows (v2 DiscordUI.MemberView layout, refs/swiftcord-v2-teardown.md, kept out of
         /// git): 44 tall, the avatar 16 in from the leading edge, the text 12 after it (x 60) and

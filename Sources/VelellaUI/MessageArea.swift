@@ -234,6 +234,10 @@ struct MessageRow: View {
                     .font(T.Typography.messageBody)
                     .foregroundStyle(.secondary)
             }
+            // After the attachments, before the reactions (wave 3 E).
+            ForEach(Array(message.embeds.enumerated()), id: \.offset) { _, embed in
+                EmbedView(embed: embed).padding(.top, T.Spacing.xs)
+            }
             if case .failed(let reason) = message.delivery {
                 Text(verbatim: reason).font(T.Typography.timestamp).foregroundStyle(.red)
             }
@@ -268,24 +272,31 @@ struct MessageRow: View {
     }
 }
 
-/// An image under a message, scaled down to the column's image width and rounded. Live images
-/// load from their URL; fixture images are generated art, a mesh gradient whose hues come from
-/// the seed.
+/// An image under a message, fitted inside `MediaBox.image` and rounded. Live images load through
+/// `MediaImages` (wave 3 E; a spoiler stays covered, and unfetched, until clicked); fixture images
+/// are generated art, a mesh gradient whose hues come from the seed.
 struct ImageAttachmentView: View {
     let image: ImageAttachment
+    @State private var revealed = false
+
+    /// The display box: the image's size fitted inside `MediaBox.image`.
+    nonisolated var box: CGSize { MediaBox.fit(width: image.width, height: image.height, in: MediaBox.image) }
+
+    /// What the view fetches: nothing for fixtures or while a spoiler is covered.
+    nonisolated static func fetched(_ image: ImageAttachment, revealed: Bool) -> URL? {
+        image.spoiler && !revealed ? nil : image.url
+    }
 
     var body: some View {
         Group {
-            if let url = image.url {
-                AsyncImage(url: url) { phase in
-                    if let loaded = phase.image { loaded.resizable() } else { T.Palette.replyBarFill }
-                }
+            if let url = Self.fetched(image, revealed: revealed) {
+                MediaImageView(url: url, box: box)
+            } else if image.url != nil {
+                SpoilerMediaCover(box: box) { revealed = true }
             } else {
-                generated
+                generated.frame(width: box.width, height: box.height)
             }
         }
-        .aspectRatio(image.width / image.height, contentMode: .fit)
-        .frame(maxWidth: min(image.width, T.Size.messageImageMaxWidth), alignment: .leading)
         .clipShape(RoundedRectangle(cornerRadius: T.Radius.messageImage, style: .continuous))
     }
 

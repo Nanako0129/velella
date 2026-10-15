@@ -194,34 +194,40 @@ public struct MessageItem: Identifiable, Hashable, Sendable {
     public var delivery: Delivery
     /// First-seen order, at most 20; read-only pills under the message.
     public var reactions: [ReactionItem]
+    /// At most 10, under the attachments (wave 3 E).
+    public var embeds: [EmbedItem]
     /// Without a `body`, `text` shows as one plain paragraph. Without an `authorId` (fixtures,
     /// previews) the name stands in for it.
     public init(
         id: String, authorId: String? = nil, authorName: String, authorColor: RGB? = nil, avatar: Avatar, timestamp: Date, text: String,
         body: MessageBody? = nil,
         displayNameStyle: DisplayNameStyle? = nil, images: [ImageAttachment] = [], files: [String] = [],
-        reply: ReplyPreview? = nil, edited: Bool = false, delivery: Delivery = .sent, reactions: [ReactionItem] = []
+        reply: ReplyPreview? = nil, edited: Bool = false, delivery: Delivery = .sent, reactions: [ReactionItem] = [],
+        embeds: [EmbedItem] = []
     ) {
         self.id = id; self.authorId = authorId ?? authorName; self.authorName = authorName; self.authorColor = authorColor
         self.avatar = avatar; self.timestamp = timestamp; self.text = text
         self.body = body ?? MessageBody(text: text)
         self.displayNameStyle = displayNameStyle; self.images = images; self.files = files
         self.reply = reply; self.edited = edited; self.delivery = delivery; self.reactions = reactions
+        self.embeds = embeds
     }
 }
 
-/// An image under a message: a URL for live rows (dimensions validated > 0 in core), or generated
-/// art from `seed` for fixtures (no network, no bundled files).
+/// An image under a message: a URL for live rows (a Discord media host and dimensions > 0, both
+/// checked in core), or generated art from `seed` for fixtures (no network, no bundled files).
 public struct ImageAttachment: Hashable, Sendable {
     public var seed: Int
     public var url: URL?
     public var width: Double
     public var height: Double
+    /// Covered, and not fetched, until clicked (IS_SPOILER or a `SPOILER_` filename).
+    public var spoiler = false
     public init(seed: Int, width: Double, height: Double) {
         self.seed = seed; self.width = width; self.height = height
     }
-    public init(url: URL, width: Double, height: Double) {
-        self.seed = 0; self.url = url; self.width = width; self.height = height
+    public init(url: URL, width: Double, height: Double, spoiler: Bool = false) {
+        self.seed = 0; self.url = url; self.width = width; self.height = height; self.spoiler = spoiler
     }
 }
 
@@ -232,20 +238,24 @@ public extension MessageItem {
         id: UInt64, authorId: UInt64, authorName: String, authorColor: UInt32?, avatarURL: String, timestampMs: UInt64,
         content: String, body: MessageBody, edited: Bool, images: [(url: String, width: UInt32, height: UInt32)],
         files: [String], replyAuthor: String?, replyContent: String?, pending: Bool, failure: String?,
-        reactions: [(name: String, url: String?, count: UInt32, me: Bool)] = []
+        reactions: [(name: String, url: String?, count: UInt32, me: Bool)] = [],
+        embeds: [EmbedItem] = [], imageSpoilers: [Bool] = []
     ) -> MessageItem {
         MessageItem(
             id: String(id), authorId: String(authorId), authorName: authorName, authorColor: authorColor.map { RGB(rgb: $0) },
             avatar: URL(string: avatarURL).map(Avatar.url) ?? .initials(initials(of: authorName)),
             timestamp: Date(timeIntervalSince1970: Double(timestampMs) / 1000), text: content, body: body,
-            images: images.compactMap { image in
-                URL(string: image.url).map { ImageAttachment(url: $0, width: Double(image.width), height: Double(image.height)) }
+            images: images.enumerated().compactMap { i, image in
+                URL(string: image.url).map {
+                    ImageAttachment(url: $0, width: Double(image.width), height: Double(image.height), spoiler: imageSpoilers.indices.contains(i) && imageSpoilers[i])
+                }
             },
             files: files,
             reply: replyAuthor.map { ReplyPreview(authorName: $0, segments: [.text(replyContent ?? "")]) },
             edited: edited,
             delivery: failure.map(Delivery.failed) ?? (pending ? .pending : .sent),
-            reactions: reactions.map { ReactionItem(name: $0.name, imageURL: $0.url.flatMap { URL(string: $0) }, count: $0.count, me: $0.me) }
+            reactions: reactions.map { ReactionItem(name: $0.name, imageURL: $0.url.flatMap { URL(string: $0) }, count: $0.count, me: $0.me) },
+            embeds: embeds
         )
     }
 }
