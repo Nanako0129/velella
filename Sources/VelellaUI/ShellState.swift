@@ -257,6 +257,18 @@ public enum ComposerSubmit {
         draft = ""
         onSend(text)
     }
+
+    /// `submit` for a composer that may be replying: the send carries the reply's `messageID`, and
+    /// the reply bar clears with the draft, only when something was sent.
+    public static func submit(
+        _ draft: inout String, reply: inout ReplyPreview?, hasMarkedText: Bool, onSend: ((String, String?) -> Void)?
+    ) {
+        guard let onSend, !hasMarkedText, !draft.allSatisfy(\.isWhitespace) else { return }
+        let text = draft, target = reply?.messageID
+        draft = ""
+        reply = nil
+        onSend(text, target)
+    }
 }
 
 // MARK: Members
@@ -346,8 +358,11 @@ public enum PreviewSegment: Hashable, Sendable {
 public struct ReplyPreview: Hashable, Sendable {
     public var authorName: String
     public var segments: [PreviewSegment]
-    public init(authorName: String, segments: [PreviewSegment]) {
-        self.authorName = authorName; self.segments = segments
+    /// The replied message's id: what the composer sends as the reply target. nil (fixtures,
+    /// previews) sends a plain message.
+    public var messageID: String?
+    public init(authorName: String, segments: [PreviewSegment], messageID: String? = nil) {
+        self.authorName = authorName; self.segments = segments; self.messageID = messageID
     }
 }
 
@@ -376,6 +391,8 @@ public struct ShellState: Equatable, Sendable {
     /// Set while the composer is replying to a message.
     public var reply: ReplyPreview?
     public var messageLoad: MessageLoad = .idle
+    /// Display names of who is typing in the open conversation (core expires them after 10 s).
+    public var typing: [String] = []
     /// Unsent composer text per conversation (`openTarget`), as the official client keeps it.
     public var drafts: [String: String] = [:]
     /// The macOS preferred language (BCP 47), for message times; ShellView puts it in the

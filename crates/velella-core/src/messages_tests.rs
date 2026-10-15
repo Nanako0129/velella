@@ -11,6 +11,9 @@ use serde_json::json;
 use std::time::Duration;
 use tokio::{io::AsyncReadExt, net::TcpListener, sync::mpsc, time::timeout};
 
+#[path = "reply_typing_tests.rs"]
+mod reply_typing;
+
 const MARKER: &str = "SYNTHETIC_TOKEN_MARKER_0123456789";
 const WAIT: Duration = Duration::from_secs(10);
 
@@ -603,7 +606,7 @@ async fn the_echo_is_reconciled_only_on_its_nonce_and_the_self_author() {
     let (_mock, store) = serve(&[ok(&json!([]))]).await;
     let epoch = store.open(5);
     settled(&store, epoch).await;
-    let (_, nonce) = store.begin_send(5, "hi", me()).unwrap();
+    let (_, nonce) = store.begin_send(5, "hi", me(), None).unwrap();
     let echo = now(&store, epoch);
     assert_eq!(echo.rows.len(), 1);
     assert!(echo.rows[0].pending && echo.rows[0].content == "hi");
@@ -642,7 +645,7 @@ async fn a_local_echo_carries_its_parsed_body() {
     let (_mock, store) = serve(&[ok(&json!([]))]).await;
     let epoch = store.open(5);
     settled(&store, epoch).await;
-    store.begin_send(5, "**b**", me()).unwrap();
+    store.begin_send(5, "**b**", me(), None).unwrap();
     let inner = store.lock();
     assert_eq!(
         inner.open.as_ref().unwrap().echoes[0].message.body,
@@ -688,11 +691,11 @@ async fn sends_post_the_exact_body_with_a_fresh_nonce_each() {
     settled(&store, epoch).await;
     let mut nonces = Vec::new();
     for id in [60, 61] {
-        let (_, nonce) = store.begin_send(5, "hi", me()).unwrap();
+        let (_, nonce) = store.begin_send(5, "hi", me(), None).unwrap();
         // The mock answers in order: the GET, then each POST.
         let result = store
             .rest
-            .create_message(5, "hi", &nonce)
+            .create_message(5, "hi", &nonce, None)
             .await
             .map(|_| reply(id, &nonce));
         store.finish_send(epoch, &nonce, result);
@@ -722,8 +725,8 @@ async fn a_post_500_sends_one_request_and_marks_the_echo_failed() {
     let (mock, store) = serve(&[ok(&json!([])), response(500, "", ""), ok(&json!({}))]).await;
     let epoch = store.open(5);
     settled(&store, epoch).await;
-    let (_, nonce) = store.begin_send(5, "hi", me()).unwrap();
-    let result = store.rest.create_message(5, "hi", &nonce).await;
+    let (_, nonce) = store.begin_send(5, "hi", me(), None).unwrap();
+    let result = store.rest.create_message(5, "hi", &nonce, None).await;
     store.finish_send(epoch, &nonce, result);
     assert_eq!(mock.count(), 2, "the POST was retried");
     let s = now(&store, epoch);
@@ -744,8 +747,8 @@ async fn a_captcha_answer_fails_with_the_official_app_text() {
     .await;
     let epoch = store.open(5);
     settled(&store, epoch).await;
-    let (_, nonce) = store.begin_send(5, "hi", me()).unwrap();
-    let result = store.rest.create_message(5, "hi", &nonce).await;
+    let (_, nonce) = store.begin_send(5, "hi", me(), None).unwrap();
+    let result = store.rest.create_message(5, "hi", &nonce, None).await;
     store.finish_send(epoch, &nonce, result);
     assert_eq!(mock.count(), 2);
     assert_eq!(
@@ -757,9 +760,12 @@ async fn a_captcha_answer_fails_with_the_official_app_text() {
 #[tokio::test]
 async fn a_send_to_a_channel_that_is_not_open_adds_nothing() {
     let (_mock, store) = serve(&[ok(&json!([]))]).await;
-    assert!(store.begin_send(5, "hi", me()).is_none(), "nothing open");
+    assert!(
+        store.begin_send(5, "hi", me(), None).is_none(),
+        "nothing open"
+    );
     let epoch = store.open(5);
-    assert!(store.begin_send(6, "hi", me()).is_none());
+    assert!(store.begin_send(6, "hi", me(), None).is_none());
     assert!(now(&store, epoch).rows.is_empty());
 }
 
@@ -861,7 +867,7 @@ async fn each_pending_site_queues_the_message_and_computes_nothing() {
     assert_eq!(store.next_job().map(|j| j.id), Some(60));
     // `finish_send` Ok.
     let (_m, store, epoch) = opened(json!([])).await;
-    let (_, nonce) = store.begin_send(5, &py, me()).unwrap();
+    let (_, nonce) = store.begin_send(5, &py, me(), None).unwrap();
     let mut sent = msg(70, 5, &py);
     sent["author"] = json!({"id": "1", "username": "me"});
     sent["nonce"] = json!(nonce);
@@ -891,7 +897,7 @@ async fn nothing_is_pending_without_a_mapped_fence_in_the_message_itself() {
     );
     assert_eq!(store.next_job(), None);
     // An echo with a `py` block. The worker never reads echoes, even one flagged by hand.
-    store.begin_send(5, &py, me()).unwrap();
+    store.begin_send(5, &py, me(), None).unwrap();
     assert_eq!(store.next_job(), None);
     let echo_id = {
         let mut inner = store.lock();

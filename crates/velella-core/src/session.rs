@@ -112,6 +112,10 @@ impl Shared {
         // including the ones `State` ignores (MESSAGE_*).
         if let Some(store) = self.messages.get() {
             store.observe(event, d);
+            // Typing needs names and the self id from the state `apply` just left.
+            if event == "TYPING_START" {
+                store.typing_start(d, &self.snapshot());
+            }
         }
         changed
     }

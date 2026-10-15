@@ -47,7 +47,7 @@ private struct MainWindow: View {
         ShellView(
             state: $model.shell,
             onSignIn: model.isDemo ? nil : { openWindow(id: LoginWindow.id) },
-            onSend: model.isDemo ? nil : { model.send($0) },
+            onSend: model.isDemo ? nil : { model.send($0, replyTo: $1) },
             onLoadOlder: model.isDemo ? nil : { model.loadOlder() }
         )
             .onChange(of: model.shell.selectedRailID) {

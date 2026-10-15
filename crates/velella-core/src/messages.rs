@@ -32,6 +32,7 @@ use crate::{
     session::{SessionHandle, Subscription},
     sidebar::{avatar_url, CDN},
     state::{Role, State, User},
+    typing::{self, Typing},
 };
 use serde_json::Value;
 use std::{
@@ -42,7 +43,7 @@ use std::{
         mpsc::{sync_channel, Receiver, SyncSender},
         Arc, Mutex, Weak,
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{sync::watch, task::AbortHandle, task::JoinHandle};
 
@@ -155,6 +156,9 @@ pub struct MessagesSnapshot {
     /// Ascending; unconfirmed and failed echoes last, in send order.
     pub rows: Vec<MessageRow>,
     pub older: OlderState,
+    /// Display names of the users typing in this channel now (never the self user), in the order
+    /// they started. Resolved as message authors are: member nick, global name, username.
+    pub typing: Vec<String>,
 }
 
 // ---- Parsing ----
@@ -727,6 +731,7 @@ struct Open {
     older: OlderState,
     /// The one in-flight older-page GET, while `older` is `Loading`.
     older_fetch: Option<AbortHandle>,
+    typing: Typing,
 }
 
 impl Open {
@@ -772,6 +777,8 @@ pub(crate) struct MessageStore {
     revision: watch::Sender<u64>,
     /// Wakes this store's highlight worker; `None` without one (a failed spawn, or tests).
     wake: Option<SyncSender<()>>,
+    /// The time typing entries are judged against (a field so tests own the clock).
+    clock: Box<dyn Fn() -> Instant + Send + Sync>,
     /// Dispatch names seen, so a test can show the observer is wired.
     #[cfg(test)]
     pub(crate) seen: std::sync::Mutex<Vec<String>>,
@@ -814,6 +821,7 @@ impl MessageStore {
             inner: Mutex::default(),
             revision: watch::channel(0).0,
             wake,
+            clock: Box::new(Instant::now),
             #[cfg(test)]
             seen: Default::default(),
         }
@@ -918,6 +926,7 @@ impl MessageStore {
             fetch: Some(fetch.abort_handle()),
             older: OlderState::Idle,
             older_fetch: None,
+            typing: Typing::default(),
         });
         drop(inner);
         self.bump();
@@ -1039,6 +1048,7 @@ impl MessageStore {
         match name {
             "MESSAGE_CREATE" => {
                 let Some(m) = parse(d, false) else { return };
+                open.typing.remove(m.author.id);
                 // Our own echo: same nonce and sent by us (the echo's author is the self user).
                 open.echoes.retain(|e| {
                     !(m.nonce.as_deref() == Some(e.nonce.as_str())
@@ -1071,10 +1081,26 @@ impl MessageStore {
         self.bump();
     }
 
-    /// Adds a local echo to `channel_id` if it is the open channel; returns (epoch, nonce).
-    fn begin_send(&self, channel_id: u64, content: &str, me: User) -> Option<(u64, String)> {
+    /// Adds a local echo to `channel_id` if it is the open channel; returns (epoch, nonce). A
+    /// reply's echo carries the preview of `reply_to` when that message is buffered.
+    fn begin_send(
+        &self,
+        channel_id: u64,
+        content: &str,
+        me: User,
+        reply_to: Option<u64>,
+    ) -> Option<(u64, String)> {
         let mut inner = self.lock();
         let open = inner.open.as_mut().filter(|o| o.channel_id == channel_id)?;
+        let reply = reply_to
+            .and_then(|r| open.messages.iter().find(|m| m.id == r))
+            .map(|m| {
+                Box::new(Stored {
+                    reply: None,
+                    pending: false,
+                    ..m.clone()
+                })
+            });
         let nonce = next_nonce();
         open.echoes.push(Echo {
             nonce: nonce.to_string(),
@@ -1089,7 +1115,7 @@ impl MessageStore {
                 edited: false,
                 attachments: Vec::new(),
                 mentions: Vec::new(),
-                reply: None,
+                reply,
                 nonce: None,
             },
             failure: None,
@@ -1141,7 +1167,58 @@ impl MessageStore {
             load: open.load.clone(),
             rows,
             older: open.older.clone(),
+            typing: open.typing.names((self.clock)()),
         })
+    }
+
+    /// TYPING_START (`d`), called by the session after `State::apply` with the state it left.
+    /// Only the open channel counts and the self user never does; a user the payload and the state
+    /// both fail to name is skipped. The entry's expiry bumps the store (`expire_typing`). Needs a
+    /// runtime context.
+    pub(crate) fn typing_start(self: &Arc<Self>, d: &Value, state: &State) {
+        let (Some(channel_id), Some(user_id)) = (
+            d.get("channel_id").and_then(id),
+            d.get("user_id").and_then(id),
+        ) else {
+            return;
+        };
+        if state.user_id == Some(user_id) {
+            return;
+        }
+        let member = d.get("member").filter(|m| m.is_object());
+        let Some(user) = member
+            .and_then(|m| user(m.get("user")?))
+            .or_else(|| state.users.get(&user_id).cloned())
+        else {
+            return;
+        };
+        let name = display_name(&user, member.and_then(|m| text(m, "nick")).as_deref());
+        let mut inner = self.lock();
+        let Some(open) = inner.open.as_mut().filter(|o| o.channel_id == channel_id) else {
+            return;
+        };
+        open.typing.start(user_id, name, (self.clock)());
+        let epoch = open.epoch;
+        drop(inner);
+        self.bump();
+        let store = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(typing::TTL).await;
+            store.expire_typing(epoch);
+        });
+    }
+
+    /// Drops lapsed typing entries of the channel opened at `epoch`; bumps if any went.
+    fn expire_typing(&self, epoch: u64) {
+        let mut inner = self.lock();
+        let Some(open) = inner.open.as_mut().filter(|o| o.epoch == epoch) else {
+            return;
+        };
+        let changed = open.typing.prune((self.clock)());
+        drop(inner);
+        if changed {
+            self.bump();
+        }
     }
 }
 
@@ -1249,20 +1326,26 @@ impl SessionHandle {
     /// Sends `content` to `channel_id` when that is the open channel, with a local echo and a
     /// fresh nonce; never retried. Returns `None` (nothing sent) for an empty or whitespace-only
     /// text, before READY, or when `channel_id` is not the open channel. The outcome shows in the
-    /// snapshot: the echo is replaced by the real message, or marked failed with fixed text. Must
-    /// be called inside a runtime context.
-    pub fn send_message(&self, channel_id: u64, content: String) -> Option<JoinHandle<()>> {
+    /// snapshot: the echo is replaced by the real message, or marked failed with fixed text. With
+    /// `reply_to` the message is a reply to that message of the same channel (the echo carries its
+    /// preview when buffered). Must be called inside a runtime context.
+    pub fn send_message(
+        &self,
+        channel_id: u64,
+        content: String,
+        reply_to: Option<u64>,
+    ) -> Option<JoinHandle<()>> {
         if content.trim().is_empty() {
             return None;
         }
         let state = self.snapshot();
         let me = state.users.get(&state.user_id?)?.clone();
         let store = self.messages();
-        let (epoch, nonce) = store.begin_send(channel_id, &content, me)?;
+        let (epoch, nonce) = store.begin_send(channel_id, &content, me, reply_to)?;
         Some(tokio::spawn(async move {
             let result = store
                 .rest
-                .create_message(channel_id, &content, &nonce)
+                .create_message(channel_id, &content, &nonce, reply_to)
                 .await;
             store.finish_send(epoch, &nonce, result);
         }))
