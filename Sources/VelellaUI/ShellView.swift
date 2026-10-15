@@ -13,7 +13,7 @@ public struct ShellView: View {
     /// Owned by the app (or a fixture), so its later changes reach the window.
     @Binding private var state: ShellState
     private let onSignIn: (() -> Void)?
-    private let onSend: ((String) -> Void)?
+    private let onSend: ((String, String?) -> Void)?
     @State private var showMembers = true
     @State private var search = ""
     /// Starts at the sidebar's ideal width, not 0: the title's frame is this minus the reserved
@@ -23,8 +23,9 @@ public struct ShellView: View {
 
     /// - Parameters:
     ///   - onSignIn: shown as "Sign In…" on the signed-out placeholder when set.
-    ///   - onSend: receives the composer's text; nil (fixtures, `--demo`) sends nothing.
-    public init(state: Binding<ShellState>, onSignIn: (() -> Void)? = nil, onSend: ((String) -> Void)? = nil) {
+    ///   - onSend: receives the composer's text and the reply target's message id (nil without a
+    ///     reply); nil (fixtures, `--demo`) sends nothing.
+    public init(state: Binding<ShellState>, onSignIn: (() -> Void)? = nil, onSend: ((String, String?) -> Void)? = nil) {
         _state = state
         self.onSignIn = onSignIn
         self.onSend = onSend
@@ -60,7 +61,8 @@ public struct ShellView: View {
             MessageArea(
                 header: state.header, conversationID: state.openTarget ?? "",
                 isSignedIn: state.isSignedIn, messages: state.messages,
-                load: state.messageLoad, reply: $state.reply, draft: $state.draft, onSend: onSend
+                load: state.messageLoad, reply: $state.reply, draft: $state.draft, onSend: onSend,
+                typing: state.typing
             )
                 // No minimum of its own: SwiftUI's `.inspector` adds the floating sidebar's current
                 // width to this column's minimum twice (measured 2026-10-13, macOS 27.0.1,

@@ -21,6 +21,7 @@ mod sidebar;
 mod state;
 mod threads;
 mod token;
+mod typing;
 mod voice;
 
 #[cfg(test)]

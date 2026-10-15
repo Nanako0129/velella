@@ -158,6 +158,7 @@ final class AppModel {
         messagesChannel = nil
         shell.messages = []
         shell.messageLoad = .idle
+        shell.typing = []
     }
 
     /// Follows the shell's own selection binding (the window calls this when it changes).
@@ -190,9 +191,10 @@ final class AppModel {
 
     /// The composer's submit: to the channel this model opened, never to a selection read now.
     /// Core sends only if that is still its open channel.
-    func send(_ text: String) {
+    /// `replyTo` is the replied message's id as the reply bar holds it.
+    func send(_ text: String, replyTo: String? = nil) {
         guard let handle, let channel = messagesChannel else { return }
-        _ = handle.sendMessage(channelId: channel, content: text)
+        _ = handle.sendMessage(channelId: channel, content: text, replyTo: replyTo.flatMap { UInt64($0) })
     }
 
     // MARK: Messages
@@ -205,6 +207,7 @@ final class AppModel {
         messagesChannel = nil
         shell.messages = []
         shell.messageLoad = .idle
+        shell.typing = []
         guard let target, let handle, let generation else { return }
         messagesChannel = target
         shell.messageLoad = .loading
@@ -226,6 +229,7 @@ final class AppModel {
                 pending: row.pending, failure: row.failure
             )
         }
+        shell.typing = snapshot.typing
         shell.messageLoad = switch snapshot.load {
         case .loading: .loading
         case .loaded: .loaded

@@ -17,7 +17,10 @@ struct MessageArea: View {
     var load: MessageLoad = .idle
     @Binding var reply: ReplyPreview?
     @Binding var draft: String
-    var onSend: ((String) -> Void)?
+    /// Receives the draft and the reply's target message id (nil without a reply).
+    var onSend: ((String, String?) -> Void)?
+    /// Who is typing in this conversation, shown under the composer.
+    var typing: [String] = []
     @State private var columnWidth: CGFloat = 0
 
     var body: some View {
@@ -52,7 +55,16 @@ struct MessageArea: View {
                     .scrollEdgeEffectStyle(.hard, for: .top)
                 }
             }
-            .safeAreaInset(edge: .bottom) { Composer(reply: $reply, draft: $draft, onSend: onSend) }
+            .safeAreaInset(edge: .bottom) {
+                VStack(spacing: 0) {
+                    Composer(reply: $reply, draft: $draft, onSend: onSend)
+                    TypingIndicator(names: typing)
+                        .padding(.horizontal, T.Spacing.lg + T.Spacing.md)
+                        // Up into the composer's own bottom gutter, which already sits under the card.
+                        .padding(.top, -T.Spacing.md)
+                        .padding(.bottom, T.Spacing.xs)
+                }
+            }
             // Under the toolbar too, so the toolbar band carries the pane's tint (a band of bare
             // window material over the messages read as a separate, lighter strip).
             .background(T.Palette.messagePane)
@@ -282,8 +294,9 @@ struct Composer: View {
     @Binding var reply: ReplyPreview?
     /// The open conversation's draft (`ShellState.draft`).
     @Binding var draft: String
-    /// Receives the draft on Return (`ComposerSubmit`: never blank, never an IME commit).
-    var onSend: ((String) -> Void)?
+    /// Receives the draft and the reply target on Return (`ComposerSubmit`: never blank, never an
+    /// IME commit); the reply bar clears with the draft.
+    var onSend: ((String, String?) -> Void)?
     @State private var plusMenuOpen = false
 
     var body: some View {
@@ -311,7 +324,7 @@ struct Composer: View {
                         // The field editor still holding marked text means this Return belongs to
                         // the input method (it commits a candidate), not to the composer.
                         let editor = NSApp.keyWindow?.firstResponder as? NSTextView
-                        ComposerSubmit.submit(&draft, hasMarkedText: editor?.hasMarkedText() ?? false, onSend: onSend)
+                        ComposerSubmit.submit(&draft, reply: &reply, hasMarkedText: editor?.hasMarkedText() ?? false, onSend: onSend)
                     }
 
                 // White glyphs, as in v2.
@@ -343,11 +356,16 @@ struct ReplyBar: View {
     let reply: ReplyPreview
     let onClose: () -> Void
 
+    /// The name is payload text: shown verbatim, isolated so its bidi controls stay inside it.
+    static func title(_ reply: ReplyPreview) -> String {
+        "Replying to " + MarkdownText.isolated(reply.authorName)
+    }
+
     var body: some View {
         HStack(spacing: T.Spacing.md) {
             Image(systemName: "arrowshape.turn.up.left.fill").font(T.Typography.replyGlyph)
             VStack(alignment: .leading, spacing: 0) {
-                Text("Replying to \(reply.authorName)").font(T.Typography.replyAuthor)
+                Text(verbatim: Self.title(reply)).font(T.Typography.replyAuthor)
                 HStack(spacing: 2) {
                     ForEach(Array(reply.segments.enumerated()), id: \.offset) { _, segment in
                         switch segment {

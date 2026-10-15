@@ -62,6 +62,8 @@ pub struct MessageRow {
 pub struct MessagesSnapshot {
     pub load: MessageLoad,
     pub rows: Vec<MessageRow>,
+    /// Display names of the users typing now, never the self user; text, not markup.
+    pub typing: Vec<String>,
 }
 
 /// Dropping this leaves the channel: deliveries stop and an in-flight history fetch is cancelled.
@@ -87,10 +89,12 @@ impl SessionHandle {
 
     /// Sends `content` to `channel_id` only if that is the open channel (the one the live
     /// `subscribe_messages` opened); false when nothing was sent (blank text, not open, before
-    /// READY). The result shows in the snapshot as an echo that is confirmed or fails.
-    pub fn send_message(&self, channel_id: u64, content: String) -> bool {
+    /// READY). The result shows in the snapshot as an echo that is confirmed or fails. With
+    /// `reply_to` the message replies to that message of the same channel.
+    #[uniffi::method(default(reply_to = None))]
+    pub fn send_message(&self, channel_id: u64, content: String, reply_to: Option<u64>) -> bool {
         let _context = runtime().enter();
-        self.0.send_message(channel_id, content).is_some()
+        self.0.send_message(channel_id, content, reply_to).is_some()
     }
 }
 
@@ -105,6 +109,7 @@ impl From<velella_core::MessagesSnapshot> for MessagesSnapshot {
                 },
             },
             rows: s.rows.into_iter().map(Into::into).collect(),
+            typing: s.typing,
         }
     }
 }
@@ -187,10 +192,12 @@ mod tests {
             channel_id: 9,
             load: velella_core::LoadState::Failed("Couldn't load messages"),
             rows: vec![row],
+            typing: vec!["Ann".into(), "Bob".into()],
         });
         assert!(
             matches!(&s.load, MessageLoad::Failed { text } if text == "Couldn't load messages")
         );
+        assert_eq!(s.typing, ["Ann", "Bob"]);
         let r = &s.rows[0];
         assert_eq!(
             (

@@ -1179,11 +1179,11 @@ mod messages_live {
         // Send: only to the open channel, never for blank text; the gateway echo reconciles.
         assert!(rig
             .handle
-            .send_message(21, "wrong channel".into())
+            .send_message(21, "wrong channel".into(), None)
             .is_none());
-        assert!(rig.handle.send_message(20, " \n\t".into()).is_none());
+        assert!(rig.handle.send_message(20, " \n\t".into(), None).is_none());
         rig.handle
-            .send_message(20, "out".into())
+            .send_message(20, "out".into(), None)
             .unwrap()
             .await
             .unwrap();
@@ -1278,7 +1278,7 @@ mod messages_live {
         let (_conn, mut rx, _sub) = open_general(&mut rig).await;
         until(&mut rx, |s| s.load == LoadState::Loaded).await;
         rig.handle
-            .send_message(20, "hi".into())
+            .send_message(20, "hi".into(), None)
             .unwrap()
             .await
             .unwrap();
@@ -1292,6 +1292,38 @@ mod messages_live {
         assert_eq!(posts, 1, "the POST was retried");
     }
 
+    /// TYPING_START reaches the store through the session with the state `apply` left: the self
+    /// user (1, from READY) is ignored, a named user shows, and that user's message ends it.
+    #[tokio::test]
+    async fn typing_start_flows_through_the_session_into_the_snapshot() {
+        let mock = MockHttp::start(vec![ok(json!([]))]).await;
+        mock.install();
+        let mut rig = Rig::start().await;
+        let (mut conn, mut rx, _sub) = open_general(&mut rig).await;
+        until(&mut rx, |s| s.load == LoadState::Loaded).await;
+        let typing = |seq, user: &str, channel: &str| {
+            dispatch(
+                seq,
+                "TYPING_START",
+                json!({
+                    "channel_id": channel, "user_id": user, "timestamp": 1,
+                    "member": {"user": {"id": user, "username": "u9"}, "nick": "Niner"},
+                }),
+            )
+        };
+        conn.send(typing(3, "1", "20")).await;
+        conn.send(typing(4, "9", "21")).await;
+        conn.send(typing(5, "9", "20")).await;
+        let s = until(&mut rx, |s| !s.typing.is_empty()).await;
+        assert_eq!(s.typing, ["Niner"]);
+        conn.send(dispatch(6, "MESSAGE_CREATE", json!({
+            "id": "30", "channel_id": "20", "content": "hi", "author": {"id": "9", "username": "u9"},
+        })))
+        .await;
+        let s = until(&mut rx, |s| s.rows.len() == 1).await;
+        assert!(s.typing.is_empty());
+    }
+
     #[tokio::test]
     async fn nothing_is_sent_before_ready_even_to_the_open_channel() {
         let mock = MockHttp::start(vec![ok(json!([]))]).await;
@@ -1302,7 +1334,7 @@ mod messages_live {
             let _ = tx.send(s);
         });
         until(&mut rx, |s| s.load == LoadState::Loaded).await;
-        assert!(rig.handle.send_message(20, "hi".into()).is_none());
+        assert!(rig.handle.send_message(20, "hi".into(), None).is_none());
         assert_eq!(mock.count(), 1, "only the history GET");
     }
 
