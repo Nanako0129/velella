@@ -97,7 +97,7 @@ Revision 1.1 folds in the plan review of rev 1 (REVISE, 7 blockers) and the secu
 | U1 | On the spike build (`--spike A` and `--spike B`; the N0 report gives the exact build and launch commands), launched by main: force-click, three-finger tap and ⌃⌘D on a hidden word and on a link; VO-Shift-M on a text view; Edit › Speech with an empty selection; ⌘E then ⌘G in another app; the Services menu over a selection | Main, announced input takeover |
 | U2 | The default button of `confirmationDialog` for a link, and whether a held Return from a menu item repeats into it | Main |
 | U3 | Every N0-16 drag case the harness could not drive, on the same spike build | Main |
-| E1 | Official client: does ⌘C of a selection keep the author's U+001B and U+202E? (blobhaj posts a labelled sample in the dev thread) | Main |
+| E1 | Official client: does ⌘C of a selection keep the author's U+001B and U+202E? **Done 2026-10-15:** keeps U+001B and U+202C; U+202E never arrives (stripped by the server) | Main + user |
 
 ## N1 — Message text on TextKit 2 (SECURITY slice), outline
 
@@ -132,7 +132,7 @@ Right-click anywhere on a message row opens a glass panel at the cursor in Disco
 | S-15 (P3) | Code-block display offsets vs `code` | FIX: N2 rule; test |
 | S-16 (P3) | The dismissing click and key repeats | FIX: C1; U2 |
 | S-17 (P3) | Emoji attachments | FIX: N0-8 image-only attachments, `:name:` in copies |
-| S-18 (P4) | Copies carry the author's invisible controls (paste-jacking) | DEFER to E1: measure the official client, then pin the answer in an N1 test |
+| S-18 (P4) | Copies carry the author's invisible controls (paste-jacking) | Measured (E1, 2026-10-15): the official client's selection copy keeps U+001B and U+202C byte for byte; Discord's server strips U+202E from message content. velella matches: the author's characters are copied unchanged; an N1 test pins that ESC survives a copy |
 | S-19 (P4) | A one-line header lets an RLO in the name reorder the time | Resolved by D3 (the user chose the official line breaks) |
 | S-20 (P4) | A bare TextKit 2 view removes most NSTextView defaults by construction | Adopted as D6 option B; the user picks after N0 |
 | T5 | Attributed-string importers | Confirmed sufficient by the review |
