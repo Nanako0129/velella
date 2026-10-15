@@ -234,7 +234,8 @@ final class AppModel {
                 avatarURL: row.authorAvatarUrl, timestampMs: row.timestampMs, content: row.content,
                 body: Self.body(row), edited: row.edited, images: row.images.map { ($0.url, $0.width, $0.height) },
                 files: row.files, replyAuthor: row.reply?.authorName, replyContent: row.reply?.content,
-                pending: row.pending, failure: row.failure
+                pending: row.pending, failure: row.failure,
+                reactions: row.reactions.map { ($0.name, $0.url, $0.count, $0.me) }
             )
         }
         shell.typing = snapshot.typing

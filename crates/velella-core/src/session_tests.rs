@@ -1347,6 +1347,37 @@ mod messages_live {
         assert!(s.typing.is_empty());
     }
 
+    /// The store learns the self user from the session state: a reaction event from user 1 (the
+    /// READY user) sets `me`, one from another user does not.
+    #[tokio::test]
+    async fn reaction_events_set_me_from_the_session_user() {
+        let history = json!([{"id": "11", "channel_id": "20", "content": "x",
+            "author": {"id": "9", "username": "u9"},
+            "reactions": [{"count": 1, "me": false, "emoji": {"id": null, "name": "\u{1f44d}"}}]}]);
+        let mock = MockHttp::start(vec![ok(history)]).await;
+        mock.install();
+        let mut rig = Rig::start().await;
+        let (mut conn, mut rx, _sub) = open_general(&mut rig).await;
+        let s = until(&mut rx, |s| s.load == LoadState::Loaded).await;
+        assert_eq!(s.rows[0].reactions.len(), 1);
+        let event = |seq, user: &str, name: &str| {
+            dispatch(
+                seq,
+                name,
+                json!({
+                    "user_id": user, "channel_id": "20", "message_id": "11",
+                    "emoji": {"id": null, "name": "\u{1f44d}"},
+                }),
+            )
+        };
+        conn.send(event(3, "9", "MESSAGE_REACTION_ADD")).await;
+        let s = until(&mut rx, |s| s.rows[0].reactions[0].count == 2).await;
+        assert!(!s.rows[0].reactions[0].me);
+        conn.send(event(4, "1", "MESSAGE_REACTION_ADD")).await;
+        let s = until(&mut rx, |s| s.rows[0].reactions[0].count == 3).await;
+        assert!(s.rows[0].reactions[0].me);
+    }
+
     #[tokio::test]
     async fn nothing_is_sent_before_ready_even_to_the_open_channel() {
         let mock = MockHttp::start(vec![ok(json!([]))]).await;

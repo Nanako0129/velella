@@ -46,6 +46,16 @@ pub struct MessageReply {
     pub content: String,
 }
 
+/// One emoji's reaction. A custom emoji has `url` (built in core from its id); a unicode emoji is
+/// its `name` and has none.
+#[derive(uniffi::Record)]
+pub struct MessageReaction {
+    pub name: String,
+    pub url: Option<String>,
+    pub count: u32,
+    pub me: bool,
+}
+
 #[derive(uniffi::Record)]
 pub struct MessageRow {
     pub id: u64,
@@ -68,6 +78,8 @@ pub struct MessageRow {
     pub pending: bool,
     /// Fixed text.
     pub failure: Option<String>,
+    /// First-seen order, at most 20.
+    pub reactions: Vec<MessageReaction>,
 }
 
 #[derive(uniffi::Record)]
@@ -176,6 +188,16 @@ impl From<velella_core::MessageRow> for MessageRow {
             }),
             pending: r.pending,
             failure: r.failure.map(str::to_owned),
+            reactions: r
+                .reactions
+                .into_iter()
+                .map(|x| MessageReaction {
+                    name: x.name,
+                    url: x.url,
+                    count: x.count,
+                    me: x.me,
+                })
+                .collect(),
         }
     }
 }
@@ -219,6 +241,14 @@ mod tests {
             }),
             pending: false,
             failure: Some("Not sent"),
+            reactions: vec![velella_core::Reaction {
+                id: Some(8),
+                name: "party".into(),
+                animated: false,
+                url: Some("https://cdn.discordapp.com/emojis/8.webp?size=48".into()),
+                count: 3,
+                me: true,
+            }],
         };
         let s = MessagesSnapshot::from(velella_core::MessagesSnapshot {
             channel_id: 9,
@@ -280,5 +310,20 @@ mod tests {
         let reply = r.reply.as_ref().unwrap();
         assert_eq!((&*reply.author_name, &*reply.content), ("r", "c"));
         assert_eq!(r.failure.as_deref(), Some("Not sent"));
+        let reaction = &r.reactions[0];
+        assert_eq!(
+            (
+                &*reaction.name,
+                reaction.url.as_deref(),
+                reaction.count,
+                reaction.me
+            ),
+            (
+                "party",
+                Some("https://cdn.discordapp.com/emojis/8.webp?size=48"),
+                3,
+                true
+            )
+        );
     }
 }

@@ -237,6 +237,8 @@ struct MessageRow: View {
             if case .failed(let reason) = message.delivery {
                 Text(verbatim: reason).font(T.Typography.timestamp).foregroundStyle(.red)
             }
+            // Last in the text column: after the text, attachments and any failure line.
+            ReactionsView(reactions: message.reactions)
         }
         .padding(.leading, M.contentInset)
         .padding(.trailing, M.trailingInset)

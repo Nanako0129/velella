@@ -96,6 +96,11 @@ public enum Fixtures {
             27: ImageAttachment(seed: 5, width: 360, height: 240),
             33: ImageAttachment(seed: 6, width: 480, height: 320),
         ]
+        // Unicode only: a fixture makes no network request. The first pill is the user's own.
+        let reactions: [Int: [ReactionItem]] = [
+            2: [ReactionItem(name: "\u{1F44D}", count: 12, me: true), ReactionItem(name: "\u{1F389}", count: 3), ReactionItem(name: "\u{2764}\u{FE0F}", count: 1)],
+            9: [ReactionItem(name: "\u{1F602}", count: 2)],
+        ]
         return (0..<36).map { index in
             let author = authors[(index * 5 + index / 3) % authors.count]
             let markdown = index == 6
@@ -105,7 +110,8 @@ public enum Fixtures {
                 timestamp: baseTime.addingTimeInterval(Double(index) * 240),
                 text: markdown ? markdownSource : images[index] != nil ? lines[8] : lines[index % 8],
                 body: markdown ? markdownBody : nil,
-                images: images[index].map { [$0] } ?? []
+                images: images[index].map { [$0] } ?? [],
+                reactions: reactions[index] ?? []
             )
         }
     }()

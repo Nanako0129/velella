@@ -23,11 +23,15 @@
 //!   computes off the lock, and `apply` sets each block's highlight only while the message still has
 //!   exactly those blocks. Every `bump` wakes it. On the session path the only highlighting code is
 //!   the pure table lookup `highlight::header`.
+//! - Reactions (wave 3, X) are parsed with the message and edited in place by the four
+//!   MESSAGE_REACTION_* dispatches (see reactions.rs); an event for a message not buffered is
+//!   dropped, and `me` follows events whose `user_id` is the self user (`set_me`).
 //! - A reply preview is flattened from the replied message's AST: a spoiler and everything in it
 //!   become one placeholder, so a preview never shows spoiler text.
 use crate::{
     highlight::{self, Highlighted, Job},
     markdown::{self, Block, Inline, NavTarget, TimestampStyle},
+    reactions::{self, Reaction},
     rest::{Rest, RestError},
     session::{SessionHandle, Subscription},
     sidebar::{avatar_url, CDN},
@@ -147,6 +151,8 @@ pub struct MessageRow {
     pub pending: bool,
     /// A local echo whose send failed.
     pub failure: Option<&'static str>,
+    /// First-seen order, at most 20.
+    pub reactions: Vec<Reaction>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -163,7 +169,7 @@ pub struct MessagesSnapshot {
 
 // ---- Parsing ----
 
-fn id(v: &Value) -> Option<u64> {
+pub(crate) fn id(v: &Value) -> Option<u64> {
     v.as_str()
         .and_then(|s| s.parse().ok())
         .or_else(|| v.as_u64())
@@ -312,6 +318,7 @@ struct Stored {
     mentions: Vec<(u64, String)>,
     reply: Option<Box<Stored>>,
     nonce: Option<String>,
+    reactions: Vec<Reaction>,
 }
 
 /// A message object from the gateway or REST. A referenced message is parsed one level deep.
@@ -347,6 +354,7 @@ fn parse(v: &Value, nested: bool) -> Option<Stored> {
             Value::Number(n) => Some(n.to_string()),
             _ => None,
         }),
+        reactions: reactions::parse(v.get("reactions")),
     })
 }
 
@@ -657,6 +665,7 @@ fn row(m: &Stored, ctx: &Context, pending: bool, failure: Option<&'static str>) 
         }),
         pending,
         failure,
+        reactions: m.reactions.clone(),
     }
 }
 
@@ -754,6 +763,8 @@ impl Open {
                     m.body = std::mem::take(&mut old.body);
                     m.pending = old.pending;
                 }
+                // A MESSAGE_CREATE never carries reactions; the buffered copy has the events.
+                m.reactions = std::mem::take(&mut old.reactions);
                 *old = m;
             }
             Ok(_) => {}
@@ -779,6 +790,8 @@ pub(crate) struct MessageStore {
     wake: Option<SyncSender<()>>,
     /// The time typing entries are judged against (a field so tests own the clock).
     clock: Box<dyn Fn() -> Instant + Send + Sync>,
+    /// The self user id (0 until known), from the session state; decides reactions' `me`.
+    me: AtomicU64,
     /// Dispatch names seen, so a test can show the observer is wired.
     #[cfg(test)]
     pub(crate) seen: std::sync::Mutex<Vec<String>>,
@@ -822,9 +835,15 @@ impl MessageStore {
             revision: watch::channel(0).0,
             wake,
             clock: Box::new(Instant::now),
+            me: AtomicU64::new(0),
             #[cfg(test)]
             seen: Default::default(),
         }
+    }
+
+    /// The self user's id, as the session state has it (`None` before READY).
+    pub(crate) fn set_me(&self, user_id: Option<u64>) {
+        self.me.store(user_id.unwrap_or(0), Ordering::Relaxed);
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -1034,7 +1053,16 @@ impl MessageStore {
     pub(crate) fn observe(&self, name: &str, d: &Value) {
         #[cfg(test)]
         self.seen.lock().unwrap().push(name.to_owned());
-        if !matches!(name, "MESSAGE_CREATE" | "MESSAGE_UPDATE" | "MESSAGE_DELETE") {
+        if !matches!(
+            name,
+            "MESSAGE_CREATE"
+                | "MESSAGE_UPDATE"
+                | "MESSAGE_DELETE"
+                | "MESSAGE_REACTION_ADD"
+                | "MESSAGE_REACTION_REMOVE"
+                | "MESSAGE_REACTION_REMOVE_ALL"
+                | "MESSAGE_REACTION_REMOVE_EMOJI"
+        ) {
             return;
         }
         let mut inner = self.lock();
@@ -1067,13 +1095,26 @@ impl MessageStore {
                 };
                 m.merge(d);
             }
-            _ => {
+            "MESSAGE_DELETE" => {
                 let Some(target) = d.get("id").and_then(id) else {
                     return;
                 };
                 open.messages.retain(|m| m.id != target);
                 if open.load == LoadState::Loading || open.older == OlderState::Loading {
                     open.deleted.push(target);
+                }
+            }
+            _ => {
+                let Some(m) = d
+                    .get("message_id")
+                    .and_then(id)
+                    .and_then(|target| open.messages.iter_mut().find(|m| m.id == target))
+                else {
+                    return;
+                };
+                let me = Some(self.me.load(Ordering::Relaxed)).filter(|n| *n != 0);
+                if !reactions::apply(&mut m.reactions, name, d, me) {
+                    return;
                 }
             }
         }
@@ -1117,6 +1158,7 @@ impl MessageStore {
                 mentions: Vec::new(),
                 reply,
                 nonce: None,
+                reactions: Vec::new(),
             },
             failure: None,
         });
