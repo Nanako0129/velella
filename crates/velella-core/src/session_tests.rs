@@ -1292,6 +1292,29 @@ mod messages_live {
         assert_eq!(posts, 1, "the POST was retried");
     }
 
+    /// `MessageSubscription::load_older` (the call the FFI makes) runs one older GET and the page
+    /// arrives as a snapshot with the rows prepended.
+    #[tokio::test]
+    async fn load_older_through_the_subscription_prepends_one_page() {
+        let first: Vec<Value> = (51..=100u64)
+            .rev()
+            .map(|id| json!({"id": id.to_string(), "channel_id": "20", "content": "new", "author": {"id": "9", "username": "u9"}}))
+            .collect();
+        let older = json!([{"id": "50", "channel_id": "20", "content": "old", "author": {"id": "9", "username": "u9"}}]);
+        let mock = MockHttp::start(vec![ok(Value::Array(first)), ok(older)]).await;
+        mock.install();
+        let mut rig = Rig::start().await;
+        let (_conn, mut rx, sub) = open_general(&mut rig).await;
+        let s = until(&mut rx, |s| s.load == LoadState::Loaded).await;
+        assert_eq!((s.rows.len(), s.older), (50, crate::OlderState::Idle));
+        sub.load_older();
+        let s = until(&mut rx, |s| s.older == crate::OlderState::ReachedStart).await;
+        assert_eq!((s.rows.len(), s.rows[0].id), (51, 50));
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].starts_with("GET /api/v9/channels/20/messages?limit=50&before=51 "));
+    }
+
     #[tokio::test]
     async fn nothing_is_sent_before_ready_even_to_the_open_channel() {
         let mock = MockHttp::start(vec![ok(json!([]))]).await;

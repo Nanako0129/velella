@@ -5,7 +5,11 @@
 //! Rules, each with a named test in messages_tests.rs:
 //! - Only the open channel is buffered. Opening fetches its latest 50 once; leaving cancels the
 //!   fetch. History is merged into live events that arrived meanwhile (a live copy wins), sorted
-//!   ascending by snowflake, deduplicated by id and capped at 200 (oldest dropped).
+//!   ascending by snowflake, deduplicated by id and capped at `CAP` (oldest dropped).
+//! - Older history (wave 3 P): `load_older` fetches the 50 messages before the oldest buffered
+//!   one, one GET at a time, only when the UI asks (it reaches the top). A page of fewer than 50,
+//!   or a buffer too full for another page, marks the start reached; a failure keeps the rows and
+//!   allows a retry.
 //! - MESSAGE_UPDATE merges only the fields it carries (Concord's partial update,
 //!   refs/concord/src/discord/gateway/parser/messages.rs:943-1021; see THIRD_PARTY_NOTICES.md).
 //! - Sends go only to the open channel; the local echo is reconciled on nonce and self author.
@@ -43,7 +47,9 @@ use std::{
 use tokio::{sync::watch, task::AbortHandle, task::JoinHandle};
 
 /// Rows kept per open channel.
-const CAP: usize = 200;
+const CAP: usize = 1000;
+/// Messages per history GET (`limit=50`); a shorter page is the start of the channel.
+const PAGE: usize = 50;
 const DISCORD_EPOCH_MS: u64 = 1_420_070_400_000;
 const CAPTCHA_TEXT: &str = "Discord asked for a captcha; send this from the official app";
 /// What a spoiler shows as in a reply preview. Provisional: K0 has not captured Discord's yet.
@@ -58,6 +64,15 @@ const MAX_EMOJI_IMAGES: usize = 64;
 pub enum LoadState {
     Loading,
     Loaded,
+    Failed(&'static str),
+}
+
+/// Older-history state of the open channel; failures carry fixed text only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OlderState {
+    Idle,
+    Loading,
+    ReachedStart,
     Failed(&'static str),
 }
 
@@ -139,6 +154,7 @@ pub struct MessagesSnapshot {
     pub load: LoadState,
     /// Ascending; unconfirmed and failed echoes last, in send order.
     pub rows: Vec<MessageRow>,
+    pub older: OlderState,
 }
 
 // ---- Parsing ----
@@ -649,6 +665,17 @@ fn load_failure(e: RestError) -> &'static str {
     }
 }
 
+fn older_failure(e: RestError) -> &'static str {
+    match e {
+        RestError::Unauthorized => {
+            "Couldn't load older messages: Discord did not accept this sign-in"
+        }
+        RestError::Forbidden => "Couldn't load older messages: no access to this channel",
+        RestError::RateLimited => "Couldn't load older messages: rate limited",
+        _ => "Couldn't load older messages",
+    }
+}
+
 fn send_failure(e: RestError) -> &'static str {
     match e {
         RestError::Captcha => CAPTCHA_TEXT,
@@ -697,9 +724,20 @@ struct Open {
     /// Deleted while the history fetch ran, so the fetch cannot bring them back.
     deleted: Vec<u64>,
     fetch: Option<AbortHandle>,
+    older: OlderState,
+    /// The one in-flight older-page GET, while `older` is `Loading`.
+    older_fetch: Option<AbortHandle>,
 }
 
 impl Open {
+    /// Cancels every in-flight GET of this open channel (it is being left or replaced).
+    fn cancel(self) {
+        self.fetch
+            .into_iter()
+            .chain(self.older_fetch)
+            .for_each(|f| f.abort());
+    }
+
     /// Inserts in id order; `replace` decides whether an existing copy is overwritten.
     /// A replacing copy with equal `content` keeps the existing body and `pending`: the body is a
     /// function of `content` alone, so colours already applied stay.
@@ -859,15 +897,15 @@ impl MessageStore {
     /// and starts the one history GET. Returns the open's epoch. Needs a runtime context.
     pub(crate) fn open(self: &Arc<Self>, channel_id: u64) -> u64 {
         let mut inner = self.lock();
-        if let Some(fetch) = inner.open.take().and_then(|o| o.fetch) {
-            fetch.abort();
+        if let Some(open) = inner.open.take() {
+            open.cancel();
         }
         inner.epoch += 1;
         let epoch = inner.epoch;
         let store = self.clone();
         // The task cannot finish before `inner` is released: `history` takes the same lock.
         let fetch = tokio::spawn(async move {
-            let result = store.rest.channel_messages(channel_id).await;
+            let result = store.rest.channel_messages(channel_id, None).await;
             store.history(epoch, result);
         });
         inner.open = Some(Open {
@@ -878,6 +916,8 @@ impl MessageStore {
             echoes: Vec::new(),
             deleted: Vec::new(),
             fetch: Some(fetch.abort_handle()),
+            older: OlderState::Idle,
+            older_fetch: None,
         });
         drop(inner);
         self.bump();
@@ -889,8 +929,8 @@ impl MessageStore {
     pub(crate) fn close(&self, epoch: u64) {
         let mut inner = self.lock();
         if inner.open.as_ref().is_some_and(|o| o.epoch == epoch) {
-            if let Some(fetch) = inner.open.take().and_then(|o| o.fetch) {
-                fetch.abort();
+            if let Some(open) = inner.open.take() {
+                open.cancel();
             }
             drop(inner);
             self.bump();
@@ -912,9 +952,71 @@ impl MessageStore {
                 }
                 open.deleted = Vec::new();
                 open.load = LoadState::Loaded;
+                if list.len() < PAGE {
+                    open.older = OlderState::ReachedStart;
+                }
             }
             Err(e) => open.load = LoadState::Failed(load_failure(e)),
         }
+        drop(inner);
+        self.bump();
+    }
+
+    /// Asks for the page before the oldest buffered message of the channel opened at `epoch`.
+    /// Does nothing unless the first page is in and no older GET is running or the start reached
+    /// (a failed one may be retried). A buffer without room for another page counts as the start:
+    /// the page is not requested. Needs a runtime context.
+    pub(crate) fn load_older(self: &Arc<Self>, epoch: u64) {
+        let mut inner = self.lock();
+        let Some(open) = inner.open.as_mut().filter(|o| o.epoch == epoch) else {
+            return;
+        };
+        if open.load != LoadState::Loaded
+            || !matches!(open.older, OlderState::Idle | OlderState::Failed(_))
+        {
+            return;
+        }
+        let before = open.messages.first().map(|m| m.id);
+        match before.filter(|_| open.messages.len() + PAGE <= CAP) {
+            None => open.older = OlderState::ReachedStart,
+            Some(before) => {
+                open.older = OlderState::Loading;
+                let (store, channel_id) = (self.clone(), open.channel_id);
+                // The task cannot finish before `inner` is released: `older_page` takes the lock.
+                let fetch = tokio::spawn(async move {
+                    let result = store.rest.channel_messages(channel_id, Some(before)).await;
+                    store.older_page(epoch, result);
+                });
+                open.older_fetch = Some(fetch.abort_handle());
+            }
+        }
+        drop(inner);
+        self.bump();
+    }
+
+    /// An older page, merged like the first one; dropped when its channel was left or replaced.
+    fn older_page(&self, epoch: u64, result: Result<Vec<Value>, RestError>) {
+        let mut inner = self.lock();
+        let Some(open) = inner.open.as_mut().filter(|o| o.epoch == epoch) else {
+            return;
+        };
+        open.older_fetch = None;
+        open.older = match result {
+            Ok(list) => {
+                for m in list.iter().filter_map(|v| parse(v, false)) {
+                    if !open.deleted.contains(&m.id) {
+                        open.insert(m, false);
+                    }
+                }
+                open.deleted = Vec::new();
+                if list.len() < PAGE {
+                    OlderState::ReachedStart
+                } else {
+                    OlderState::Idle
+                }
+            }
+            Err(e) => OlderState::Failed(older_failure(e)),
+        };
         drop(inner);
         self.bump();
     }
@@ -960,7 +1062,7 @@ impl MessageStore {
                     return;
                 };
                 open.messages.retain(|m| m.id != target);
-                if open.load == LoadState::Loading {
+                if open.load == LoadState::Loading || open.older == OlderState::Loading {
                     open.deleted.push(target);
                 }
             }
@@ -1038,6 +1140,7 @@ impl MessageStore {
             channel_id: open.channel_id,
             load: open.load.clone(),
             rows,
+            older: open.older.clone(),
         })
     }
 }
@@ -1077,6 +1180,14 @@ pub struct MessageSubscription {
     epoch: u64,
     task: JoinHandle<()>,
     _context: Subscription,
+}
+
+impl MessageSubscription {
+    /// Asks for the page of messages before the oldest buffered one (see
+    /// `MessageStore::load_older`); the result arrives as a snapshot. Needs a runtime context.
+    pub fn load_older(&self) {
+        self.store.load_older(self.epoch);
+    }
 }
 
 impl Drop for MessageSubscription {

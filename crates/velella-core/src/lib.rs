@@ -40,7 +40,7 @@ pub use identify::USER_AGENT;
 pub use member_list::{member_sections, MemberListEntry, MemberListSection, MemberListStatus};
 pub use messages::{
     EmojiImage, LoadState, MentionKind, MessageImage, MessageReply, MessageRow,
-    MessageSubscription, MessagesSnapshot, ResolvedMention,
+    MessageSubscription, MessagesSnapshot, OlderState, ResolvedMention,
 };
 pub use presence::PresenceStatus;
 pub use session::{Session, SessionEvent, SessionHandle, Subscription};

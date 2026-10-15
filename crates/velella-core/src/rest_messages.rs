@@ -14,9 +14,15 @@ struct CreateMessage<'a> {
 }
 
 impl Rest {
-    /// The latest 50 messages of a channel or DM, newest first as Discord returns them.
-    pub(crate) async fn channel_messages(&self, channel_id: u64) -> Result<Vec<Value>, RestError> {
-        self.get(&format!("/channels/{channel_id}/messages?limit=50"))
+    /// 50 messages of a channel or DM, newest first as Discord returns them: the latest, or the
+    /// ones just before message `before` (a `u64`, so the query cannot be shaped either).
+    pub(crate) async fn channel_messages(
+        &self,
+        channel_id: u64,
+        before: Option<u64>,
+    ) -> Result<Vec<Value>, RestError> {
+        let before = before.map_or_else(String::new, |id| format!("&before={id}"));
+        self.get(&format!("/channels/{channel_id}/messages?limit=50{before}"))
             .await
     }
 
