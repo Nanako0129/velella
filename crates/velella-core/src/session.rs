@@ -95,6 +95,7 @@ impl Shared {
     // ponytail: clones the whole State when a reader holds a snapshot; fine at sidebar sizes,
     // switch to per-guild Arcs if profiling says otherwise.
     fn apply(&self, event: &str, d: &Value) -> bool {
+        let user_id;
         let changed = {
             let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
             let changed = Arc::make_mut(&mut guard).apply(event, d);
@@ -106,11 +107,13 @@ impl Shared {
                 .lock()
                 .unwrap()
                 .push((event.to_owned(), guard.member_sub.clone()));
+            user_id = guard.user_id;
             changed
         };
         // Outside the state lock: the store keeps its own buffers. Every dispatch goes through,
         // including the ones `State` ignores (MESSAGE_*).
         if let Some(store) = self.messages.get() {
+            store.set_me(user_id);
             store.observe(event, d);
         }
         changed
@@ -185,7 +188,11 @@ impl SessionHandle {
     pub(crate) fn messages(&self) -> Arc<MessageStore> {
         self.shared
             .messages
-            .get_or_init(|| MessageStore::new(self.shared.rest.clone()))
+            .get_or_init(|| {
+                let store = MessageStore::new(self.shared.rest.clone());
+                store.set_me(self.shared.snapshot().user_id);
+                store
+            })
             .clone()
     }
 

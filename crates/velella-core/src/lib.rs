@@ -12,6 +12,7 @@ mod member_list;
 mod messages;
 mod permissions;
 mod presence;
+mod reactions;
 mod read_state;
 mod relationships;
 mod rest;
@@ -43,6 +44,7 @@ pub use messages::{
     MessageSubscription, MessagesSnapshot, ResolvedMention,
 };
 pub use presence::PresenceStatus;
+pub use reactions::Reaction;
 pub use session::{Session, SessionEvent, SessionHandle, Subscription};
 pub use sidebar::{
     channel_categories, dm_list, guild_entries, SidebarCategory, SidebarChannel, SidebarDm,

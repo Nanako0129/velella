@@ -192,19 +192,21 @@ public struct MessageItem: Identifiable, Hashable, Sendable {
     public var reply: ReplyPreview?
     public var edited: Bool
     public var delivery: Delivery
+    /// First-seen order, at most 20; read-only pills under the message.
+    public var reactions: [ReactionItem]
     /// Without a `body`, `text` shows as one plain paragraph. Without an `authorId` (fixtures,
     /// previews) the name stands in for it.
     public init(
         id: String, authorId: String? = nil, authorName: String, authorColor: RGB? = nil, avatar: Avatar, timestamp: Date, text: String,
         body: MessageBody? = nil,
         displayNameStyle: DisplayNameStyle? = nil, images: [ImageAttachment] = [], files: [String] = [],
-        reply: ReplyPreview? = nil, edited: Bool = false, delivery: Delivery = .sent
+        reply: ReplyPreview? = nil, edited: Bool = false, delivery: Delivery = .sent, reactions: [ReactionItem] = []
     ) {
         self.id = id; self.authorId = authorId ?? authorName; self.authorName = authorName; self.authorColor = authorColor
         self.avatar = avatar; self.timestamp = timestamp; self.text = text
         self.body = body ?? MessageBody(text: text)
         self.displayNameStyle = displayNameStyle; self.images = images; self.files = files
-        self.reply = reply; self.edited = edited; self.delivery = delivery
+        self.reply = reply; self.edited = edited; self.delivery = delivery; self.reactions = reactions
     }
 }
 
@@ -229,7 +231,8 @@ public extension MessageItem {
     static func live(
         id: UInt64, authorId: UInt64, authorName: String, authorColor: UInt32?, avatarURL: String, timestampMs: UInt64,
         content: String, body: MessageBody, edited: Bool, images: [(url: String, width: UInt32, height: UInt32)],
-        files: [String], replyAuthor: String?, replyContent: String?, pending: Bool, failure: String?
+        files: [String], replyAuthor: String?, replyContent: String?, pending: Bool, failure: String?,
+        reactions: [(name: String, url: String?, count: UInt32, me: Bool)] = []
     ) -> MessageItem {
         MessageItem(
             id: String(id), authorId: String(authorId), authorName: authorName, authorColor: authorColor.map { RGB(rgb: $0) },
@@ -241,7 +244,8 @@ public extension MessageItem {
             files: files,
             reply: replyAuthor.map { ReplyPreview(authorName: $0, segments: [.text(replyContent ?? "")]) },
             edited: edited,
-            delivery: failure.map(Delivery.failed) ?? (pending ? .pending : .sent)
+            delivery: failure.map(Delivery.failed) ?? (pending ? .pending : .sent),
+            reactions: reactions.map { ReactionItem(name: $0.name, imageURL: $0.url.flatMap { URL(string: $0) }, count: $0.count, me: $0.me) }
         )
     }
 }

@@ -1334,3 +1334,305 @@ async fn release_contended_observe() {
     assert!(worst <= Duration::from_millis(5), "{worst:?}");
     assert!(longest <= Duration::from_millis(5), "{longest:?}");
 }
+
+// ---- Reactions (wave 3, track X) ----
+
+const THUMBS: &str = "\u{1f44d}";
+
+fn unicode(name: &str) -> Value {
+    json!({"id": null, "name": name})
+}
+
+fn custom(id: u64, name: &str, animated: bool) -> Value {
+    json!({"id": id.to_string(), "name": name, "animated": animated})
+}
+
+fn with_reactions(id: u64, reactions: Value) -> Value {
+    let mut m = msg(id, 5, "x");
+    m["reactions"] = reactions;
+    m
+}
+
+/// Channel 5 open with one message, id 10, carrying `reactions`; the self user is 1.
+async fn reacted(reactions: Value) -> (MockHttp, Arc<MessageStore>, u64) {
+    let (mock, store, epoch) = opened(json!([with_reactions(10, reactions)])).await;
+    store.set_me(Some(1));
+    (mock, store, epoch)
+}
+
+fn event(name: &str, user: u64, message: u64, emoji: Value) -> (String, Value) {
+    (
+        name.to_owned(),
+        json!({
+            "user_id": user.to_string(), "channel_id": "5", "message_id": message.to_string(),
+            "emoji": emoji,
+        }),
+    )
+}
+
+fn fire(store: &MessageStore, (name, d): (String, Value)) {
+    store.observe(&name, &d);
+}
+
+/// (name, count, me) of message 10's reactions.
+fn shown(store: &MessageStore, epoch: u64) -> Vec<(String, u32, bool)> {
+    now(store, epoch).rows[0]
+        .reactions
+        .iter()
+        .map(|r| (r.name.clone(), r.count, r.me))
+        .collect()
+}
+
+#[tokio::test]
+async fn reactions_parse_with_count_me_and_the_emoji() {
+    let (_mock, store, epoch) = reacted(json!([
+        {"count": 3, "me": true, "emoji": unicode(THUMBS)},
+        {"count": 2, "me": false, "emoji": custom(100_000_000_000_000_007, "party", true)},
+        {"count": 1, "emoji": custom(100_000_000_000_000_008, "still", false)},
+        {"count": 0, "me": false, "emoji": unicode("x")},
+        {"count": 4, "me": false, "emoji": {"id": null, "name": null}},
+        {"count": 4, "me": false, "emoji": {"id": "not-a-snowflake", "name": "bad"}},
+    ]))
+    .await;
+    let rs = now(&store, epoch).rows[0].reactions.clone();
+    assert_eq!(
+        rs.len(),
+        3,
+        "zero-count and unusable emoji are skipped: {rs:?}"
+    );
+    // A unicode emoji is its name, with no id and no image.
+    assert_eq!(
+        (
+            rs[0].id,
+            &*rs[0].name,
+            rs[0].url.as_deref(),
+            rs[0].count,
+            rs[0].me
+        ),
+        (None, THUMBS, None, 3, true)
+    );
+    // A custom emoji's URL comes from core's CDN rule and its id, never from the name.
+    assert_eq!(rs[1].id, Some(100_000_000_000_000_007));
+    assert!(rs[1].animated && !rs[1].me);
+    assert_eq!(
+        rs[1].url.as_deref(),
+        Some(&*emoji_url(100_000_000_000_000_007, true))
+    );
+    assert!(rs[1].url.as_deref().unwrap().ends_with(".gif?size=48"));
+    assert!(rs[2].url.as_deref().unwrap().ends_with(".webp?size=48"));
+    assert_eq!((rs[2].count, rs[2].me), (1, false));
+}
+
+#[tokio::test]
+async fn a_message_without_reactions_has_none() {
+    let (_mock, store, epoch) = opened(json!([msg(10, 5, "x")])).await;
+    assert!(now(&store, epoch).rows[0].reactions.is_empty());
+}
+
+#[tokio::test]
+async fn reaction_add_counts_and_appends_in_first_seen_order() {
+    let (_mock, store, epoch) =
+        reacted(json!([{"count": 1, "me": false, "emoji": unicode("a")}])).await;
+    fire(&store, event("MESSAGE_REACTION_ADD", 9, 10, unicode("b")));
+    fire(&store, event("MESSAGE_REACTION_ADD", 8, 10, unicode("a")));
+    fire(
+        &store,
+        event(
+            "MESSAGE_REACTION_ADD",
+            8,
+            10,
+            custom(100_000_000_000_000_007, "c", false),
+        ),
+    );
+    // A custom emoji is told apart by id, not by a name another emoji shares.
+    fire(&store, event("MESSAGE_REACTION_ADD", 7, 10, unicode("c")));
+    assert_eq!(
+        shown(&store, epoch),
+        [
+            ("a".into(), 2, false),
+            ("b".into(), 1, false),
+            ("c".into(), 1, false),
+            ("c".into(), 1, false)
+        ]
+    );
+}
+
+#[tokio::test]
+async fn reaction_remove_counts_down_and_zero_removes_the_reaction() {
+    let (_mock, store, epoch) = reacted(json!([
+        {"count": 2, "me": false, "emoji": unicode("a")},
+        {"count": 1, "me": false, "emoji": unicode("b")},
+    ]))
+    .await;
+    fire(
+        &store,
+        event("MESSAGE_REACTION_REMOVE", 9, 10, unicode("a")),
+    );
+    assert_eq!(
+        shown(&store, epoch),
+        [("a".into(), 1, false), ("b".into(), 1, false)]
+    );
+    fire(
+        &store,
+        event("MESSAGE_REACTION_REMOVE", 9, 10, unicode("a")),
+    );
+    assert_eq!(shown(&store, epoch), [("b".into(), 1, false)]);
+    // Removing one that is not listed changes nothing (and never underflows).
+    fire(
+        &store,
+        event("MESSAGE_REACTION_REMOVE", 9, 10, unicode("a")),
+    );
+    assert_eq!(shown(&store, epoch), [("b".into(), 1, false)]);
+}
+
+#[tokio::test]
+async fn reaction_remove_all_and_remove_emoji_clear_what_they_name() {
+    let (_mock, store, epoch) = reacted(json!([
+        {"count": 5, "me": true, "emoji": unicode("a")},
+        {"count": 2, "me": false, "emoji": unicode("b")},
+        {"count": 1, "me": false, "emoji": custom(100_000_000_000_000_007, "c", false)},
+    ]))
+    .await;
+    fire(
+        &store,
+        event("MESSAGE_REACTION_REMOVE_EMOJI", 0, 10, unicode("a")),
+    );
+    assert_eq!(
+        shown(&store, epoch),
+        [("b".into(), 2, false), ("c".into(), 1, false)]
+    );
+    fire(
+        &store,
+        event(
+            "MESSAGE_REACTION_REMOVE_EMOJI",
+            0,
+            10,
+            custom(100_000_000_000_000_007, "c", false),
+        ),
+    );
+    assert_eq!(shown(&store, epoch), [("b".into(), 2, false)]);
+    // REMOVE_ALL carries no emoji at all.
+    store.observe(
+        "MESSAGE_REACTION_REMOVE_ALL",
+        &json!({"channel_id": "5", "message_id": "10"}),
+    );
+    assert!(shown(&store, epoch).is_empty());
+}
+
+#[tokio::test]
+async fn me_follows_only_events_from_the_self_user() {
+    let (_mock, store, epoch) =
+        reacted(json!([{"count": 1, "me": false, "emoji": unicode("a")}])).await;
+    fire(&store, event("MESSAGE_REACTION_ADD", 9, 10, unicode("a")));
+    assert_eq!(shown(&store, epoch), [("a".into(), 2, false)]);
+    fire(&store, event("MESSAGE_REACTION_ADD", 1, 10, unicode("a")));
+    assert_eq!(shown(&store, epoch), [("a".into(), 3, true)]);
+    // Another user's removal leaves `me`; ours clears it.
+    fire(
+        &store,
+        event("MESSAGE_REACTION_REMOVE", 9, 10, unicode("a")),
+    );
+    assert_eq!(shown(&store, epoch), [("a".into(), 2, true)]);
+    fire(
+        &store,
+        event("MESSAGE_REACTION_REMOVE", 1, 10, unicode("a")),
+    );
+    assert_eq!(shown(&store, epoch), [("a".into(), 1, false)]);
+    // A new reaction of ours starts with `me`.
+    fire(&store, event("MESSAGE_REACTION_ADD", 1, 10, unicode("b")));
+    assert_eq!(shown(&store, epoch)[1], ("b".into(), 1, true));
+}
+
+#[tokio::test]
+async fn nobody_is_me_while_the_self_user_is_unknown() {
+    let (_mock, store, epoch) = opened(json!([with_reactions(10, json!([]))])).await;
+    fire(&store, event("MESSAGE_REACTION_ADD", 1, 10, unicode("a")));
+    assert_eq!(shown(&store, epoch), [("a".into(), 1, false)]);
+}
+
+#[tokio::test]
+async fn at_most_twenty_reactions_are_kept() {
+    let many: Vec<Value> = (0..25)
+        .map(|i| json!({"count": 1, "me": false, "emoji": unicode(&format!("e{i}"))}))
+        .collect();
+    let (_mock, store, epoch) = reacted(json!(many)).await;
+    assert_eq!(shown(&store, epoch).len(), 20, "parse keeps the first 20");
+    assert_eq!(shown(&store, epoch)[19].0, "e19");
+    // A 21st emoji by event is dropped; an existing one still counts.
+    fire(&store, event("MESSAGE_REACTION_ADD", 9, 10, unicode("new")));
+    fire(&store, event("MESSAGE_REACTION_ADD", 9, 10, unicode("e0")));
+    let s = shown(&store, epoch);
+    assert_eq!((s.len(), s[0].1), (20, 2));
+    assert!(s.iter().all(|r| r.0 != "new"));
+    // Room freed by a removal admits a new emoji again.
+    fire(
+        &store,
+        event("MESSAGE_REACTION_REMOVE_EMOJI", 0, 10, unicode("e1")),
+    );
+    fire(&store, event("MESSAGE_REACTION_ADD", 9, 10, unicode("new")));
+    assert_eq!(shown(&store, epoch).last().unwrap().0, "new");
+}
+
+#[tokio::test]
+async fn burst_reactions_count_like_normal_ones() {
+    let (_mock, store, epoch) = reacted(json!([{"count": 2, "me": false,
+        "count_details": {"burst": 1, "normal": 1}, "emoji": unicode("a")}]))
+    .await;
+    let (name, mut d) = event("MESSAGE_REACTION_ADD", 9, 10, unicode("a"));
+    d["burst"] = json!(true);
+    d["type"] = json!(1);
+    store.observe(&name, &d);
+    assert_eq!(shown(&store, epoch), [("a".into(), 3, false)]);
+}
+
+#[tokio::test]
+async fn reaction_events_for_other_channels_or_unbuffered_messages_are_ignored() {
+    let (_mock, store, epoch) =
+        reacted(json!([{"count": 1, "me": false, "emoji": unicode("a")}])).await;
+    let before = *store.revision.borrow();
+    // Another channel's message with the same id.
+    let (name, mut d) = event("MESSAGE_REACTION_ADD", 9, 10, unicode("a"));
+    d["channel_id"] = json!("6");
+    store.observe(&name, &d);
+    // A message that is not in the buffer.
+    fire(&store, event("MESSAGE_REACTION_ADD", 9, 99, unicode("a")));
+    fire(
+        &store,
+        event("MESSAGE_REACTION_REMOVE", 9, 99, unicode("a")),
+    );
+    // Malformed: no message id, no emoji.
+    store.observe(
+        "MESSAGE_REACTION_ADD",
+        &json!({"channel_id": "5", "emoji": unicode("a")}),
+    );
+    store.observe(
+        "MESSAGE_REACTION_ADD",
+        &json!({"channel_id": "5", "message_id": "10", "user_id": "9"}),
+    );
+    assert_eq!(shown(&store, epoch), [("a".into(), 1, false)]);
+    assert_eq!(
+        *store.revision.borrow(),
+        before,
+        "nothing changed, nothing bumped"
+    );
+}
+
+#[tokio::test]
+async fn a_message_create_for_a_buffered_message_keeps_its_reactions() {
+    let (_mock, store, epoch) =
+        reacted(json!([{"count": 1, "me": false, "emoji": unicode("a")}])).await;
+    fire(&store, event("MESSAGE_REACTION_ADD", 9, 10, unicode("a")));
+    store.observe("MESSAGE_CREATE", &msg(10, 5, "x"));
+    assert_eq!(shown(&store, epoch), [("a".into(), 2, false)]);
+}
+
+#[tokio::test]
+async fn a_message_update_leaves_reactions_alone() {
+    let (_mock, store, epoch) =
+        reacted(json!([{"count": 1, "me": false, "emoji": unicode("a")}])).await;
+    store.observe(
+        "MESSAGE_UPDATE",
+        &json!({"id": "10", "channel_id": "5", "content": "edited"}),
+    );
+    assert_eq!(shown(&store, epoch), [("a".into(), 1, false)]);
+}
