@@ -110,6 +110,8 @@ struct EmbedView: View {
     let embed: EmbedItem
     /// Opens a vetted link; nil uses the surrounding (system) `openURL`. Tests inject a recorder.
     var opener: ((URL) -> Void)?
+    /// Where the card's images load from; tests point it at a local server.
+    var loader: MediaImages = .shared
     @Environment(\.openURL) private var outerOpenURL
     @Environment(\.discordLocale) private var locale
     @State private var revealed = false
@@ -228,13 +230,6 @@ struct EmbedView: View {
         return rows
     }
 
-    /// The images this card fetches: none while covered.
-    nonisolated static func fetchedImages(_ embed: EmbedItem, covered: Bool) -> [URL] {
-        guard !covered else { return [] }
-        let (thumbnail, large) = slots(embed)
-        return [embed.authorIcon, thumbnail?.url, large?.url, embed.footerIcon].compactMap { $0 }
-    }
-
     /// (top-right thumbnail, large image): a video shows its preview large and no thumbnail.
     nonisolated static func slots(_ embed: EmbedItem) -> (thumbnail: EmbedItem.Image?, large: EmbedItem.Image?) {
         embed.isVideo ? (nil, embed.image ?? embed.thumbnail) : (embed.thumbnail, embed.image)
@@ -329,6 +324,6 @@ struct EmbedView: View {
     }
 
     private func media(_ url: URL, box: CGSize, alt: String?) -> some View {
-        MediaImageView(url: url, box: box, alt: alt)
+        MediaImageView(url: url, box: box, alt: alt, loader: loader)
     }
 }

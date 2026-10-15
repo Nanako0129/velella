@@ -53,7 +53,7 @@ import UniformTypeIdentifiers
 
 /// A one-thread HTTP/1.1 server on 127.0.0.1 answering each connection with the next canned
 /// response, then closing it. Records each request's head.
-private final class LocalServer: @unchecked Sendable {
+final class LocalServer: @unchecked Sendable {
     let port: UInt16
     private let fd: Int32
     private let lock = NSLock()
@@ -130,14 +130,14 @@ private final class LocalServer: @unchecked Sendable {
     }
 }
 
-private func response(_ status: String = "200 OK", headers: [String] = [], body: Data, length: Bool = true) -> Data {
+func response(_ status: String = "200 OK", headers: [String] = [], body: Data, length: Bool = true) -> Data {
     var head = "HTTP/1.1 \(status)\r\nConnection: close\r\nContent-Type: image/png\r\n"
     if length { head += "Content-Length: \(body.count)\r\n" }
     for h in headers { head += h + "\r\n" }
     return head.data(using: .utf8)! + "\r\n".data(using: .utf8)! + body
 }
 
-private func png(width: Int, height: Int) -> Data {
+func png(width: Int, height: Int) -> Data {
     let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
                             space: CGColorSpaceCreateDeviceGray(), bitmapInfo: CGImageAlphaInfo.none.rawValue)!
     let image = context.makeImage()!

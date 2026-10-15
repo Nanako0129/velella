@@ -84,14 +84,11 @@ private func embed(spoiler: Bool = false) -> EmbedItem {
 
 // MARK: Spoiler cover
 
-@Test func aCoveredCardSpeaksOnlySpoilerAndFetchesNothing() {
+@Test func aCoveredCardSpeaksOnlySpoiler() {
     let covered = embed(spoiler: true)
     let label = EmbedView.spokenLabel(covered, covered: true)
     #expect(label == "Spoiler")
     #expect(label?.contains("Secret") == false)
-    #expect(EmbedView.fetchedImages(covered, covered: true).isEmpty)
-    // Revealed (or never covered), the same card fetches its four images.
-    #expect(EmbedView.fetchedImages(covered, covered: false).count == 4)
     #expect(EmbedView.spokenLabel(covered, covered: false) == nil)
 }
 
@@ -219,4 +216,25 @@ private func imageless(spoiler: Bool) -> EmbedItem {
         let renderer = ImageRenderer(content: EmbedView(embed: e, opener: { _ in }).frame(width: 520))
         #expect(renderer.nsImage != nil)
     }
+}
+
+/// A covered card builds no image view, so nothing is fetched until it is revealed; the same card
+/// uncovered fetches its four images (all through the test seam to 127.0.0.1).
+@MainActor @Test func aCoveredCardFetchesNothing() async throws {
+    let server = try LocalServer(Array(repeating: response(body: png(width: 10, height: 10)), count: 8))
+    let loader = MediaImages(rewrite: server.rewrite)
+    func show(_ e: EmbedItem) -> NSWindow {
+        let host = NSHostingView(rootView: EmbedView(embed: e, opener: { _ in }, loader: loader).frame(width: 520))
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 520, height: 600), styleMask: .borderless, backing: .buffered, defer: true)
+        window.contentView = host
+        host.layoutSubtreeIfNeeded()
+        return window
+    }
+    let covered = show(embed(spoiler: true))
+    try await Task.sleep(for: .milliseconds(500))
+    #expect(server.requests.isEmpty, "\(server.requests)")
+    let shown = show(embed())
+    try await Task.sleep(for: .milliseconds(1500))
+    #expect(server.requests.count == 4, "\(server.requests.count)")
+    _ = (covered, shown)
 }
