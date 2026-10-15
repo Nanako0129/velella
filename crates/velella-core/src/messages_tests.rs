@@ -14,6 +14,9 @@ use tokio::{io::AsyncReadExt, net::TcpListener, sync::mpsc, time::timeout};
 #[path = "reply_typing_tests.rs"]
 mod reply_typing;
 
+#[path = "embeds_tests.rs"]
+mod embeds_tests;
+
 const MARKER: &str = "SYNTHETIC_TOKEN_MARKER_0123456789";
 const WAIT: Duration = Duration::from_secs(10);
 
@@ -530,7 +533,8 @@ fn image_attachments_need_positive_dimensions_and_others_are_listed_by_filename(
         [MessageImage {
             url: url.into(),
             width: 640,
-            height: 480
+            height: 480,
+            spoiler: false
         }]
     );
     assert_eq!(r.files, ["zero.png", "nodims.png", "clip.mp4", "huge.png"]);

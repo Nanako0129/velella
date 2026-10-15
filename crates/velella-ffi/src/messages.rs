@@ -35,9 +35,62 @@ pub enum MessageOlder {
 
 #[derive(uniffi::Record)]
 pub struct MessageImage {
+    /// One of Discord's media hosts (core's `media_url`).
     pub url: String,
     pub width: u32,
     pub height: u32,
+    /// Covered until revealed, and not fetched before (IS_SPOILER or a `SPOILER_` filename).
+    pub spoiler: bool,
+}
+
+/// A checked http(s) link target: canonical URL and ASCII host (core's message-link check).
+#[derive(uniffi::Record)]
+pub struct MessageEmbedLink {
+    pub url: String,
+    pub host: String,
+}
+
+/// An embed thumbnail or image: a media-host proxy URL, both sides 1...16384.
+#[derive(uniffi::Record)]
+pub struct MessageEmbedImage {
+    pub url: String,
+    pub width: u32,
+    pub height: u32,
+    /// Alt text; text, not markup.
+    pub description: Option<String>,
+}
+
+#[derive(uniffi::Record)]
+pub struct MessageEmbedField {
+    /// Text, not markup.
+    pub name: String,
+    pub value: Vec<MdBlock>,
+    pub inline: bool,
+}
+
+/// One embed. Plain strings are text, not markup; `description` and field values are core's
+/// markdown AST. Icons and images are media-host proxy URLs only; no original image, icon or
+/// video URL crosses.
+#[derive(uniffi::Record)]
+pub struct MessageEmbed {
+    pub title: Option<String>,
+    pub url: Option<MessageEmbedLink>,
+    pub description: Vec<MdBlock>,
+    pub color: Option<u32>,
+    pub timestamp_ms: Option<i64>,
+    pub author_name: Option<String>,
+    pub author_url: Option<MessageEmbedLink>,
+    pub author_icon_url: Option<String>,
+    pub footer_text: Option<String>,
+    pub footer_icon_url: Option<String>,
+    pub fields: Vec<MessageEmbedField>,
+    pub provider_name: Option<String>,
+    pub provider_url: Option<MessageEmbedLink>,
+    pub thumbnail: Option<MessageEmbedImage>,
+    pub image: Option<MessageEmbedImage>,
+    pub is_video: bool,
+    /// The body hides this embed's link in a spoiler: cover the whole card.
+    pub spoiler: bool,
 }
 
 #[derive(uniffi::Record)]
@@ -80,6 +133,8 @@ pub struct MessageRow {
     pub failure: Option<String>,
     /// First-seen order, at most 20.
     pub reactions: Vec<MessageReaction>,
+    /// At most 10.
+    pub embeds: Vec<MessageEmbed>,
 }
 
 #[derive(uniffi::Record)]
@@ -179,6 +234,7 @@ impl From<velella_core::MessageRow> for MessageRow {
                     url: i.url,
                     width: i.width,
                     height: i.height,
+                    spoiler: i.spoiler,
                 })
                 .collect(),
             files: r.files,
@@ -198,6 +254,55 @@ impl From<velella_core::MessageRow> for MessageRow {
                     me: x.me,
                 })
                 .collect(),
+            embeds: r.embeds.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+fn embed_link(l: velella_core::embeds::EmbedLink) -> MessageEmbedLink {
+    MessageEmbedLink {
+        url: l.url,
+        host: l.host,
+    }
+}
+
+fn embed_image(i: velella_core::embeds::EmbedImage) -> MessageEmbedImage {
+    MessageEmbedImage {
+        url: i.url,
+        width: i.width,
+        height: i.height,
+        description: i.description,
+    }
+}
+
+impl From<velella_core::embeds::Embed> for MessageEmbed {
+    fn from(e: velella_core::embeds::Embed) -> Self {
+        Self {
+            title: e.title,
+            url: e.url.map(embed_link),
+            description: blocks(e.description),
+            color: e.color,
+            timestamp_ms: e.timestamp_ms,
+            author_name: e.author_name,
+            author_url: e.author_url.map(embed_link),
+            author_icon_url: e.author_icon_url,
+            footer_text: e.footer_text,
+            footer_icon_url: e.footer_icon_url,
+            fields: e
+                .fields
+                .into_iter()
+                .map(|f| MessageEmbedField {
+                    name: f.name,
+                    value: blocks(f.value),
+                    inline: f.inline,
+                })
+                .collect(),
+            provider_name: e.provider_name,
+            provider_url: e.provider_url.map(embed_link),
+            thumbnail: e.thumbnail.map(embed_image),
+            image: e.image.map(embed_image),
+            is_video: e.is_video,
+            spoiler: e.spoiler,
         }
     }
 }
@@ -233,6 +338,7 @@ mod tests {
                 url: "u".into(),
                 width: 4,
                 height: 5,
+                spoiler: true,
             }],
             files: vec!["f.txt".into()],
             reply: Some(velella_core::MessageReply {
@@ -248,6 +354,40 @@ mod tests {
                 url: Some("https://cdn.discordapp.com/emojis/8.webp?size=48".into()),
                 count: 3,
                 me: true,
+            }],
+            embeds: vec![velella_core::embeds::Embed {
+                title: Some("t".into()),
+                url: Some(velella_core::embeds::EmbedLink {
+                    url: "https://a.test/".into(),
+                    host: "a.test".into(),
+                }),
+                description: velella_core::markdown::parse("**d**"),
+                color: Some(0xABCDEF),
+                timestamp_ms: Some(-5),
+                author_name: Some("an".into()),
+                author_url: None,
+                author_icon_url: Some("https://images-ext-1.discordapp.net/i".into()),
+                footer_text: Some("ft".into()),
+                footer_icon_url: Some("https://images-ext-2.discordapp.net/f".into()),
+                fields: vec![velella_core::embeds::EmbedField {
+                    name: "fn".into(),
+                    value: velella_core::markdown::parse("fv"),
+                    inline: true,
+                }],
+                provider_name: Some("pn".into()),
+                provider_url: Some(velella_core::embeds::EmbedLink {
+                    url: "https://p.test/".into(),
+                    host: "p.test".into(),
+                }),
+                thumbnail: None,
+                image: Some(velella_core::embeds::EmbedImage {
+                    url: "https://media.discordapp.net/x".into(),
+                    width: 3,
+                    height: 2,
+                    description: Some("alt".into()),
+                }),
+                is_video: true,
+                spoiler: true,
             }],
         };
         let s = MessagesSnapshot::from(velella_core::MessagesSnapshot {
@@ -303,8 +443,68 @@ mod tests {
         );
         assert_eq!((r.timestamp_ms, r.edited, r.pending), (3, true, false));
         assert_eq!(
-            (&*r.images[0].url, r.images[0].width, r.images[0].height),
-            ("u", 4, 5)
+            (
+                &*r.images[0].url,
+                r.images[0].width,
+                r.images[0].height,
+                r.images[0].spoiler
+            ),
+            ("u", 4, 5, true)
+        );
+        let e = &r.embeds[0];
+        assert_eq!(
+            (
+                e.title.as_deref(),
+                e.url.as_ref().map(|u| (&*u.url, &*u.host))
+            ),
+            (Some("t"), Some(("https://a.test/", "a.test")))
+        );
+        assert!(matches!(&e.description[..], [MdBlock::Paragraph { .. }]));
+        assert_eq!(
+            (e.color, e.timestamp_ms, e.is_video, e.spoiler),
+            (Some(0xABCDEF), Some(-5), true, true)
+        );
+        assert_eq!(
+            (
+                e.author_name.as_deref(),
+                e.author_url.is_none(),
+                e.author_icon_url.as_deref(),
+                e.footer_text.as_deref(),
+                e.footer_icon_url.as_deref()
+            ),
+            (
+                Some("an"),
+                true,
+                Some("https://images-ext-1.discordapp.net/i"),
+                Some("ft"),
+                Some("https://images-ext-2.discordapp.net/f")
+            )
+        );
+        assert_eq!(
+            (
+                &*e.fields[0].name,
+                e.fields[0].inline,
+                e.fields[0].value.len()
+            ),
+            ("fn", true, 1)
+        );
+        assert_eq!(
+            (
+                e.provider_name.as_deref(),
+                e.provider_url.as_ref().map(|u| &*u.url)
+            ),
+            (Some("pn"), Some("https://p.test/"))
+        );
+        assert!(e.thumbnail.is_none());
+        let image = e.image.as_ref().unwrap();
+        assert_eq!(
+            (
+                &*image.url,
+                image.width,
+                image.height,
+                image.description.as_deref()
+            ),
+            ("https://media.discordapp.net/x", 3, 2, Some("alt"))
         );
         assert_eq!(r.files, ["f.txt"]);
         let reply = r.reply.as_ref().unwrap();

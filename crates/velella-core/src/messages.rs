@@ -28,9 +28,16 @@
 //!   dropped, and `me` follows events whose `user_id` is the self user (`set_me`).
 //! - A reply preview is flattened from the replied message's AST: a spoiler and everything in it
 //!   become one placeholder, so a preview never shows spoiler text.
+//! - Embeds (wave 3 E, embeds.rs) are parsed with the message (descriptions and field values
+//!   parsed once there); a present `embeds` in an update replaces them, an absent one keeps them,
+//!   and `flags` bit 2 (SUPPRESS_EMBEDS) hides them from rows. An embed whose link the body hides
+//!   in a spoiler is marked `spoiler` in the row. Image attachments come only from `media_url`
+//!   (the proxy URL first), and IS_SPOILER or a `SPOILER_` filename marks them `spoiler`.
 use crate::{
+    embeds::{self, Embed},
     highlight::{self, Highlighted, Job},
     markdown::{self, Block, Inline, NavTarget, TimestampStyle},
+    media::media_url,
     reactions::{self, Reaction},
     rest::{Rest, RestError},
     session::{SessionHandle, Subscription},
@@ -63,6 +70,10 @@ const SPOILER_PLACEHOLDER: &str = "\u{2592}\u{2592}\u{2592}";
 const PREVIEW_CHARS: usize = 200;
 /// Distinct custom-emoji images per row (plan P3-4); further ones render as `:name:`.
 const MAX_EMOJI_IMAGES: usize = 64;
+/// Message flag SUPPRESS_EMBEDS.
+const SUPPRESS_EMBEDS: u64 = 1 << 2;
+/// Attachment flag IS_SPOILER.
+const IS_SPOILER: u64 = 1 << 3;
 
 /// Load state of the open channel; failures carry fixed text only.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -83,10 +94,13 @@ pub enum OlderState {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MessageImage {
+    /// Passed `media_url`.
     pub url: String,
     /// Both > 0 (checked when parsed).
     pub width: u32,
     pub height: u32,
+    /// IS_SPOILER or a `SPOILER_` filename: covered until revealed, not fetched before.
+    pub spoiler: bool,
 }
 
 /// The message a row replies to.
@@ -153,6 +167,8 @@ pub struct MessageRow {
     pub failure: Option<&'static str>,
     /// First-seen order, at most 20.
     pub reactions: Vec<Reaction>,
+    /// At most 10; none while SUPPRESS_EMBEDS is set.
+    pub embeds: Vec<Embed>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -206,8 +222,8 @@ enum Attachment {
     File(String),
 }
 
-/// An image needs an image (or absent) content type, a URL and both dimensions > 0; anything
-/// else is listed by filename.
+/// An image needs an image (or absent) content type, a media URL (`proxy_url`, else `url`, through
+/// `media_url`) and both dimensions > 0; anything else is listed by filename.
 fn attachment(a: &Value) -> Option<Attachment> {
     let filename = text(a, "filename")?;
     let dim = |key| {
@@ -220,14 +236,23 @@ fn attachment(a: &Value) -> Option<Attachment> {
         .get("content_type")
         .and_then(Value::as_str)
         .is_none_or(|t| t.starts_with("image/"));
-    Some(
-        match (image_type, text(a, "url"), dim("width"), dim("height")) {
-            (true, Some(url), Some(width), Some(height)) => {
-                Attachment::Image(MessageImage { url, width, height })
-            }
-            _ => Attachment::File(filename),
-        },
-    )
+    let url = ["proxy_url", "url"]
+        .into_iter()
+        .find_map(|k| a.get(k)?.as_str().and_then(media_url));
+    let spoiler = a
+        .get("flags")
+        .and_then(Value::as_u64)
+        .is_some_and(|f| f & IS_SPOILER != 0)
+        || filename.starts_with("SPOILER_");
+    Some(match (image_type, url, dim("width"), dim("height")) {
+        (true, Some(url), Some(width), Some(height)) => Attachment::Image(MessageImage {
+            url,
+            width,
+            height,
+            spoiler,
+        }),
+        _ => Attachment::File(filename),
+    })
 }
 
 fn attachments(v: Option<&Value>) -> Vec<Attachment> {
@@ -319,6 +344,17 @@ struct Stored {
     reply: Option<Box<Stored>>,
     nonce: Option<String>,
     reactions: Vec<Reaction>,
+    /// Parsed once with the message (descriptions and values included); never in `row()`.
+    embeds: Vec<Embed>,
+    /// `flags` bit 2: the embeds are kept but not shown.
+    suppress_embeds: bool,
+}
+
+/// Whether `flags` has SUPPRESS_EMBEDS; `None` when the payload carries no integer `flags`.
+fn suppress_embeds(v: &Value) -> Option<bool> {
+    v.get("flags")
+        .and_then(Value::as_u64)
+        .map(|f| f & SUPPRESS_EMBEDS != 0)
 }
 
 /// A message object from the gateway or REST. A referenced message is parsed one level deep.
@@ -355,6 +391,13 @@ fn parse(v: &Value, nested: bool) -> Option<Stored> {
             _ => None,
         }),
         reactions: reactions::parse(v.get("reactions")),
+        // A nested reply only feeds the one-line preview: its embeds are never parsed.
+        embeds: if nested {
+            Vec::new()
+        } else {
+            embeds::parse(v.get("embeds"))
+        },
+        suppress_embeds: suppress_embeds(v).unwrap_or(false),
     })
 }
 
@@ -377,6 +420,30 @@ impl Stored {
         if d.get("mentions").is_some() {
             self.mentions = mentions(d.get("mentions"));
         }
+        if d.get("embeds").is_some() {
+            self.embeds = embeds::parse(d.get("embeds"));
+        }
+        if let Some(suppress) = suppress_embeds(d) {
+            self.suppress_embeds = suppress;
+        }
+    }
+
+    /// The embeds rows show: none while suppressed.
+    fn shown_embeds(&self) -> &[Embed] {
+        if self.suppress_embeds {
+            &[]
+        } else {
+            &self.embeds
+        }
+    }
+
+    /// The body, then each shown embed's description and field values: every stored AST whose
+    /// mentions and emoji a row resolves.
+    fn markdown(&self) -> impl Iterator<Item = &[Block]> {
+        std::iter::once(self.body.as_slice()).chain(self.shown_embeds().iter().flat_map(|e| {
+            std::iter::once(e.description.as_slice())
+                .chain(e.fields.iter().map(|f| f.value.as_slice()))
+        }))
     }
 
     fn name(&self) -> String {
@@ -483,7 +550,7 @@ fn mention_name(
 fn resolve_mentions(m: &Stored, ctx: &Context) -> Vec<ResolvedMention> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
-    each_inline(&m.body, &mut |i| {
+    let mut each = |i: &Inline| {
         let Some((kind, id)) = mention_of(i).filter(|k| seen.insert(*k)) else {
             return;
         };
@@ -497,15 +564,18 @@ fn resolve_mentions(m: &Stored, ctx: &Context) -> Vec<ResolvedMention> {
             name: mention_name(kind, id, &m.mentions, ctx),
             color,
         });
-    });
+    };
+    m.markdown()
+        .for_each(|blocks| each_inline(blocks, &mut each));
     out
 }
 
-/// The first `MAX_EMOJI_IMAGES` distinct custom emoji of `body`, with their CDN URLs.
-fn emoji_images(body: &[Block]) -> Vec<EmojiImage> {
+/// The first `MAX_EMOJI_IMAGES` distinct custom emoji of `m`'s body and then its shown embeds,
+/// with their CDN URLs.
+fn emoji_images(m: &Stored) -> Vec<EmojiImage> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
-    each_inline(body, &mut |i| {
+    let mut each = |i: &Inline| {
         if let Inline::CustomEmoji { id, animated, .. } = *i {
             if out.len() < MAX_EMOJI_IMAGES && seen.insert((id, animated)) {
                 out.push(EmojiImage {
@@ -514,6 +584,23 @@ fn emoji_images(body: &[Block]) -> Vec<EmojiImage> {
                     url: emoji_url(id, animated),
                 });
             }
+        }
+    };
+    m.markdown()
+        .for_each(|blocks| each_inline(blocks, &mut each));
+    out
+}
+
+/// Canonical URLs of the links inside spoilers of `body` (an embed of one is covered).
+fn spoilered_links(body: &[Block]) -> HashSet<String> {
+    let mut out = HashSet::new();
+    each_inline(body, &mut |i| {
+        if let Inline::Spoiler(c) = i {
+            each_in(c, &mut |j| {
+                if let Inline::Link { url, .. } = j {
+                    out.insert(url.clone());
+                }
+            });
         }
     });
     out
@@ -654,7 +741,7 @@ fn row(m: &Stored, ctx: &Context, pending: bool, failure: Option<&'static str>) 
         content: m.content.clone(),
         body: m.body.clone(),
         mentions: resolve_mentions(m, ctx),
-        emoji: emoji_images(&m.body),
+        emoji: emoji_images(m),
         timestamp_ms: (m.id >> 22) + DISCORD_EPOCH_MS,
         edited: m.edited,
         images,
@@ -666,6 +753,16 @@ fn row(m: &Stored, ctx: &Context, pending: bool, failure: Option<&'static str>) 
         pending,
         failure,
         reactions: m.reactions.clone(),
+        embeds: {
+            let hidden = spoilered_links(&m.body);
+            m.shown_embeds()
+                .iter()
+                .map(|e| Embed {
+                    spoiler: e.url.as_ref().is_some_and(|u| hidden.contains(&u.url)),
+                    ..e.clone()
+                })
+                .collect()
+        },
     }
 }
 
@@ -1159,6 +1256,8 @@ impl MessageStore {
                 reply,
                 nonce: None,
                 reactions: Vec::new(),
+                embeds: Vec::new(),
+                suppress_embeds: false,
             },
             failure: None,
         });

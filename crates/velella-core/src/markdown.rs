@@ -777,8 +777,8 @@ fn in_ranges(table: &[(u32, u32)], c: char) -> bool {
         .is_ok()
 }
 
-/// C0, C1 or Cf: never allowed in a link target (D4).
-fn forbidden_in_url(c: char) -> bool {
+/// C0, C1 or Cf: never allowed in a link target (D4), nor in a media URL (media.rs).
+pub(crate) fn forbidden_in_url(c: char) -> bool {
     matches!(c, '\u{0}'..='\u{1f}' | '\u{80}'..='\u{9f}') || in_ranges(FORMAT, c)
 }
 
@@ -1146,6 +1146,15 @@ fn unescape_url(raw: &str) -> String {
 
 /// A validated link target: the canonical URL and its ASCII host.
 type Target = (String, String);
+
+/// A link target from outside message text (embed links, wave 3 E): the same check as a message
+/// link's target (D4: no C0, C1 or Cf character, then `validate`).
+pub(crate) fn checked_link(raw: &str) -> Option<Target> {
+    if raw.chars().any(forbidden_in_url) {
+        return None;
+    }
+    validate(raw)
+}
 
 /// D4: an http(s) target that `url::Url` parses with a host and no userinfo (forbidden characters
 /// are checked by the caller).

@@ -235,7 +235,8 @@ final class AppModel {
                 body: Self.body(row), edited: row.edited, images: row.images.map { ($0.url, $0.width, $0.height) },
                 files: row.files, replyAuthor: row.reply?.authorName, replyContent: row.reply?.content,
                 pending: row.pending, failure: row.failure,
-                reactions: row.reactions.map { ($0.name, $0.url, $0.count, $0.me) }
+                reactions: row.reactions.map { ($0.name, $0.url, $0.count, $0.me) },
+                embeds: row.embeds.map { Self.embed($0, row: row) }, imageSpoilers: row.images.map(\.spoiler)
             )
         }
         shell.typing = snapshot.typing
@@ -255,8 +256,13 @@ final class AppModel {
     // MARK: Message body (core's AST, field for field; `MessageBody` numbers links and spoilers)
 
     private static func body(_ row: VelellaFFI.MessageRow) -> MessageBody {
+        body(row.body, row: row)
+    }
+
+    /// `blocks` with the row's resolved mentions and emoji images (the body's and its embeds').
+    private static func body(_ blocks: [MdBlock], row: VelellaFFI.MessageRow) -> MessageBody {
         MessageBody(
-            blocks: row.body.map(block),
+            blocks: blocks.map(block),
             mentions: row.mentions.map { mention in
                 let kind: MentionKind = switch mention.kind {
                 case .user: .user
@@ -266,6 +272,24 @@ final class AppModel {
                 return ResolvedMention(kind: kind, id: mention.id, name: mention.name, color: mention.color)
             },
             emoji: row.emoji.compactMap { e in URL(string: e.url).map { EmojiImage(id: e.id, animated: e.animated, url: $0) } }
+        )
+    }
+
+    // MARK: Embeds (wave 3 E; field for field, URLs as core checked them)
+
+    private static func embed(_ e: MessageEmbed, row: VelellaFFI.MessageRow) -> EmbedItem {
+        func link(_ l: MessageEmbedLink?) -> EmbedItem.Link? { l.map { EmbedItem.Link(url: $0.url, host: $0.host) } }
+        func image(_ i: MessageEmbedImage?) -> EmbedItem.Image? {
+            i.flatMap { i in URL(string: i.url).map { EmbedItem.Image(url: $0, width: Double(i.width), height: Double(i.height), alt: i.description) } }
+        }
+        return EmbedItem(
+            title: e.title, url: link(e.url), description: body(e.description, row: row), color: e.color,
+            timestampMs: e.timestampMs, authorName: e.authorName, authorURL: link(e.authorUrl),
+            authorIcon: e.authorIconUrl.flatMap { URL(string: $0) }, footerText: e.footerText,
+            footerIcon: e.footerIconUrl.flatMap { URL(string: $0) },
+            fields: e.fields.map { EmbedItem.Field(name: $0.name, value: body($0.value, row: row), inline: $0.inline) },
+            providerName: e.providerName, providerURL: link(e.providerUrl), thumbnail: image(e.thumbnail), image: image(e.image),
+            isVideo: e.isVideo, spoiler: e.spoiler
         )
     }
 
