@@ -21,3 +21,5 @@ python3 -I scripts/icon/build_icon.py /tmp/velella-icon
 xcrun actool --compile /tmp/out --platform macosx --minimum-deployment-target 26.0 \
   --app-icon AppIcon --output-partial-info-plist /tmp/out/partial.plist packaging/AppIcon.icon
 ```
+
+actool's `.icns` holds the default appearance only, so `AppIcon-dark.icns` comes from a copy of the `.icon` whose dark specializations are promoted to the defaults (each layer's dark `image-name`, the dark fill), compiled the same way. `VelellaApp` swaps the two with the system appearance.

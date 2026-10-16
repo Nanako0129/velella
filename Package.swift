@@ -55,7 +55,7 @@ let package = Package(
             dependencies: ["VelellaFFI", "VelellaUI", "VelellaLogin", "VelellaTransport"],
             path: "Sources/Velella",
             exclude: ["Transport"],
-            resources: [.copy("Resources/AppIcon.icns")],
+            resources: [.copy("Resources/AppIcon.icns"), .copy("Resources/AppIcon-dark.icns")],
             linkerSettings: rustArchive
         ),
     ]

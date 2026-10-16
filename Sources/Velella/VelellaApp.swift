@@ -14,11 +14,7 @@ struct VelellaApp: App {
         // `swift run` launches a bare executable; make it a regular foreground app.
         NSApplication.shared.setActivationPolicy(.regular)
         NSApplication.shared.activate()
-        // A bare executable has no bundle icon; use packaging/AppIcon.icon as actool renders it
-        // (default appearance). The bundled app takes the layered .icon and its dark variant instead.
-        if let url = Bundle.module.url(forResource: "AppIcon", withExtension: "icns"), let icon = NSImage(contentsOf: url) {
-            NSApplication.shared.applicationIconImage = icon
-        }
+        DockIcon.follow()
     }
 
     var body: some Scene {
@@ -41,6 +37,29 @@ struct VelellaApp: App {
         .commandsRemoved()
         .restorationBehavior(.disabled)
         .defaultSize(width: LoginWindow.defaultWidth, height: LoginWindow.defaultHeight)
+    }
+}
+
+/// A bare executable has no bundle icon, so the system never switches it with the appearance.
+/// Sets packaging/AppIcon.icon as actool renders it, one icns per appearance, and swaps them when
+/// the system appearance changes. The bundled app takes the layered .icon and switches by itself.
+@MainActor
+private enum DockIcon {
+    static let light = image("AppIcon")
+    static let dark = image("AppIcon-dark")
+    static var observation: NSKeyValueObservation?
+
+    static func follow() {
+        observation = NSApplication.shared.observe(\.effectiveAppearance, options: [.initial]) { app, _ in
+            MainActor.assumeIsolated {
+                let isDark = app.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+                app.applicationIconImage = isDark ? dark : light
+            }
+        }
+    }
+
+    private static func image(_ name: String) -> NSImage? {
+        Bundle.module.url(forResource: name, withExtension: "icns").flatMap(NSImage.init(contentsOf:))
     }
 }
 
