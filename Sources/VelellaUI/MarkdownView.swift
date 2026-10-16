@@ -36,6 +36,8 @@ struct MarkdownView: View {
         }
         .environment(\.textCoordinator, CoordinatorBox(coordinator: selection))
         .environment(\.openURL, OpenURLAction { router.handle($0) })
+        // The message menu's Open Link goes through this same router (selection plan W1 Link).
+        .environment(\.textLinks, LinkRouterBox(router: router))
         .confirmationDialog(
             "Open this link in your browser?",
             isPresented: Binding(get: { confirmation != nil }, set: { if !$0 { confirmation = nil } }),

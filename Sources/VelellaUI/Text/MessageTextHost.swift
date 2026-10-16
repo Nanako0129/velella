@@ -52,6 +52,8 @@ struct MessageTextRep: NSViewRepresentable {
         let environment = context.environment
         let openURL = environment.openURL
         view.onActivate = { openURL($0.url) }
+        view.linkRouter = environment.textLinks.router
+        view.openMenu = environment.messageMenu.open
         view.onTip = onTip
         view.pasteboard = environment.textPasteboard.board ?? .general
         let source = TextSource(leaves: leaves, images: images)
@@ -103,6 +105,7 @@ struct HeaderTextRep: NSViewRepresentable {
 
     func updateNSView(_ view: MessageTextView, context: Context) {
         view.pasteboard = context.environment.textPasteboard.board ?? .general
+        view.openMenu = context.environment.messageMenu.open
         let key = name + HeaderText.separator + time + String(describing: font)
         if view.contentKey != key {
             view.setContent(HeaderText.content(name: name, time: time, font: font))
