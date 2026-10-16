@@ -116,3 +116,15 @@ private let br = MarkdownInline.lineBreak
     #expect(abs((drawn.columns.lowerBound + drawn.columns.upperBound) / 2 - 130) <= 3, "centred on the host")
     #expect(try inkDifference(nil) == nil)
 }
+
+@MainActor @Test func aTipKeepsItsOwnLineHeightUnderAParagraphsLineBox() {
+    // Placed over a paragraph, the tip inherits its environment; the paragraph's 22 pt line box
+    // made it 38 pt tall. v2's capsule is 33 (14 pt medium text, 8 above and below; user's capture).
+    func height(_ view: some View) -> CGFloat {
+        NSHostingView(rootView: view.environment(\.tooltipSurface, .solid)).fittingSize.height
+    }
+    let text = "Saturday, September 13, 275760 at 8:00 AM"
+    let bare = height(TooltipBubble(text: text))
+    #expect(height(TooltipBubble(text: text).lineHeight(.exact(points: 22))) == bare)
+    #expect(abs(bare - 33) <= 1, "\(bare)")
+}

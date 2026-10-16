@@ -20,9 +20,9 @@ enum TooltipStyle {
     /// Fade and move with a critically damped spring of 0.25 s response (0x102a07114); v2 skips
     /// the animation when Reduce Motion is on.
     static let animation = Animation.spring(response: 0.25, dampingFraction: 1)
-    /// Wait before showing. v2 passes the delay in per call site (0 at 0x100ba3278) and the
-    /// SwiftUI modifier's default was not recovered, so this stays velella's own 500 ms.
-    static let showDelay: Duration = .milliseconds(500)
+    // No show delay: v2's text views show a tip at once (delay 0 at 0x100ba3278, the UIKit call
+    // site behind message timestamps; the user's capture, 2026-10-16). Header and gutter times
+    // match it; v2's SwiftUI modifier default was not recovered.
 }
 
 enum TooltipPlacement {
@@ -65,6 +65,11 @@ struct TooltipBubble: View {
     var body: some View {
         Text(verbatim: text)
             .font(TooltipStyle.font)
+            // The host's text styling must not leak in: a paragraph's 22 pt line box made the
+            // capsule 38 pt tall instead of v2's 33 (user's capture, 2026-10-16), and a quote's
+            // secondary colour dimmed it.
+            .lineHeight(nil)
+            .foregroundStyle(.primary)
             .padding(.horizontal, TooltipStyle.horizontalPadding)
             .padding(.vertical, TooltipStyle.verticalPadding)
             .frame(maxWidth: TooltipStyle.maxWidth)
@@ -126,25 +131,17 @@ extension View {
     /// Shows `request` as the v2 tooltip (the paragraph picks runs itself).
     func tooltipOverlay(_ request: TooltipRequest?) -> some View { modifier(TooltipOverlay(request: request)) }
 
-    /// A v2 tooltip on the whole view after the pointer rests on it.
+    /// A v2 tooltip on the whole view while the pointer is on it.
     func tooltip(_ text: String) -> some View { modifier(HoverTooltip(text: text)) }
 }
 
 private struct HoverTooltip: ViewModifier {
     let text: String
     @State private var shown = false
-    @State private var delay: Task<Void, Never>?
 
     func body(content: Content) -> some View {
         content
-            .onHover { inside in
-                delay?.cancel()
-                guard inside else { shown = false; return }
-                delay = Task {
-                    try? await Task.sleep(for: TooltipStyle.showDelay)
-                    if !Task.isCancelled { shown = true }
-                }
-            }
+            .onHover { shown = $0 }
             .tooltipOverlay(shown ? TooltipRequest(text: text, rect: nil) : nil)
     }
 }

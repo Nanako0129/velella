@@ -78,10 +78,9 @@ struct ParagraphView: View {
     let build: (RenderContext) -> [Segment]
     @Environment(\.discordLocale) private var locale
     @State private var frames: TipFrames
-    /// The tipped run under the pointer, and its tip once the delay passed.
+    /// The tipped run under the pointer, and the tip shown for it.
     @State private var armed: TipFrame?
     @State private var shown: TipFrame?
-    @State private var delay: Task<Void, Never>?
     private let images = EmojiImages.shared
 
     init(frames: TipFrames = TipFrames(), build: @escaping (RenderContext) -> [Segment]) {
@@ -165,17 +164,11 @@ struct ParagraphView: View {
             let hit = frames.tip(at: point)
             guard hit != armed else { return }
             armed = hit
-            shown = nil
-            delay?.cancel()
-            guard let hit else { return }
-            delay = Task {
-                try? await Task.sleep(for: TooltipStyle.showDelay)
-                if !Task.isCancelled { shown = hit }
-            }
+            // At once, as v2's text views do (TooltipStyle).
+            shown = hit
         case .ended:
             armed = nil
             shown = nil
-            delay?.cancel()
         }
     }
 }
