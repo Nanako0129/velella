@@ -416,6 +416,21 @@ private func hasIsolates(_ s: String) -> Bool { s.unicodeScalars.contains { (0x2
         }
     }
 
+    /// N0-4's rows: one line is 19 tall (18 + 1), a wrapped row n x 18. Padding 7 (0.5 em at 14) each side plus 1 on top.
+    @Test func codeRowsAreNineteenForOneLineAndEighteenPerWrappedLine() {
+        func view(_ code: String) -> MessageTextView {
+            let (text, chrome) = MessageTextContent.codeBlock(code: code, header: nil, highlight: nil, size: 14)
+            return TextHarness.view(MessageTextContent(text: text, chrome: chrome, spoken: ""), width: 600).view
+        }
+        #expect(abs(view("x").height(forWidth: 600) - 34) < 0.01)
+        let long = view(String(repeating: "word ", count: 30))
+        let wide = long.height(forWidth: 2000)
+        let narrow = long.height(forWidth: 300)
+        #expect(abs(wide - 34) < 0.01, "\(wide)")
+        let rows = (narrow - 15) / 18
+        #expect(rows >= 2 && abs(rows - rows.rounded()) < 0.01, "\(narrow)")
+    }
+
     @Test func anAuthorsEscapeAndPopSurviveACopy() {
         TextHarness.guardingGeneral {
             let (view, _) = TextHarness.paragraph(TextHarness.segments([.text("x\u{1B}[31my\u{202C}z")]).segments)

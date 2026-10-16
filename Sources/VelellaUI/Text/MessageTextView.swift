@@ -81,6 +81,11 @@ final class MessageTextView: NSView {
         contentStorage.textStorage = NSTextStorage(attributedString: content.text)
         measured = [:]
         settledWidth = nil
+        wrappedRows = []
+        hasRows = false
+        content.text.enumerateAttribute(TextKey.row, in: NSRange(location: 0, length: content.text.length)) { value, _, stop in
+            if value != nil { hasRows = true; stop.pointee = true }
+        }
         chrome = content.chrome
         spoken = content.spoken
         unwrapped = content.unwrapped
@@ -108,12 +113,16 @@ final class MessageTextView: NSView {
         let w = max(width - 2 * containerOrigin.x, 1)
         if container.size.width != w { container.size = CGSize(width: w, height: 0) }
         if settledWidth != w {
-            settleRows()
+            if hasRows { settleRows() }
             settledWidth = w
         }
     }
 
     private var settledWidth: CGFloat?
+    /// Whether the text holds code rows, whose spacing `settleRows` keeps.
+    private var hasRows = false
+    /// The rows (by start offset) that wrap at the settled width, so carry no extra spacing.
+    private var wrappedRows: Set<Int> = []
 
     /// Height and widest line per proposed width, until the text changes: SwiftUI asks the same
     /// widths again on every pass, and each answer otherwise lays the whole text out anew.
@@ -145,6 +154,7 @@ final class MessageTextView: NSView {
             }
         }
         fit(width: max(width, Self.probeFloor))
+        layoutManager.ensureLayout(for: layoutManager.documentRange)
         let last = length > 0 ? (attributed.attribute(.paragraphStyle, at: length - 1, effectiveRange: nil) as? NSParagraphStyle)?.paragraphSpacing ?? 0 : 0
         let usage = layoutManager.usageBoundsForTextContainer
         // TextKit leaves the last paragraph's spacing after it out of its usage bounds.
@@ -158,27 +168,31 @@ final class MessageTextView: NSView {
         fitBounds()
     }
 
-    /// Measuring leaves the container at the last width SwiftUI asked about; drawing and hit-testing use the view's own.
+    /// Measuring leaves the container at the last width SwiftUI asked about; drawing and hit-testing
+    /// use the view's own, or the unbounded layout when every line fits the view (the same lines).
     private func fitBounds() {
-        if bounds.width > 0 { fit(width: unwrapped ? Self.unbounded : bounds.width) }
+        guard bounds.width > 0 else { return }
+        let fits = unwrapped || measured[Self.unbounded].map { $0.width <= bounds.width + 0.5 } == true
+        fit(width: fits ? Self.unbounded : bounds.width)
     }
 
-    /// Row minimum of code blocks (N0-4): a one-line row is 19 tall, a wrapped one n x 18. Each row
-    /// paragraph gets 1 pt of spacing after it only when it is one line; a change lays the text out
-    /// again (TextKit cannot state a minimum per paragraph).
+    /// Row minimum of code blocks (N0-4): a one-line row is 19 tall, a wrapped one n x 18. Rows are
+    /// built with the one-line row's 1 pt of spacing after them; a row that wraps loses it, and gets
+    /// it back when it fits again. A change lays the text out again (TextKit cannot state a minimum
+    /// per paragraph).
     private func settleRows() {
         guard let storage = contentStorage.textStorage else { return }
         layoutManager.ensureLayout(for: layoutManager.documentRange)
         var changes: [(NSRange, CGFloat)] = []
+        let recheck = !wrappedRows.isEmpty
         layoutManager.enumerateTextLayoutFragments(from: layoutManager.documentRange.location, options: [.ensuresLayout]) { fragment in
-            guard let paragraph = fragment.textElement as? NSTextParagraph, paragraph.attributedString.length > 0,
+            let wraps = fragment.textLineFragments.count > 1
+            guard wraps || recheck, let paragraph = fragment.textElement as? NSTextParagraph, paragraph.attributedString.length > 0,
                   paragraph.attributedString.attribute(TextKey.row, at: 0, effectiveRange: nil) != nil else { return true }
-            let want: CGFloat = fragment.textLineFragments.count == 1 ? 1 : 0
-            let have = (paragraph.attributedString.attribute(.paragraphStyle, at: 0, effectiveRange: nil) as? NSParagraphStyle)?.paragraphSpacing ?? 0
-            if have != want {
-                let start = offset(of: fragment.rangeInElement.location)
-                changes.append((NSRange(location: start, length: offset(of: fragment.rangeInElement.endLocation) - start), want))
-            }
+            let start = offset(of: fragment.rangeInElement.location)
+            guard wraps != wrappedRows.contains(start) else { return true }
+            if wraps { wrappedRows.insert(start) } else { wrappedRows.remove(start) }
+            changes.append((NSRange(location: start, length: offset(of: fragment.rangeInElement.endLocation) - start), wraps ? 0 : 1))
             return true
         }
         guard !changes.isEmpty else { return }
@@ -335,17 +349,6 @@ final class MessageTextView: NSView {
         }
         return out
     }
-
-    override func viewDidMoveToWindow() {
-        super.viewDidMoveToWindow()
-        NotificationCenter.default.removeObserver(self)
-        guard let window else { return }
-        for name in [NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification] {
-            NotificationCenter.default.addObserver(self, selector: #selector(keyChanged), name: name, object: window)
-        }
-    }
-
-    @objc private func keyChanged(_ note: Notification) { needsDisplay = true }
 
     override func becomeFirstResponder() -> Bool { selection.repaint(); return true }
     override func resignFirstResponder() -> Bool { selection.repaint(); return true }
@@ -535,6 +538,8 @@ final class SelectionCoordinator {
     private let feedback = CopyFeedback()
     /// Only one selection shows at a time: a press in another body clears this one.
     private static weak var active: SelectionCoordinator?
+    /// The selection's colour follows the window's key state: repaint when it changes, while there is one.
+    private var keyObservers: [NSObjectProtocol] = []
 
     func attach(_ view: MessageTextView) {
         guard views[view.participant]?.view !== view else { return }
@@ -553,6 +558,13 @@ final class SelectionCoordinator {
         if views[view.participant]?.view !== view { attach(view) }
         anchor = Position(participant: view.participant, offset: offset)
         focus = anchor
+        if keyObservers.isEmpty, let window = view.window {
+            keyObservers = [NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification].map { name in
+                NotificationCenter.default.addObserver(forName: name, object: window, queue: .main) { [weak self] _ in
+                    MainActor.assumeIsolated { self?.repaint() }
+                }
+            }
+        }
         repaint()
     }
 
@@ -565,6 +577,8 @@ final class SelectionCoordinator {
     func clear() {
         anchor = nil
         focus = nil
+        keyObservers.forEach { NotificationCenter.default.removeObserver($0) }
+        keyObservers = []
         repaint()
     }
 

@@ -165,13 +165,20 @@ struct MessageTextContent {
         return max(0, lineHeight - (f.ascender - f.descender + f.leading).rounded(.up))
     }
 
+    private struct StyleKey: Hashable { var lineHeight, indent, after: CGFloat }
+    private static var styles: [StyleKey: NSParagraphStyle] = [:]
+
+    /// Shared per value: a paragraph style is immutable once made.
     static func paragraphStyle(lineHeight: CGFloat, indent: CGFloat = 0, after: CGFloat = 0) -> NSParagraphStyle {
+        let key = StyleKey(lineHeight: lineHeight, indent: indent, after: after)
+        if let hit = styles[key] { return hit }
         let style = NSMutableParagraphStyle()
         style.minimumLineHeight = lineHeight
         style.maximumLineHeight = lineHeight
         style.firstLineHeadIndent = indent
         style.headIndent = indent
         style.paragraphSpacing = after
+        styles[key] = style
         return style
     }
 
@@ -259,6 +266,15 @@ struct MessageTextContent {
     private static func spokenCode(_ code: String) -> String { CodeBlockModel.escaped(code) }
 
     private static let codePlain = NSColor(Color(RGB(rgb: CodeBlockStyle.plain)))
+    /// Code colours are fixed RGB values (Dark+), a handful per block: converted once each.
+    private static var codeColors: [Color: NSColor] = [:]
+
+    private static func codeColor(_ color: Color) -> NSColor {
+        if let hit = codeColors[color] { return hit }
+        let converted = NSColor(color)
+        codeColors[color] = converted
+        return converted
+    }
     private static let codeBackground = NSColor(Color(CodeBlockStyle.background))
     private static var digitWidths: [CGFloat: CGFloat] = [:]
 
@@ -297,7 +313,7 @@ struct MessageTextContent {
             out.append(head)
         }
         for (i, line) in model.lines.enumerated() {
-            let row = NSMutableAttributedString(attributedString: codeLine(CodeBlockView.attributed(line, size: size)))
+            let row = codeLine(CodeBlockView.attributed(line, size: size))
             // An empty row needs content to keep its line height (measured: 17 instead of 19).
             if row.length == 0 { row.append(NSAttributedString(string: "\u{200B}", attributes: [.font: mono, .foregroundColor: plain, TextKey.copy: CopyText("")])) }
             if i < model.lines.count - 1 { row.append(NSAttributedString(string: "\n", attributes: [.font: mono, .foregroundColor: plain])) }
@@ -314,12 +330,12 @@ struct MessageTextContent {
     }
 
     /// A code line's runs as storage text: fonts and colours from the runs, escapes copied raw.
-    private static func codeLine(_ line: AttributedString) -> NSAttributedString {
+    private static func codeLine(_ line: AttributedString) -> NSMutableAttributedString {
         let out = NSMutableAttributedString()
         for run in line.runs {
             let spec = run[TextFontAttribute.self] ?? TextFont(size: 14, weight: .regular, mono: true, italic: false)
             var attrs: [NSAttributedString.Key: Any] = [.font: font(spec)]
-            if let color = run.swiftUI.foregroundColor { attrs[.foregroundColor] = NSColor(color) }
+            if let color = run.swiftUI.foregroundColor { attrs[.foregroundColor] = codeColor(color) }
             if run.swiftUI.underlineStyle != nil { attrs[.underlineStyle] = NSUnderlineStyle.single.rawValue }
             if let raw = run[RawTextAttribute.self] { attrs[TextKey.copy] = CopyText(raw.text) }
             out.append(NSAttributedString(string: String(line[run.range].characters), attributes: attrs))
@@ -330,7 +346,7 @@ struct MessageTextContent {
     /// K3's plain block, past the line-number cap: monospaced, escaped, unwrapped.
     static func plainCode(_ code: String, size: CGFloat) -> NSAttributedString {
         let lineHeight = MarkdownText.lineHeight(size: size)
-        let out = NSMutableAttributedString(attributedString: codeLine(CodeBlockView.attributed([CodeSpan(text: code, rgb: 0)], size: size)))
+        let out = codeLine(CodeBlockView.attributed([CodeSpan(text: code, rgb: 0)], size: size))
         let whole = NSRange(location: 0, length: out.length)
         out.addAttributes([.foregroundColor: NSColor.labelColor, .paragraphStyle: paragraphStyle(lineHeight: lineHeight),
                            TextKey.lift: lift(size: size, mono: true, lineHeight: lineHeight)], range: whole)
