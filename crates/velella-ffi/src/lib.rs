@@ -14,11 +14,13 @@ pub use decorations::{SidebarOccupant, SidebarStatus, SidebarThread};
 uniffi::setup_scaffolding!();
 
 mod actions;
+mod experiments;
 mod markdown;
 mod members;
 mod messages;
 mod transport;
 pub use actions::*;
+pub use experiments::*;
 pub use markdown::*;
 pub use messages::*;
 pub use transport::*;

@@ -680,13 +680,24 @@ impl Identity {
     }
 }
 
-/// The capabilities value sent: the normal one, unless slice X reports the obfuscation experiment
-/// Enabled (D14; X does not exist yet, so Unknown → normal).
+/// The normal capabilities value, which every IDENTIFY sends unless the obfuscation experiment is
+/// Enabled (D14, `obfuscated_capabilities`).
 pub(crate) fn normal_capabilities(pair: (u64, u64)) -> u64 {
     if SUPPORTED_PAIRS.contains(&pair) {
         pair.1
     } else {
         newest_supported().1
+    }
+}
+
+/// The obfuscation variant: what a normal IDENTIFY sends while slice X reports
+/// `2026-02-private-channel-hiding` Enabled for the account (D14); Disabled and Unknown send
+/// `normal_capabilities`. Never used by the fast-connect IDENTIFY.
+pub(crate) fn obfuscated_capabilities(pair: (u64, u64)) -> u64 {
+    if SUPPORTED_PAIRS.contains(&pair) {
+        pair.0
+    } else {
+        newest_supported().0
     }
 }
 
@@ -722,6 +733,17 @@ pub(crate) enum Shape<'a> {
 /// The IDENTIFY frame, byte for byte. Held in a zeroizing buffer and never formatted: the token
 /// is in it.
 pub(crate) fn identify(token: &Token, identity: &Identity, shape: Shape) -> Zeroizing<String> {
+    identify_with(token, identity, shape, None)
+}
+
+/// `identify`, with the normal shape's `capabilities` replaced by `capabilities` when given (D14).
+/// The fast-connect shape always sends the session's fixed value.
+pub(crate) fn identify_with(
+    token: &Token,
+    identity: &Identity,
+    shape: Shape,
+    capabilities: Option<u64>,
+) -> Zeroizing<String> {
     let base = identity.base();
     let mut props = match shape {
         Shape::Fast { .. } => base.fast_props.clone(),
@@ -755,7 +777,11 @@ pub(crate) fn identify(token: &Token, identity: &Identity, shape: Shape) -> Zero
     let mut frame = Zeroizing::new(String::with_capacity(props.len() + 512));
     frame.push_str("{\"op\":2,\"d\":{\"token\":");
     frame.push_str(&serde_json::to_string(token.expose()).expect("token serializes"));
-    push_key(&mut frame, "capabilities", &base.capabilities);
+    let capabilities = match shape {
+        Shape::Normal { .. } => capabilities.unwrap_or(base.capabilities),
+        Shape::Fast { .. } => base.capabilities,
+    };
+    push_key(&mut frame, "capabilities", &capabilities);
     frame.push_str(",\"properties\":");
     frame.push_str(&props);
     if let Shape::Normal {
@@ -1103,6 +1129,38 @@ mod tests {
                 base16(&l.launch_id)
             )
         );
+    }
+
+    /// D14: the override replaces only the normal shape's capabilities; fast-connect keeps the
+    /// session's value, and the obfuscation variant is the pair's first member.
+    #[test]
+    fn a_capabilities_override_reaches_the_normal_identify_only() {
+        let identity = Identity::new(launch(&[], None));
+        identity.fix(640_102, 1_734_653);
+        let token = Token::new(MARKER.into()).unwrap();
+        let normal = |capabilities| {
+            let shape = Shape::Normal {
+                installation_id: None,
+                reasons: "NO_REASONS",
+                presence: None,
+                qos_token: None,
+            };
+            identify_with(&token, &identity, shape, capabilities)
+        };
+        assert!(normal(None).contains(r#""capabilities":1734653,"#));
+        assert!(normal(Some(1_767_421)).contains(r#""capabilities":1767421,"#));
+        let fast = identify_with(
+            &token,
+            &identity,
+            Shape::Fast {
+                installation_id: None,
+            },
+            Some(1_767_421),
+        );
+        assert!(fast.contains(r#""capabilities":1734653,"#));
+        assert_eq!(obfuscated_capabilities(BUILTIN_PAIR), 1_767_421);
+        assert_eq!(obfuscated_capabilities((1, 2)), 1_767_421);
+        assert_eq!(normal_capabilities((1, 2)), 1_734_653);
     }
 
     #[test]

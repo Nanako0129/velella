@@ -1778,6 +1778,36 @@ mod identity {
         );
     }
 
+    /// D14: a normal IDENTIFY sends the obfuscation variant only when an earlier READY of the
+    /// session left `2026-02-private-channel-hiding` Enabled. The fast-connect IDENTIFY, a normal
+    /// one before any READY (Unknown), and a Disabled variant all send the normal value.
+    #[tokio::test]
+    async fn obfuscation_capabilities_follow_the_experiment_on_a_reidentify() {
+        for (variant, expected) in [(1, 1_767_421), (2, 1_767_421), (3, 1_734_653)] {
+            let mut rig = Rig::start_with(opts(&launch(false), None)).await;
+            let mut c1 = Conn::accept(&rig.initial).await;
+            c1.hello(30_000).await;
+            assert_eq!(identify(&mut c1).await["d"]["capabilities"], 1_734_653);
+            c1.close(4009).await;
+            let mut c2 = Conn::accept(&rig.initial).await;
+            c2.hello(30_000).await;
+            assert_eq!(identify(&mut c2).await["d"]["capabilities"], 1_734_653);
+            let apex = json!({"assignments": {"1": {"1": {
+                "evaluation_id": "e",
+                "assignments": [[764_569_958u64, variant, 0, 1, variant]]
+            }}}});
+            c2.send(ready_with(json!({"apex_experiments": apex}))).await;
+            rig.ready_event().await;
+            c2.send(json!({"op": 9, "d": false})).await;
+            let mut c3 = Conn::accept(&rig.initial).await;
+            c3.hello(30_000).await;
+            let again = identify(&mut c3).await;
+            assert_eq!(again["d"]["capabilities"], expected, "variant {variant}");
+            // Only the capabilities differ from a normal IDENTIFY: the shape is the same.
+            assert_eq!(again["d"]["properties"]["is_fast_connect"], false);
+        }
+    }
+
     /// Op 40 with `qos` null until the first activity report, then the report; a gateway op 1 is
     /// answered with op 40. Op 1 never goes out.
     #[tokio::test]
@@ -2259,6 +2289,8 @@ mod live_log {
             [
                 "READY_KEYS <other>,auth_token,guilds,private_channels,resume_gateway_url,session_id,user,user_settings",
                 "READY_GUILD_KEYS channels,data_mode,id,properties; properties: name,owner_id",
+                "GATES Translate=Unknown TidaWebform=Unknown BookmarksV1=Unknown BookmarksV2=Unknown BookmarksVisible=Unknown ChannelObfuscation=Unknown",
+                "GUILD_GATES ViewConversation=Unknown OfficialMessage=Unknown ReportToModerators=Unknown",
                 "READY_SUPPLEMENTAL_KEYS guilds,merged_presences",
                 "UNHANDLED_DISPATCH SOME_NEW_EVENT",
                 "UNHANDLED_DISPATCH <other>",
@@ -2280,5 +2312,92 @@ mod live_log {
         ] {
             assert!(!all.contains(value), "{value} in {all}");
         }
+    }
+
+    /// The live check of slice X: one line of account gates and one of the first guild's gates
+    /// (the buffered INITIAL_GUILD when there is one), names and states only.
+    #[tokio::test]
+    async fn gate_lines_name_the_gates_and_their_states_and_nothing_else() {
+        const SECRET: &str = "SYNTHETIC_REFRESHED_TOKEN_0123456789";
+        let tida = json!([4_055_210_228u64, 2, 1, 1, 0, 1234, 0, 0, null, null, null]);
+        let official = json!([3_747_270_261u64, null, 1, [],
+            [{"b": 1, "k": ["555666777888"]}], [], null, null, 0, 0]);
+        let apex = json!({"assignments": {"1": {"123456789012345678": {
+        "evaluation_id": "e",
+        "assignments": [
+            [3_051_456_417u64, 1, 0, 1, 1],
+            [367_271_379u64, 1, 0, 1, 1, "{\"b\":777,\"r\":888}"],
+            [764_569_958u64, 3, 0, 1, 3],
+            [485_610_171u64, 2, 0, 1, 2]
+        ]}}}});
+        let features = ["VERIFIED", "CONVERSATIONS_EXTRACTION_PROCESSING"];
+        let run = |initial: Option<Value>, guilds: Value| {
+            let tida = tida.clone();
+            let official = official.clone();
+            let apex = apex.clone();
+            async move {
+                let launch = Launch::new(LaunchConfig::default());
+                let mut rig = Rig::start_with(crate::SessionOptions {
+                    launch: launch.clone(),
+                    expected_user: None,
+                    identity_events: None,
+                })
+                .await;
+                let mut conn = Conn::accept(&rig.initial).await;
+                conn.hello(30_000).await;
+                assert_eq!(conn.recv_non_beat().await["op"], 2);
+                if let Some(g) = initial {
+                    conn.send(json!({"op": 0, "t": "INITIAL_GUILD", "s": 1, "d": g}))
+                        .await;
+                }
+                let mut ready = ready(2, "wss://gateway-resume.discord.gg/");
+                ready["d"]["user"] = json!({"id": "123456789012345678", "flags": 1});
+                ready["d"]["auth_token"] = json!(SECRET);
+                ready["d"]["experiments"] = json!([tida]);
+                ready["d"]["guild_experiments"] = json!([official]);
+                ready["d"]["apex_experiments"] = apex;
+                ready["d"]["guilds"] = guilds;
+                conn.send(ready).await;
+                assert!(matches!(rig.event().await, SessionEvent::Ready { .. }));
+                let lines = launch.diagnostics.lock().unwrap().clone();
+                let gates: Vec<String> = lines
+                    .iter()
+                    .filter(|l| l.contains("GATES"))
+                    .cloned()
+                    .collect();
+                (gates, lines.join("\n"))
+            }
+        };
+        let named = json!({"id": "555666777888",
+            "properties": {"name": "SecretGuildName", "features": features}});
+        let (gates, all) = run(None, json!([named.clone()])).await;
+        assert_eq!(
+            gates,
+            [
+                "GATES Translate=Enabled TidaWebform=Enabled BookmarksV1=Enabled BookmarksV2=Enabled BookmarksVisible=Enabled ChannelObfuscation=Disabled",
+                "GUILD_GATES ViewConversation=Enabled OfficialMessage=Enabled ReportToModerators=Disabled",
+            ]
+        );
+        // Only the two gate lines may carry state; none carries a planted value.
+        for value in [
+            SECRET,
+            "123456789012345678",
+            "555666777888",
+            "SecretGuildName",
+            "777",
+            "888",
+            "1234",
+            "VERIFIED",
+        ] {
+            assert!(!all.contains(value), "{value} in {all}");
+        }
+        // With an INITIAL_GUILD the guild line is its: READY's own first guild (nothing set up
+        // for it) would read Disabled for the official-message gate.
+        let other = json!({"id": "777", "properties": {"features": []}});
+        let (gates, _) = run(Some(named), json!([other])).await;
+        assert_eq!(
+            gates[1],
+            "GUILD_GATES ViewConversation=Enabled OfficialMessage=Enabled ReportToModerators=Disabled"
+        );
     }
 }
