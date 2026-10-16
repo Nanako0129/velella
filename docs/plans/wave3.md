@@ -127,3 +127,4 @@ A fresh verifier CONFIRMED E: every contract row, the Tests cell and the disposi
 | Descriptions render at 16 pt (`MarkdownView` has no size parameter), Discord uses 14 | With N1 |
 | Live (user): spoilered-link embeds, markdown in titles and field names, display maxima, proxy resize parameters, the 80 pt cover, the card look | Pending |
 
+**Live acceptance (user, 2026-10-16: "驗收OK"):** P, R (typing; reply still has no entry point), X and E checked in the running app.

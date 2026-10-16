@@ -38,7 +38,7 @@ Revision 1.1 folds in the plan review of rev 1 (REVISE, 7 blockers) and the secu
 | D3 | A selection that crosses into a message emits its header as two lines, `name` then ` — time` (the displayed header time), as the official client does without the badge line velella doesn't show; then the body. Messages are separated by one newline | User ("照官方換行") |
 | D4 | Every copy path writes plain text only: one writer does `clearContents()` then `setString(_:forType: .string)` (`CopyFeedback.copy`); no RTF, RTFD, URL or attributed type | Security (S-6) |
 | D5 | Menu row pitch 36 pt (measured at 1× in `e0-menu-other.png`); CSS: label row min-height 32, padding 8, item radius 2, separators 1 pt with 8 above and below; icons as SF Symbols sized from the capture; on a glass panel | User + E0 |
-| D6 | The text view is either **A**, a configured `NSTextView(usingTextLayoutManager: true)`, or **B**, a custom `NSView` driving `NSTextLayoutManager` + `NSTextContentStorage` itself. N0 builds both; the user picks among the eligible ones (N0's eligibility rule) from N0's report | User |
+| D6 | The text view is either **A**, a configured `NSTextView(usingTextLayoutManager: true)`, or **B**, a custom `NSView` driving `NSTextLayoutManager` + `NSTextContentStorage` itself. N0 builds both; the user picks among the eligible ones (N0's eligibility rule) from N0's report. **Chosen: B** (user, 2026-10-16, after trying the spike B window: "先試 spike B，沒問題就用 B", then "驗收OK"). N0 (5e521f6 on `worktree-agent-a760539e18d998c61`): both eligible; B ran at 0.85-1.47× today's rows against A's ~2×, 164 lines against 198, no TextKit 1 fallback and none of NSTextView's defaults | User |
 
 ## N0 — Spike (no merge)
 
