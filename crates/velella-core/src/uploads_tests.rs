@@ -1102,6 +1102,40 @@ async fn a_hostile_resume_range_gets_no_request_after_the_probe() {
     assert_eq!(w.upload_row(), None);
 }
 
+/// CU-3's bound itself: `bytes=0-N` with `N + 1 <= size`, one header, nothing else.
+#[test]
+fn a_resume_range_is_accepted_only_within_the_size() {
+    let at = |ranges: &[&str]| {
+        let response = HttpResponse {
+            status: 308,
+            headers: ranges
+                .iter()
+                .map(|r| ("Range".into(), (*r).into()))
+                .collect(),
+            body: None,
+        };
+        resume_at(&response, 1000)
+    };
+    assert_eq!(at(&[]), Some(0));
+    assert_eq!(at(&["bytes=0-0"]), Some(1));
+    assert_eq!(at(&["bytes=0-599"]), Some(600));
+    assert_eq!(at(&["bytes=0-999"]), Some(1000));
+    for hostile in [
+        "bytes=0-1000",
+        "bytes=0-1005",
+        "bytes=7-9",
+        "garbage",
+        "bytes=0-",
+        "bytes=0-12345678901234567890",
+        "bytes=0-18446744073709551615",
+        "bytes=0--1",
+        "bytes=0-+5",
+    ] {
+        assert_eq!(at(&[hostile]), None, "{hostile}");
+    }
+    assert_eq!(at(&["bytes=0-1", "bytes=0-2"]), None, "two Range headers");
+}
+
 #[tokio::test(start_paused = true)]
 async fn the_upload_stops_after_13_attempts() {
     let w = world().await;
