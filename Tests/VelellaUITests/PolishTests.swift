@@ -128,3 +128,23 @@ private let br = MarkdownInline.lineBreak
     #expect(height(TooltipBubble(text: text).lineHeight(.exact(points: 22))) == bare)
     #expect(abs(bare - 33) <= 1, "\(bare)")
 }
+
+@MainActor @Test func aTipHugsItsTextEvenWhenItsHostOffersMore() throws {
+    // v2 sizes a tip to its content (sizeThatFits, at most 360); `.frame(maxWidth:)` stretched it
+    // to the host's width. Text 14 pt medium plus 12 on each side.
+    let text = "Saturday, September 13, 275760 at 8:00 AM"
+    let natural = NSAttributedString(string: text, attributes: [.font: NSFont.systemFont(ofSize: 14, weight: .medium)]).size().width
+    let view = TooltipBubble(text: text).environment(\.tooltipSurface, .solid)
+        .frame(width: 600, alignment: .leading)
+    let renderer = ImageRenderer(content: view)
+    renderer.scale = 1
+    let image = try #require(renderer.cgImage)
+    let data = try #require(image.dataProvider?.data as Data?)
+    let y = image.height / 2
+    let inked = (0..<image.width).filter { data[y * image.bytesPerRow + $0 * 4 + 3] > 0 }
+    let width = CGFloat(try #require(inked.max()) - (inked.min() ?? 0) + 1)
+    #expect(abs(width - (natural + 24)) <= 2, "\(width) vs \(natural + 24)")
+    // A long tip still wraps at 360.
+    let long = NSHostingView(rootView: TooltipBubble(text: String(repeating: "word ", count: 60)).environment(\.tooltipSurface, .solid))
+    #expect(long.fittingSize.width <= TooltipStyle.maxWidth)
+}

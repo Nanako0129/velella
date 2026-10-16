@@ -72,9 +72,27 @@ struct TooltipBubble: View {
             .foregroundStyle(.primary)
             .padding(.horizontal, TooltipStyle.horizontalPadding)
             .padding(.vertical, TooltipStyle.verticalPadding)
-            .frame(maxWidth: TooltipStyle.maxWidth)
-            .fixedSize(horizontal: false, vertical: true)
             .modifier(TooltipSurfaceModifier(kind: surface))
+            .modifier(TipSize())
+    }
+}
+
+/// Sizes the tip to its content the way v2 does (`sizeThatFits` at 0x102a07570): the ideal width,
+/// at most `maxWidth`, wrapping only past it. `.frame(maxWidth:)` instead stretched the capsule to
+/// whatever its host offered, up to 360 (the user's capture, 2026-10-16).
+private struct TipSize: ViewModifier {
+    func body(content: Content) -> some View { TipLayout { content } }
+}
+
+private struct TipLayout: Layout {
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        guard let tip = subviews.first else { return .zero }
+        let width = min(tip.sizeThatFits(.unspecified).width, TooltipStyle.maxWidth)
+        return tip.sizeThatFits(ProposedViewSize(width: width, height: nil))
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        subviews.first?.place(at: bounds.origin, proposal: ProposedViewSize(bounds.size))
     }
 }
 
