@@ -50,6 +50,8 @@ private struct UnhiddenCover<Content: View>: View {
 }
 
 private let hiddenInlines: [MarkdownInline] = [.text("a "), .spoiler(id: 0, [.text("secret")]), .text(" b")]
+/// A hidden run that ends the text.
+private let endInlines: [MarkdownInline] = [.text("a "), .spoiler(id: 0, [.text("secret")])]
 
 @MainActor
 private func range(of key: NSAttributedString.Key, in view: MessageTextView, value: Int? = nil) -> NSRange {
@@ -101,16 +103,34 @@ private func hasIsolates(_ s: String) -> Bool { s.unicodeScalars.contains { (0x2
     // MARK: N0-7: hidden spoilers are never drawn
 
     @Test func n0_7_coversAreUniformInFourStatesAndEachLayerHoldsAlone() {
-        TextHarness.guardingGeneral {
-            let segments = TextHarness.segments(hiddenInlines).segments
+        // Mid-text, and at the end of the text, where TextKit returns the run's rect twice: there
+        // the cover must also be filled once, so both covers have one colour.
+        let covers = [hiddenInlines, endInlines].map { inlines in
+            TextHarness.guardingGeneral { fourStates(TextHarness.segments(inlines).segments) }
+        }
+        #expect(covers[0] != nil && covers[1] != nil && covers[0]! == covers[1]!, "\(String(describing: covers))")
+    }
+
+    /// N0-7's states and mutations for one paragraph; returns the unselected cover's colour.
+    private func fourStates(_ segments: [Segment]) -> (Int, Int, Int)? {
+        var coverColour: (Int, Int, Int)?
+        do {
             @MainActor func spreads(clip: Bool, clear: Bool) -> (unselected: Int, key: Int, notKey: Int, hover: Int, keyPixel: (Int, Int, Int)?, notKeyPixel: (Int, Int, Int)?) {
                 let (view, window) = TextHarness.paragraph(segments, clearHidden: clear)
                 view.clipsHidden = clip
                 #expect(window.isKeyWindow && window.firstResponder === view)
                 let unselected = coverSpread(view, in: window)
+                if clip && clear, let rect = hiddenRects(view).first {
+                    coverColour = window.contentView.flatMap { TextHarness.Pixels($0) }?.rgb(rect.midX, rect.midY)
+                }
                 selectAll(view)
                 #expect(window.isKeyWindow && window.firstResponder === view, "key state or first responder lost")
                 let key = coverSpread(view, in: window)
+                if clip && clear, let rect = hiddenRects(view).first {
+                    // The selection skips covered runs: the cover keeps its unselected colour.
+                    let selected = window.contentView.flatMap { TextHarness.Pixels($0) }?.rgb(rect.midX, rect.midY)
+                    #expect(selected != nil && coverColour != nil && selected! == coverColour!, "selection painted under the cover")
+                }
                 let keyPixel = window.contentView.flatMap { TextHarness.Pixels($0) }?.rgb(4, 11)
                 window.keyState = false
                 view.needsDisplay = true
@@ -134,6 +154,7 @@ private func hasIsolates(_ s: String) -> Bool { s.unicodeScalars.contains { (0x2
             let neither = spreads(clip: false, clear: false)
             for spread in [neither.unselected, neither.key, neither.notKey] { #expect(spread > 2, "neither layer must show the glyphs: \(neither)") }
         }
+        return coverColour
     }
 
     @Test func n0_7_aHiddenCodeBlockStaysUnderItsCover() throws {
@@ -327,7 +348,9 @@ private func hasIsolates(_ s: String) -> Bool { s.unicodeScalars.contains { (0x2
         let (host, window) = TextHarness.hosting(MarkdownView(content: body).frame(width: 400), size: CGSize(width: 400, height: 600))
         #expect(TextHarness.all(NSTextView.self, in: host).isEmpty)
         let views = TextHarness.textViews(in: host)
-        // Seven text blocks; the code block under a hidden spoiler makes no view at all under `.hidden()`.
+        // Seven text views for eight text blocks: in this hosted render the code block under a
+        // hidden spoiler (inside `SpoilerCover`'s `.hidden()`) has no text view in the AppKit tree,
+        // so no selection in this body reaches its text.
         #expect(views.count == 7, "\(views.count)")
         #expect(!views.contains { $0.attributed.string.contains("covered") })
         for view in views {
