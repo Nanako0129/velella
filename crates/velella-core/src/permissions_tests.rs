@@ -501,7 +501,7 @@ fn guild_member_update_and_guild_create_change_the_timeout() {
     assert_eq!(perms(&s, CHANNEL), ChannelPermissions::Bits(VIEW_CHANNEL));
 }
 
-fn appearance(developer_mode: bool) -> Message {
+pub(crate) fn appearance(developer_mode: bool) -> Message {
     let mut a = Message::new();
     a.push_bool(2, developer_mode);
     a

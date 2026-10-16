@@ -33,6 +33,9 @@ final class AppModel {
     @ObservationIgnored private var guildsSub: SidebarSubscription?
     @ObservationIgnored private var dmsSub: SidebarSubscription?
     @ObservationIgnored private var channelsSub: SidebarSubscription?
+    /// The user's own state (`premium_type` now: the composer's message-length limit); delivered at
+    /// once, then after every USER_UPDATE or settings change that alters it.
+    @ObservationIgnored private var selfStateSub: SidebarSubscription?
     /// Guild of the live `channelsSub`; the only guild whose channel snapshots may be applied.
     @ObservationIgnored private var channelsGuild: UInt64?
     @ObservationIgnored private var guildNames: [UInt64: String] = [:]
@@ -147,6 +150,7 @@ final class AppModel {
             )
             self.handle = handle
             generation = handle.generation()
+            selfStateSub = handle.subscribeSelfState(listener: SelfStateSnapshots(model: self, generation: handle.generation()))
             pending = fresh ? (handle.generation(), token) : nil
             notice = nil
             handle.setAppFocused(focused: NSApplication.shared.isActive)
@@ -237,6 +241,7 @@ final class AppModel {
     private func dropSubscriptions() {
         guildsSub = nil
         dmsSub = nil
+        selfStateSub = nil
         channelsSub = nil
         channelsGuild = nil
         guildNames = [:]
@@ -468,6 +473,11 @@ final class AppModel {
         }
     }
 
+    fileprivate func apply(selfState state: SelfState, generation gen: UInt64) {
+        guard gen == generation else { return }
+        shell.premiumType = state.premiumType
+    }
+
     fileprivate func apply(guilds entries: [SidebarEntry], generation gen: UInt64) {
         guard gen == generation else { return }
         var names: [UInt64: String] = [:]
@@ -662,6 +672,16 @@ private final class GuildsSnapshots: GuildsListener {
 
     func onGuilds(entries: [SidebarEntry]) {
         DispatchQueue.main.async { [model, generation] in model.apply(guilds: entries, generation: generation) }
+    }
+}
+
+private final class SelfStateSnapshots: SelfStateListener {
+    let model: AppModel
+    let generation: UInt64
+    init(model: AppModel, generation: UInt64) { self.model = model; self.generation = generation }
+
+    func onSelfState(state: SelfState) {
+        DispatchQueue.main.async { [model, generation] in model.apply(selfState: state, generation: generation) }
     }
 }
 

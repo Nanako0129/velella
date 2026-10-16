@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 /// Every visual parameter of the shell lives here. Views reference these names and never
@@ -184,6 +185,23 @@ enum DesignTokens {
         /// g-composer-plus-button.png.
         static let composerHeight: CGFloat = 52
         static let composerPlus: CGFloat = 34
+        /// The input row's height at one line: the card's `composerHeight` less its 8 pt padding on
+        /// both sides. The "+" and the glyphs each take this height, so aligned to the last line
+        /// of a multi-line input (D1) they sit exactly where they sat centred on the single line.
+        static let composerRow: CGFloat = composerHeight - 2 * Spacing.sm
+        /// Editor insets above and below the text: (`composerRow` - the 13 pt body's ~16 pt line) / 2,
+        /// so a single line is centred in `composerRow` as the old text field was, and the
+        /// placeholder aligns to the same top.
+        static let composerInputInset: CGFloat = 10
+        /// The editor's height limit (plan D2, Swiftcord v2): `composerMaxHeight`, or half the
+        /// window's safe-area height when that is smaller; `composerNoWindowHeight` stands in for
+        /// that half before the view has a window.
+        static let composerMaxHeight: CGFloat = 320
+        static let composerMaxWindowFraction: CGFloat = 0.5
+        static let composerNoWindowHeight: CGFloat = 160
+        /// One line of the character counter; the input reserves at least it (the upsell line adds its own)
+        /// while the counter shows, as the official `.charCountShowing` does.
+        static let composerCounterLine: CGFloat = 16
         /// Close button of the reply bar and the custom-emoji image in its preview.
         static let replyEmoji: CGFloat = 16
         /// "+" menu: wide Discord-style rows rather than a narrow native menu.
@@ -269,6 +287,10 @@ enum DesignTokens {
         static let footerUsername = Font.system(size: 11)
         static let badge = Font.caption2.weight(.bold)
         static let composer = Font.body
+        /// The same font for the AppKit editor (`.body` is 13 pt on macOS).
+        static var composerAppKit: NSFont { .preferredFont(forTextStyle: .body) }
+        /// Character counter and its upsell line.
+        static let composerCounter = Font.system(size: 12)
         /// Composer glyphs and reply bar, from Swiftcord v2's rendered composer (user's capture,
         /// 2026-10-13; the SwiftUI code could not be located in the binary): sticker / emoji
         /// glyphs ~19 pt, "GIF" 21x9 pt bold, reply arrow 15x13, close cross 9x9 semibold,
@@ -357,6 +379,12 @@ enum DesignTokens {
     }
 
     enum Palette {
+        /// Character counter: default text, and the official `text-feedback-critical` once the
+        /// draft is over the limit.
+        static let counterDefault = Color.primary
+        static let counterCritical = Color.red
+        /// Placeholder of the composer's editor (the system's placeholder colour, as a text field's).
+        static let composerPlaceholder = Color(nsColor: .placeholderTextColor)
         /// Unread indicator and bold-name colour: the strongest label colour of the appearance.
         static let unread = Color.primary
         /// Read channel names use the secondary label colour, unread and selected ones `unread` (v2).
@@ -469,6 +497,9 @@ enum DesignTokens {
     }
 
     enum Motion {
+        /// The composer's one spring (plan D6, Swiftcord v2: the same constants drive its reply bar
+        /// and attachment row), keyed on whether a reply is present.
+        static let composer = Animation.spring(response: 0.15, dampingFraction: 0.85, blendDuration: 0.25)
         /// Legacy spring for the rail indicator and icon morph.
         static let railSpring = Animation.interpolatingSpring(stiffness: 500, damping: 30)
     }
