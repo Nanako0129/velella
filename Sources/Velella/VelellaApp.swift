@@ -14,6 +14,11 @@ struct VelellaApp: App {
         // `swift run` launches a bare executable; make it a regular foreground app.
         NSApplication.shared.setActivationPolicy(.regular)
         NSApplication.shared.activate()
+        // A bare executable has no bundle icon; use packaging/AppIcon.icon as actool renders it
+        // (default appearance). The bundled app takes the layered .icon and its dark variant instead.
+        if let url = Bundle.module.url(forResource: "AppIcon", withExtension: "icns"), let icon = NSImage(contentsOf: url) {
+            NSApplication.shared.applicationIconImage = icon
+        }
     }
 
     var body: some Scene {

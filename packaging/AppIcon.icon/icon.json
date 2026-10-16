@@ -1,0 +1,95 @@
+{
+  "fill-specializations": [
+    {
+      "value": {
+        "solid": "srgb:0.92157,0.86275,0.77647,1.00000"
+      }
+    },
+    {
+      "appearance": "dark",
+      "value": {
+        "solid": "srgb:0.02353,0.10196,0.23922,1.00000"
+      }
+    }
+  ],
+  "groups": [
+    {
+      "layers": [
+        {
+          "image-name": "rim.svg",
+          "name": "rim"
+        }
+      ],
+      "shadow": {
+        "kind": "neutral",
+        "opacity": 0.25
+      },
+      "translucency": {
+        "enabled": false,
+        "value": 0
+      }
+    },
+    {
+      "layers": [
+        {
+          "glass": true,
+          "image-name": "sail.svg",
+          "name": "sail"
+        }
+      ],
+      "lighting": "individual",
+      "specular": true,
+      "shadow": {
+        "kind": "neutral",
+        "opacity": 0.2
+      },
+      "translucency": {
+        "enabled": true,
+        "value": 0.75
+      }
+    },
+    {
+      "layers": [
+        {
+          "image-name": "body-light.png",
+          "name": "body",
+          "image-name-specializations": [
+            {
+              "appearance": "dark",
+              "value": "body-dark.png"
+            }
+          ]
+        }
+      ],
+      "shadow": {
+        "kind": "neutral",
+        "opacity": 0.45
+      },
+      "translucency": {
+        "enabled": false,
+        "value": 0
+      }
+    },
+    {
+      "layers": [
+        {
+          "image-name": "bg-light.png",
+          "name": "background",
+          "image-name-specializations": [
+            {
+              "appearance": "dark",
+              "value": "bg-dark.png"
+            }
+          ]
+        }
+      ],
+      "translucency": {
+        "enabled": false,
+        "value": 0
+      }
+    }
+  ],
+  "supported-platforms": {
+    "squares": "shared"
+  }
+}
