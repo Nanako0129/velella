@@ -36,14 +36,27 @@ struct MessageArea: View {
     @State private var topID: String?
     /// The open message menu, if any (selection plan C1).
     @State private var menu = MessageMenuPresenter()
+    /// The selection across the column's messages (selection plan N2).
+    @State private var selection = SelectionCoordinator()
+    @Environment(\.discordLocale) private var discordLocale
 
     var body: some View {
         Group { content }
+            // N2 Model: the coordinator follows the rows in display order, so a selection reaches rows no view shows.
+            .onChange(of: messages, initial: true) {
+                selection.locale = discordLocale
+                selection.setRows(MessageGrouping.entries(messages).compactMap { entry in
+                    if case .row(let message, let startsGroup, _) = entry { SelectionRow(message: message, startsGroup: startsGroup) } else { nil }
+                })
+            }
             // C1 Dismissal: the message left the rows (deleted, a switch or sign-out emptied them),
             // its body or delivery changed, or the conversation did.
             .onChange(of: messages) { menu.revalidate(messages: messages, conversation: conversation) }
             .onChange(of: conversation) { menu.revalidate(messages: messages, conversation: conversation) }
-            .onDisappear { menu.dismiss() }
+            .onDisappear {
+                menu.dismiss()
+                selection.clear()
+            }
     }
 
     /// Opens the menu for `message` (C1 Trigger); link and selection come with W1.
@@ -92,7 +105,9 @@ struct MessageArea: View {
                         .coordinateSpace(.named(TooltipSpace.name))
                         .onGeometryChange(for: CGFloat.self, of: { $0.size.width }) { columnWidth = $0 }
                         .environment(\.tooltipContainer, CGRect(x: 0, y: 0, width: columnWidth, height: 1e7))
+                        .environment(\.selectionColumn, CoordinatorBox(coordinator: selection))
                     }
+                    .background { SelectionResponder(coordinator: selection) }
                     .defaultScrollAnchor(.bottom)
                     .scrollPosition(id: $topID, anchor: .top)
                     // Messages pass under the toolbar through a glass band with a hard lower edge, on a
@@ -216,6 +231,7 @@ struct MessageRow: View {
     /// A right-click anywhere on the row (C1 Trigger): its screen point and window.
     var onContextMenu: ((NSPoint, NSWindow?) -> Void)?
     @Environment(\.discordLocale) private var discordLocale
+    @Environment(\.selectionColumn) private var column
     @State private var hovered = false
 
     /// The context the header time formats with (K4); body paragraphs build their own per tick.
@@ -239,20 +255,32 @@ struct MessageRow: View {
                     .frame(height: M.replyLineHeight)
                     .padding(.bottom, M.replyGap)
                 }
+                let time = DiscordTime.header(date: message.timestamp, now: renderContext.now, locale: renderContext.locale)
                 HStack(alignment: .firstTextBaseline, spacing: M.headerGap) {
                     Text(verbatim: message.authorName)
                         .font(T.Typography.authorName)
                         .displayNameStyle(message.displayNameStyle)
                         .foregroundStyle(message.authorColor.map(Color.init) ?? Color.primary)
-                    Text(verbatim: DiscordTime.header(date: message.timestamp, now: renderContext.now, locale: renderContext.locale))
+                        // A press on the name reaches the header participant behind it (N2 Headers). The
+                        // time keeps its hover (the tooltip), so a press on it starts no selection.
+                        .allowsHitTesting(column.coordinator == nil)
+                    Text(verbatim: time)
                         .font(T.Typography.timestamp)
                         .foregroundStyle(.secondary)
                         .tooltip(DiscordTime.tooltip(date: message.timestamp, locale: renderContext.locale, now: renderContext.now))
                 }
                 .frame(height: M.headerLineHeight)
+                // N2 Headers: the header's selectable twin, behind the SwiftUI text.
+                .background(alignment: .topLeading) {
+                    if column.coordinator != nil {
+                        HeaderTextRep(name: message.authorName, time: time, font: message.displayNameStyle?.font)
+                            .environment(\.textMessage, message.id)
+                    }
+                }
             }
             if !message.body.blocks.isEmpty {
                 MarkdownView(content: message.body)
+                    .environment(\.textMessage, message.id)
             }
             // After the text, so a follow-up row (no header) shows it too.
             if message.edited {

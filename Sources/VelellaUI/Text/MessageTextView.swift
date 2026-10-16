@@ -46,10 +46,18 @@ final class MessageTextView: NSView {
     weak var coordinator: SelectionCoordinator?
     private lazy var ownCoordinator = SelectionCoordinator()
     var selection: SelectionCoordinator { coordinator ?? ownCoordinator }
-    /// This view's place in its coordinator's document order.
+    /// This view's place in its coordinator's document order: the message it belongs to (empty in a
+    /// body's own coordinator) and its part of it (`PartID.headerPart`, or the body's text view number).
+    var message = ""
     var participant = 0
+    var partID: PartID { PartID(message: message, part: participant) }
+    /// Whether assistive technology sees this view. The header participant is behind SwiftUI text
+    /// that says the same, so it is not an element (N2 Headers).
+    var isAccessible = true
     /// What the content was built from, so an update can skip an unchanged one.
     var source: TextSource?
+    /// The same for a header participant, whose content is not leaves.
+    var contentKey: String?
     private(set) var spoken = ""
     private(set) var unwrapped = false
     private var chrome: TextChrome?
@@ -304,7 +312,7 @@ final class MessageTextView: NSView {
     /// The system's selected-text background while the window is key and one of the coordinator's
     /// views is first responder; unemphasized otherwise.
     private var selectionColor: NSColor {
-        let focused = (window?.firstResponder as? MessageTextView)?.selection === selection
+        let focused = selection.owns(window?.firstResponder)
         return window?.isKeyWindow == true && focused ? .selectedTextBackgroundColor : .unemphasizedSelectedTextBackgroundColor
     }
 
@@ -345,7 +353,14 @@ final class MessageTextView: NSView {
     }
 
     override func becomeFirstResponder() -> Bool { selection.repaint(); return true }
-    override func resignFirstResponder() -> Bool { selection.repaint(); return true }
+    override func resignFirstResponder() -> Bool {
+        selection.repaint()
+        // After the window has settled on its next responder (or none, when this view is leaving it).
+        DispatchQueue.main.async { [weak selection, weak window] in
+            MainActor.assumeIsolated { selection?.reclaimResponder(in: window) }
+        }
+        return true
+    }
 
     // MARK: Mouse
 
@@ -357,18 +372,19 @@ final class MessageTextView: NSView {
         let point = convert(event.locationInWindow, from: nil)
         press = (point, activation(at: point), event.clickCount == 1)
         dragged = false
-        selection.begin(in: self, at: index(at: point))
+        selection.begin(in: self, at: index(at: point), windowPoint: event.locationInWindow)
     }
 
     override func mouseDragged(with event: NSEvent) {
         guard let press else { return }
         let point = convert(event.locationInWindow, from: nil)
         if hypot(point.x - press.point.x, point.y - press.point.y) > DesignTokens.TextView.dragThreshold { dragged = true }
-        if dragged { selection.extend(to: event.locationInWindow) }
+        if dragged { selection.drag(to: event.locationInWindow) }
     }
 
     override func mouseUp(with event: NSEvent) {
         defer { press = nil }
+        selection.finish()
         guard let press, let target = press.activation, press.single, event.clickCount == 1, !dragged,
               activation(at: convert(event.locationInWindow, from: nil)) == target else { return }
         onActivate?(target)
@@ -402,7 +418,7 @@ final class MessageTextView: NSView {
 
     // MARK: Accessibility (N0-10): only what is defined here is exposed.
 
-    override func isAccessibilityElement() -> Bool { true }
+    override func isAccessibilityElement() -> Bool { isAccessible }
     override func accessibilityRole() -> NSAccessibility.Role? { .staticText }
     /// `NSAccessibilityStaticText`'s value, narrowing NSView's `Any?`.
     func accessibilityValue() -> String? { spoken }
@@ -521,118 +537,5 @@ final class TextFragment: NSTextLayoutFragment {
         NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: true)
         string.draw(at: CGPoint(x: point.x - layoutFragmentFrame.origin.x + marker.x, y: baseline - marker.font.ascender.rounded(.up)))
         NSGraphicsContext.restoreGraphicsState()
-    }
-}
-
-// MARK: Selection
-
-/// The selection over the text views of one `MarkdownView` instance (N1; N2 lifts it to the
-/// column). Positions are (participant, UTF-16 offset), clamped and snapped to composed-character
-/// boundaries whenever they are read, so a view whose text changed never traps.
-@MainActor
-final class SelectionCoordinator {
-    struct Position: Equatable { var participant: Int; var offset: Int }
-
-    private final class Weak { weak var view: MessageTextView?; init(_ view: MessageTextView) { self.view = view } }
-    private var views: [Int: Weak] = [:]
-    private(set) var anchor: Position?
-    private(set) var focus: Position?
-    private let feedback = CopyFeedback()
-    /// Only one selection shows at a time: a press in another body clears this one.
-    private static weak var active: SelectionCoordinator?
-    /// The selection's colour follows the window's key state: repaint when it changes, while there is one.
-    private var keyObservers: [NSObjectProtocol] = []
-
-    func attach(_ view: MessageTextView) {
-        guard views[view.participant]?.view !== view else { return }
-        views[view.participant] = Weak(view)
-        view.needsDisplay = true
-    }
-
-    func detach(_ view: MessageTextView) {
-        // A newer view may already hold the participant (SwiftUI makes before it dismantles).
-        if let held = views[view.participant], held.view === view || held.view == nil { views[view.participant] = nil }
-    }
-
-    func begin(in view: MessageTextView, at offset: Int) {
-        if Self.active !== self { Self.active?.clear() }
-        Self.active = self
-        if views[view.participant]?.view !== view { attach(view) }
-        anchor = Position(participant: view.participant, offset: offset)
-        focus = anchor
-        if keyObservers.isEmpty, let window = view.window {
-            keyObservers = [NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification].map { name in
-                NotificationCenter.default.addObserver(forName: name, object: window, queue: .main) { [weak self] _ in
-                    MainActor.assumeIsolated { self?.repaint() }
-                }
-            }
-        }
-        repaint()
-    }
-
-    func extend(to windowPoint: CGPoint) {
-        guard anchor != nil, let position = resolve(windowPoint) else { return }
-        focus = position
-        repaint()
-    }
-
-    func clear() {
-        anchor = nil
-        focus = nil
-        keyObservers.forEach { NotificationCenter.default.removeObserver($0) }
-        keyObservers = []
-        repaint()
-    }
-
-    func repaint() { views.values.forEach { $0.view?.needsDisplay = true } }
-
-    private var ordered: (Position, Position)? {
-        guard let anchor, let focus else { return nil }
-        return (anchor.participant, anchor.offset) <= (focus.participant, focus.offset) ? (anchor, focus) : (focus, anchor)
-    }
-
-    /// The part of `view`'s text the selection covers.
-    func range(for view: MessageTextView) -> NSRange? {
-        guard views[view.participant]?.view === view, let (start, end) = ordered,
-              (start.participant...end.participant).contains(view.participant) else { return nil }
-        let length = view.length
-        let from = view.participant == start.participant ? min(start.offset, length) : 0
-        let to = view.participant == end.participant ? min(end.offset, length) : length
-        guard to > from else { return nil }
-        let snapped = (view.attributed.string as NSString).rangeOfComposedCharacterSequences(for: NSRange(location: from, length: to - from))
-        return snapped.length > 0 ? snapped : nil
-    }
-
-    /// The selection's displayed text (D2): each view's slice, one newline between views.
-    var selectedText: String {
-        views.keys.sorted().compactMap { participant -> String? in
-            guard let view = views[participant]?.view, let range = range(for: view) else { return nil }
-            return MessageTextContent.copied(view.attributed, in: range)
-        }.joined(separator: "\n")
-    }
-
-    var hasSelection: Bool { !selectedText.isEmpty }
-
-    /// Through the one plain-text writer (D4): clear, then one string.
-    func copy(to pasteboard: NSPasteboard) {
-        let text = selectedText
-        guard !text.isEmpty else { return }
-        feedback.copy(text, to: pasteboard)
-    }
-
-    /// The participant under `point` (window coordinates), else the nearest one vertically: its
-    /// start when the point is below it, its end when above (the window's y grows upward).
-    private func resolve(_ point: CGPoint) -> Position? {
-        var best: (participant: Int, distance: CGFloat, offset: Int)?
-        for (participant, held) in views {
-            guard let view = held.view, view.window != nil, !view.isHiddenOrHasHiddenAncestor else { continue }
-            let frame = view.convert(view.bounds, to: nil)
-            let distance = point.y > frame.maxY ? point.y - frame.maxY : (point.y < frame.minY ? frame.minY - point.y : 0)
-            let offset = point.y > frame.maxY ? 0 : (point.y < frame.minY ? view.length : view.index(at: view.convert(point, from: nil)))
-            if best == nil || distance < best!.distance || (distance == best!.distance && participant < best!.participant) {
-                best = (participant, distance, offset)
-            }
-        }
-        return best.map { Position(participant: $0.participant, offset: $0.offset) }
     }
 }
