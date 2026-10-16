@@ -372,10 +372,11 @@ struct BlockView: View, Equatable {
 /// The code-block look of Vencord's ShikiCodeblocks (refs/vencord/src/plugins/shikiCodeblocks.desktop,
 /// GPL-3.0; look only, no code), with VS Code's Dark+ colours. Each constant cites its source.
 enum CodeBlockStyle {
-    /// Dark+ `colors.editor.background` and `editor.foreground` (dark_vs.json): the root's
-    /// background (`backgroundColor: editor.background` at the default 100 % opacity) and the plain
-    /// colour of text, line numbers and the header. Core's theme takes the same two values.
-    static let background = RGB(rgb: 0x1E1E1E)
+    /// The root's background: darker than Dark+ `colors.editor.background` (#1E1E1E), which is
+    /// the dark pane's own colour and hid the block's edge (user, 2026-10-16). Provisional.
+    static let background = RGB(rgb: 0x141414)
+    /// Dark+ `editor.foreground` (dark_vs.json): the plain colour of text, line numbers and the
+    /// header. Core's theme takes this and Dark+'s background; only this side paints the root.
     static let plain: UInt32 = 0xD4D4D4
     /// `.vc-shiki-code { line-height: 1.125rem }`.
     static let lineHeight: CGFloat = 18

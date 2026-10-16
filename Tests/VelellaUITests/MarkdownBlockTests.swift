@@ -190,9 +190,9 @@ private struct Pixels {
     // Vencord: `white-space: pre-wrap; overflow-wrap: anywhere`. Never wider than the column.
     #expect(long.height > short.height * 2, "a long line wraps")
     #expect(long.width == 200)
-    // Dark+'s editor background (#1E1E1E) inside the right padding; the corner is cut by the radius.
+    // The block's background (#141414) inside the right padding; the corner is cut by the radius.
     let edge = short.at(short.width - 3, short.height / 2)
-    #expect(edge[0...2].allSatisfy { abs(Int($0) - 0x1E) <= 4 } && edge[3] == 255, "\(edge)")
+    #expect(edge[0...2].allSatisfy { abs(Int($0) - 0x14) <= 4 } && edge[3] == 255, "\(edge)")
     #expect(short.at(0, 0)[3] < 255)
     // Lines are kept.
     let two = try #require(render([.codeBlock(language: nil, code: "a\nb", header: nil, highlight: nil)], width: 200))
