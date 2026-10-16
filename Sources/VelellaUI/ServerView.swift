@@ -8,7 +8,7 @@ import SwiftUI
 
 private typealias T = DesignTokens
 
-/// The channel column: channel or DM list, floating user footer. The column title lives in the
+/// The channel column: channel or DM list under a floating user footer. The column title lives in the
 /// window toolbar (see ShellView), so the list starts directly under it.
 struct ServerView: View {
     @Binding var state: ShellState
@@ -22,7 +22,7 @@ struct ServerView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
+        Group {
             if state.isDMMode {
                 DMList(topRows: state.dmTopRows, dms: state.dms, selection: $state.selectedDMID)
             } else if state.categories.isEmpty {
@@ -39,10 +39,16 @@ struct ServerView: View {
             } else {
                 ChannelList(categories: state.categories, selection: $state.selectedChannelID)
             }
-
+        }
+        // The footer floats over the list, which scrolls on under its glass and still lets its
+        // last row scroll clear of it; the list's bottom edge is soft. Swiftcord v2's
+        // ChannelSidebar: safeAreaBar(edge: .bottom, spacing: 0) and
+        // scrollEdgeEffectStyle(.soft, for: .bottom) (refs/swiftcord-v2-teardown.md, UserFooterBar).
+        .safeAreaBar(edge: .bottom, spacing: 0) {
             if let user = state.currentUser {
                 CurrentUserFooter(user: user).padding(T.Spacing.sm)
             }
         }
+        .scrollEdgeEffectStyle(.soft, for: .bottom)
     }
 }
