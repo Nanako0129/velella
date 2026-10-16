@@ -415,6 +415,44 @@ enum DesignTokens {
         static let nameGlowRadius: CGFloat = 4
     }
 
+    /// The message context menu (selection plan C1, D5): Discord's layout, measured at 1x in
+    /// refs/discord-ground-truth/captures/e0-menu-other.png (kept out of git) and its CSS module
+    /// c1e9c4 (docs/element-map.md), drawn on glass instead of Discord's dark fill.
+    enum Menu {
+        /// The capture's menu is 222 px wide including its 1 px border; glass has no border.
+        static let width: CGFloat = 220
+        /// Panel edge to the first and last row, and to the rows' sides: the capture's last row
+        /// ends 8 above the bottom border.
+        static let panelPadding: CGFloat = 8
+        /// `.item`: min-height 32 (D5). Rows sit 36 apart in the capture, so 2 above and below each.
+        static let rowHeight: CGFloat = 32
+        static let rowMargin: CGFloat = 2
+        /// `.item`: padding 8; radius 2 (D5).
+        static let itemPadding: CGFloat = 8
+        static let itemRadius: CGFloat = 2
+        /// `.separator`: 1 pt with 8 above and below (D5); a section break adds 17 to the pitch in
+        /// the capture.
+        static let separatorHeight: CGFloat = 1
+        static let separatorGap: CGFloat = 8
+        /// Icon box 18; the capture's glyphs are 16 px, starting 18 px in from the menu's inner edge
+        /// (8 panel + 8 item + 2), and the label starts 10 px after the 18 pt box.
+        static let iconBox: CGFloat = 18
+        static let iconGap: CGFloat = 10
+        static let icon = Font.system(size: 15)
+        /// Labels: cap height 10 px in the capture, Discord's 14 px medium.
+        static let label = Font.system(size: 14, weight: .medium)
+        /// "⌘C" and the Open Link arrow at the trailing edge.
+        static let trailing = Font.system(size: 13, weight: .medium)
+        /// Corner of the glass panel; the capture's corner sits under its border, so the radius is
+        /// not measured (provisional, a visual round may change it).
+        static let panelRadius: CGFloat = 8
+        /// `--background-mod-subtle` under the highlighted row: a faint label-colour wash, as the
+        /// "+" menu's hover (`Palette.plusMenuRowHover`).
+        static let rowHighlight = Color.primary.opacity(0.1)
+        /// `--border-subtle`.
+        static let separator = Color(nsColor: .separatorColor)
+    }
+
     enum Motion {
         /// Legacy spring for the rail indicator and icon morph.
         static let railSpring = Animation.interpolatingSpring(stiffness: 500, damping: 30)

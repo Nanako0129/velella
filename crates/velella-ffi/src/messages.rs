@@ -159,6 +159,13 @@ impl MessageSubscription {
         let _context = runtime().enter();
         self.0.load_older();
     }
+
+    /// The reply preview of buffered message `message_id` of this channel, flattened at call time
+    /// by core's spoiler-safe rules (hidden spoiler text never appears; text only, emoji as
+    /// `:name:`). nil when the message is not buffered or this channel is no longer open.
+    pub fn preview(&self, message_id: u64) -> Option<String> {
+        self.0.preview(message_id)
+    }
 }
 
 #[uniffi::export]

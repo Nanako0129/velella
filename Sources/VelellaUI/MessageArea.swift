@@ -17,8 +17,14 @@ struct MessageArea: View {
     var load: MessageLoad = .idle
     @Binding var reply: ReplyPreview?
     @Binding var draft: String
-    /// Receives the draft and the reply's target message id (nil without a reply).
-    var onSend: ((String, String?) -> Void)?
+    /// Receives the draft and the reply's target (nil without a reply).
+    var onSend: ((String, ReplyTarget?) -> Void)?
+    /// The conversation `messages` were loaded for (`ShellState.conversation`); the message menu
+    /// builds its links from it.
+    var conversation: ConversationIDs?
+    /// Core's reply preview line for a message id (the app's per-message preview call); nil
+    /// (fixtures) leaves the reply bar's line empty.
+    var replyPreview: ((String) -> String?)?
     /// Older-history state and the request for the next page (wave 3 P); see `OlderMessages.swift`.
     var older: OlderState = .idle
     var onLoadOlder: (() -> Void)?
@@ -28,8 +34,30 @@ struct MessageArea: View {
     /// The topmost message row (or divider) in view, kept by SwiftUI as the list scrolls. Binding it
     /// makes the scroll view hold that row at its place when older rows are prepended.
     @State private var topID: String?
+    /// The open message menu, if any (selection plan C1).
+    @State private var menu = MessageMenuPresenter()
 
     var body: some View {
+        Group { content }
+            // C1 Dismissal: the message left the rows (deleted, a switch or sign-out emptied them),
+            // its body or delivery changed, or the conversation did.
+            .onChange(of: messages) { menu.revalidate(messages: messages, conversation: conversation) }
+            .onChange(of: conversation) { menu.revalidate(messages: messages, conversation: conversation) }
+            .onDisappear { menu.dismiss() }
+    }
+
+    /// Opens the menu for `message` (C1 Trigger); link and selection come with W1.
+    private func openMenu(_ message: MessageItem, at point: NSPoint, in window: NSWindow?) {
+        let context = MessageMenuContext(message: message, conversation: conversation)
+        // Core flattens the preview now, once, and only when Reply can show (C1 Reply).
+        let preview = context.delivery == .sent ? replyPreview?(message.id) : nil
+        menu.present(
+            context, body: message.body, conversation: conversation, replyPreview: preview, at: point, from: window
+        ) { [reply = $reply] in reply.wrappedValue = $0 }
+    }
+
+    @ViewBuilder
+    private var content: some View {
         if header != nil {
             Group {
                 // Until the first page arrives (a switch empties the rows at once), as in v2.
@@ -49,7 +77,9 @@ struct MessageArea: View {
                                     switch entry {
                                     case .divider(_, let date): DateDivider(date: date)
                                     case .row(let message, let startsGroup, let afterDivider):
-                                        MessageRow(message: message, startsGroup: startsGroup, afterDivider: afterDivider)
+                                        MessageRow(message: message, startsGroup: startsGroup, afterDivider: afterDivider) { point, window in
+                                            openMenu(message, at: point, in: window)
+                                        }
                                             .onAppear { if entry.id == entries.first?.id, older == .idle { onLoadOlder?() } }
                                     }
                                 }
@@ -183,6 +213,8 @@ struct MessageRow: View {
     let message: MessageItem
     var startsGroup = true
     var afterDivider = false
+    /// A right-click anywhere on the row (C1 Trigger): its screen point and window.
+    var onContextMenu: ((NSPoint, NSWindow?) -> Void)?
     @Environment(\.discordLocale) private var discordLocale
     @State private var hovered = false
 
@@ -266,6 +298,8 @@ struct MessageRow: View {
             }
         }
         .onHover { hovered = $0 }
+        // Over the whole row, avatar and paddings included; it takes only right- and Control-clicks.
+        .overlay { if let onContextMenu { MessageMenuTrigger(open: onContextMenu) } }
         .padding(.top, startsGroup && !afterDivider ? M.groupStart : 0)
         // An unconfirmed echo is dimmed until Discord confirms it.
         .opacity(message.delivery == .pending ? 0.5 : 1)
@@ -326,7 +360,7 @@ struct Composer: View {
     @Binding var draft: String
     /// Receives the draft and the reply target on Return (`ComposerSubmit`: never blank, never an
     /// IME commit); the reply bar clears with the draft.
-    var onSend: ((String, String?) -> Void)?
+    var onSend: ((String, ReplyTarget?) -> Void)?
     @State private var plusMenuOpen = false
 
     var body: some View {

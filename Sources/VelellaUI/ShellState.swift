@@ -272,13 +272,13 @@ public enum ComposerSubmit {
         onSend(text)
     }
 
-    /// `submit` for a composer that may be replying: the send carries the reply's `messageID`, and
-    /// the reply bar clears with the draft, only when something was sent.
+    /// `submit` for a composer that may be replying: the send carries the reply's whole target
+    /// (message and channel), and the reply bar clears with the draft, only when something was sent.
     public static func submit(
-        _ draft: inout String, reply: inout ReplyPreview?, hasMarkedText: Bool, onSend: ((String, String?) -> Void)?
+        _ draft: inout String, reply: inout ReplyPreview?, hasMarkedText: Bool, onSend: ((String, ReplyTarget?) -> Void)?
     ) {
         guard let onSend, !hasMarkedText, !draft.allSatisfy(\.isWhitespace) else { return }
-        let text = draft, target = reply?.messageID
+        let text = draft, target = reply?.target
         draft = ""
         reply = nil
         onSend(text, target)
@@ -375,8 +375,51 @@ public struct ReplyPreview: Hashable, Sendable {
     /// The replied message's id: what the composer sends as the reply target. nil (fixtures,
     /// previews) sends a plain message.
     public var messageID: String?
-    public init(authorName: String, segments: [PreviewSegment], messageID: String? = nil) {
-        self.authorName = authorName; self.segments = segments; self.messageID = messageID
+    /// The channel the replied message was picked in; the app sends the reply only there.
+    public var channelID: String?
+    public init(authorName: String, segments: [PreviewSegment], messageID: String? = nil, channelID: String? = nil) {
+        self.authorName = authorName; self.segments = segments; self.messageID = messageID; self.channelID = channelID
+    }
+
+    /// What the composer sends with the draft: nil unless both ids are known.
+    public var target: ReplyTarget? {
+        guard let messageID, let channelID else { return nil }
+        return ReplyTarget(messageID: messageID, channelID: channelID)
+    }
+}
+
+/// A reply's target: the replied message and the channel it was picked in (selection plan C1).
+public struct ReplyTarget: Hashable, Sendable {
+    public var messageID: String
+    public var channelID: String
+    public init(messageID: String, channelID: String) {
+        self.messageID = messageID; self.channelID = channelID
+    }
+
+    /// The message id to send as the reply target of a message posted to `channel`: nil (a plain
+    /// message) without a target, for a target picked in another channel, or when an id is not a
+    /// `UInt64`. A target never follows the draft into another conversation.
+    public static func replyID(_ target: ReplyTarget?, sendingTo channel: UInt64) -> UInt64? {
+        guard let target, UInt64(target.channelID) == channel else { return nil }
+        return UInt64(target.messageID)
+    }
+}
+
+/// The ids of the conversation the message rows were loaded for (selection plan C1, Ids source).
+/// The app writes them together with the rows, so a menu opened on a row builds its message link
+/// from the conversation the row belongs to, never from a selection that moved since.
+public struct ConversationIDs: Hashable, Sendable {
+    public var channelID: String
+    /// nil for a direct message.
+    public var guildID: String?
+    public init(channelID: String, guildID: String?) {
+        self.channelID = channelID; self.guildID = guildID
+    }
+
+    /// From the engine's ids: nil without a channel; `guild` nil for a DM.
+    public init?(channel: UInt64?, guild: UInt64?) {
+        guard let channel else { return nil }
+        self.init(channelID: String(channel), guildID: guild.map { String($0) })
     }
 }
 
@@ -397,6 +440,9 @@ public struct ShellState: Equatable, Sendable {
     public var categories: [ChannelCategory]
     public var selectedChannelID: String?
     public var messages: [MessageItem]
+    /// The conversation `messages` were loaded for, written with them (nil with no rows from the
+    /// engine: fixtures, or before the first snapshot); the message menu reads it.
+    public var conversation: ConversationIDs?
     public var memberSections: [MemberSection]
     public var currentUser: CurrentUser?
     public var dmTopRows: [DMTopRow]

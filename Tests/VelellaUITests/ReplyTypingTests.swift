@@ -7,11 +7,11 @@ private let fsi = "\u{2068}", pdi = "\u{2069}"
 // MARK: Reply
 
 @Test func aSubmitCarriesTheReplyTargetAndClearsTheReplyBar() {
-    var sent: [(String, String?)] = []
+    var sent: [(String, ReplyTarget?)] = []
     var draft = "answer"
-    var reply: ReplyPreview? = ReplyPreview(authorName: "Ada", segments: [.text("question")], messageID: "30")
+    var reply: ReplyPreview? = ReplyPreview(authorName: "Ada", segments: [.text("question")], messageID: "30", channelID: "7")
     ComposerSubmit.submit(&draft, reply: &reply, hasMarkedText: false) { sent.append(($0, $1)) }
-    #expect(sent.count == 1 && sent[0].0 == "answer" && sent[0].1 == "30")
+    #expect(sent.count == 1 && sent[0].0 == "answer" && sent[0].1 == ReplyTarget(messageID: "30", channelID: "7"))
     #expect(draft.isEmpty)
     #expect(reply == nil)
     // The next message is a plain one.
@@ -34,11 +34,14 @@ private let fsi = "\u{2068}", pdi = "\u{2069}"
 }
 
 @Test func aReplyWithoutAnIdSendsAPlainMessage() {
-    var target: String?? = .some("unset")
-    var reply: ReplyPreview? = ReplyPreview(authorName: "Ada", segments: [])
-    var draft = "hi"
-    ComposerSubmit.submit(&draft, reply: &reply, hasMarkedText: false) { _, id in target = .some(id) }
-    #expect(target == .some(nil))
+    // Neither id, or a message id without the channel it was picked in: no target.
+    for reply in [ReplyPreview(authorName: "Ada", segments: []), ReplyPreview(authorName: "Ada", segments: [], messageID: "30")] {
+        var target: ReplyTarget?? = .some(ReplyTarget(messageID: "unset", channelID: "unset"))
+        var reply: ReplyPreview? = reply
+        var draft = "hi"
+        ComposerSubmit.submit(&draft, reply: &reply, hasMarkedText: false) { _, sent in target = .some(sent) }
+        #expect(target == .some(nil))
+    }
 }
 
 @Test func theReplyBarShowsTheNameVerbatimAndIsolated() {

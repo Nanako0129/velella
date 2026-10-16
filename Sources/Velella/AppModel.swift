@@ -31,6 +31,8 @@ final class AppModel {
     @ObservationIgnored private var messagesSub: MessageSubscription?
     /// Channel `messagesSub` opened from `shell.openTarget`: the only channel `send` posts to.
     @ObservationIgnored private var messagesChannel: UInt64?
+    /// Guild of `messagesChannel` when it was opened (nil for a DM): the message menu's link scope.
+    @ObservationIgnored private var messagesGuild: UInt64?
     /// Bumped by every `openMessages`; only snapshots of the latest subscription are applied, so a
     /// late one from an earlier visit to the same channel (X, Y, back to X) is dropped too.
     @ObservationIgnored private var messagesOpen: UInt64 = 0
@@ -156,7 +158,9 @@ final class AppModel {
         members.teardown()
         messagesSub = nil
         messagesChannel = nil
+        messagesGuild = nil
         shell.messages = []
+        shell.conversation = nil
         shell.messageLoad = .idle
         shell.older = .idle
         shell.typing = []
@@ -194,10 +198,17 @@ final class AppModel {
 
     /// The composer's submit: to the channel this model opened, never to a selection read now.
     /// Core sends only if that is still its open channel.
-    /// `replyTo` is the replied message's id as the reply bar holds it.
-    func send(_ text: String, replyTo: String? = nil) {
+    /// `target` is the reply bar's target; one picked in another channel is dropped and the text
+    /// goes out as a plain message (`ReplyTarget.replyID`).
+    func send(_ text: String, target: ReplyTarget? = nil) {
         guard let handle, let channel = messagesChannel else { return }
-        _ = handle.sendMessage(channelId: channel, content: text, replyTo: replyTo.flatMap { UInt64($0) })
+        _ = handle.sendMessage(channelId: channel, content: text, replyTo: ReplyTarget.replyID(target, sendingTo: channel))
+    }
+
+    /// Core's one-line reply preview of a buffered message of the open conversation (spoilers as
+    /// the placeholder), flattened now; nil when it is not buffered.
+    func replyPreview(_ messageID: String) -> String? {
+        UInt64(messageID).flatMap { messagesSub?.preview(messageId: $0) }
     }
 
     // MARK: Messages
@@ -214,7 +225,9 @@ final class AppModel {
         messagesOpen &+= 1
         messagesSub = nil
         messagesChannel = nil
+        messagesGuild = nil
         shell.messages = []
+        shell.conversation = nil
         shell.messageLoad = .idle
         shell.older = .idle
         shell.typing = []
@@ -222,6 +235,9 @@ final class AppModel {
         shell.reply = nil
         guard let target, let handle, let generation else { return }
         messagesChannel = target
+        // `syncSelection` ran first for a rail change, so this is the open target's guild; nil in
+        // DM mode, where the rail entry is not a guild.
+        messagesGuild = shell.isDMMode ? nil : channelsGuild
         shell.messageLoad = .loading
         messagesSub = handle.subscribeMessages(
             channelId: target,
@@ -243,6 +259,8 @@ final class AppModel {
                 embeds: row.embeds.map { Self.embed($0, row: row) }, imageSpoilers: row.images.map(\.spoiler)
             )
         }
+        // With the rows, never apart from them: the menu builds a row's link from these.
+        shell.conversation = ConversationIDs(channel: messagesChannel, guild: messagesGuild)
         shell.typing = snapshot.typing
         shell.messageLoad = switch snapshot.load {
         case .loading: .loading
