@@ -67,6 +67,11 @@ const BOOKMARKS_V1: &str = "2026-03-message-bookmarks";
 const BOOKMARKS_V2: &str = "2026-07-message-bookmarks-v2";
 const OBFUSCATION: &str = "2026-02-private-channel-hiding";
 const CONVERSATIONS: &str = "2026-03-conversation-highlighting-utility";
+/// Legacy user experiments of the attachment upload (composer plan CU): the 1 GiB Nitro limit
+/// (OA A38, variation 1 enabled) and the HEIC / JXR conversions (OA A45, D16a).
+pub(crate) const NITRO_FILE_UPLOAD: &str = "2026-09-nitro-file-upload-rollout";
+pub(crate) const HEIC_CONVERSION: &str = "2026-08-heic-upload-conversion";
+pub(crate) const JXR_CONVERSION: &str = "2026-09-jxr-upload-conversion";
 
 /// Guild features and the user flag the gates read.
 const FEATURE_VERIFIED: &str = "VERIFIED";
@@ -498,7 +503,7 @@ enum Def {
 
 fn definition(name: &str) -> Option<Def> {
     Some(match name {
-        TIDA_WEBFORM => Def::LegacyUser,
+        TIDA_WEBFORM | NITRO_FILE_UPLOAD | HEIC_CONVERSION | JXR_CONVERSION => Def::LegacyUser,
         OFFICIAL_MESSAGES => Def::LegacyGuild,
         // Variations 1 and 2 are on (3 is off for the obfuscation experiment).
         BOOKMARKS_V1 | OBFUSCATION => Def::Apex(|v, _| matches!(v, Some(1 | 2))),
@@ -788,7 +793,22 @@ impl State {
             .map_or(Gate::Unknown, |e| Gate::of(e.on))
     }
 
-    fn guild_feature(&self, guild: Option<u64>, feature: &str) -> Gate {
+    /// The treatment bucket (1, 2, …) of a legacy user experiment whose variations carry different
+    /// configs (the HEIC conversion's 1 and 2, OA A45): `Some(None)` when the account gets the
+    /// default config (assigned nothing, not eligible, control, or A/A), `None` when unknown.
+    pub(crate) fn legacy_user_variation(&self, name: &str) -> Option<Option<i64>> {
+        definition(name)?;
+        let user = self.experiments.user.as_ref()?;
+        Some(match user.get(&u64::from(hs(name))) {
+            None => None,
+            Some(u) => {
+                let u = u.as_ref()?;
+                (!u.aa && u.bucket >= 1).then_some(u.bucket)
+            }
+        })
+    }
+
+    pub(crate) fn guild_feature(&self, guild: Option<u64>, feature: &str) -> Gate {
         match guild {
             None => Gate::Disabled,
             Some(g) => self.experiments.guilds.get(&g).map_or(Gate::Unknown, |i| {

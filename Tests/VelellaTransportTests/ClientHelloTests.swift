@@ -161,7 +161,7 @@ func describe(_ hello: ClientHello) -> String {
     }
     let list = AllowList(
         http: [AllowList.Rule(scheme: "https", host: .exact("localhost"), port: Int(server.port), path: .prefix("/api/v9/"))],
-        webSocket: [], authorizedPrefix: "https://localhost:\(server.port)/api/v9/"
+        webSocket: [], upload: [], authorizedPrefix: "https://localhost:\(server.port)/api/v9/"
     )
     let transport = URLSessionTransport(allowList: list)
     let outcome = await transport.perform(try request("https://localhost:\(server.port)/api/v9/users/@me"))

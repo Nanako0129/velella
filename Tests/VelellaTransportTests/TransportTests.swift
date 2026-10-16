@@ -15,7 +15,10 @@ func local(_ ports: UInt16...) -> AllowList {
     let rules = { (scheme: String) in
         ports.map { AllowList.Rule(scheme: scheme, host: .exact("127.0.0.1"), port: Int($0), path: .prefix("/")) }
     }
-    return AllowList(http: rules("http"), webSocket: rules("ws"), authorizedPrefix: "http://127.0.0.1:\(ports[0])/api/v9/")
+    return AllowList(
+        http: rules("http"), webSocket: rules("ws"), upload: [],
+        authorizedPrefix: "http://127.0.0.1:\(ports[0])/api/v9/"
+    )
 }
 
 func request(

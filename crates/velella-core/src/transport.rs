@@ -278,12 +278,144 @@ pub enum Received {
     Lost,
 }
 
+/// What the app recorded of an attached file when it was added (composer plan CU-6): the resolved
+/// path of a regular file and its (device, inode, size, mtime). Core never opens the path; it
+/// hands this back to the transport, which opens the file once at send time and refuses it when
+/// any of the four changed. `Debug` never shows the path.
+#[derive(Clone, PartialEq, Eq)]
+pub struct FileIdentity {
+    pub path: String,
+    pub device: u64,
+    pub inode: u64,
+    pub size: u64,
+    /// Modification time in nanoseconds since the Unix epoch.
+    pub mtime_ns: i64,
+}
+
+impl fmt::Debug for FileIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "FileIdentity([REDACTED], {} bytes)", self.size)
+    }
+}
+
+/// The two methods of the upload operation: the CORS preflight and the PUT (probe included).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UploadMethod {
+    Options,
+    Put,
+}
+
+impl UploadMethod {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Options => "OPTIONS",
+            Self::Put => "PUT",
+        }
+    }
+}
+
+/// `length` bytes of an opened file (`Transport::open_file`'s id) from byte `start`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UploadBody {
+    pub file: u64,
+    pub start: u64,
+    pub length: u64,
+}
+
+/// One request of the file upload (composer plan CU Upload): an OPTIONS preflight, or a PUT whose
+/// body streams from a file the app opened (`None`: an empty body). There is no Authorization
+/// field, so none can reach the upload host; the header list is core's closed list
+/// (`uploads::headers`), which the app's transport checks again by name.
+pub struct UploadRequest {
+    method: UploadMethod,
+    url: String,
+    headers: Vec<(String, String)>,
+    body: Option<UploadBody>,
+    deadline: Duration,
+    body_cap: usize,
+}
+
+impl UploadRequest {
+    pub fn new(
+        method: UploadMethod,
+        url: String,
+        headers: Vec<(String, String)>,
+        body: Option<UploadBody>,
+        deadline: Duration,
+        body_cap: usize,
+    ) -> Result<UploadRequest, InvalidHeader> {
+        Ok(UploadRequest {
+            method,
+            url,
+            headers: checked(headers)?,
+            body,
+            deadline,
+            body_cap,
+        })
+    }
+
+    pub fn method(&self) -> UploadMethod {
+        self.method
+    }
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+    pub fn headers(&self) -> &[(String, String)] {
+        &self.headers
+    }
+    pub fn body(&self) -> Option<UploadBody> {
+        self.body
+    }
+    pub fn deadline(&self) -> Duration {
+        self.deadline
+    }
+    pub fn body_cap(&self) -> usize {
+        self.body_cap
+    }
+}
+
+/// Method, header names and the body's extent only: never the URL or a header value.
+impl fmt::Debug for UploadRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let names: Vec<&str> = self.headers.iter().map(|(n, _)| n.as_str()).collect();
+        f.debug_struct("UploadRequest")
+            .field("method", &self.method)
+            .field("headers", &names)
+            .field("body", &self.body)
+            .field("deadline", &self.deadline)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Bytes of the current request body sent so far; called from any thread, often.
+pub type UploadProgress = Box<dyn Fn(u64) + Send + Sync>;
+
 pub trait Transport: Send + Sync {
     fn http(&self, request: HttpRequest) -> BoxFuture<'_, Result<HttpResponse, TransportError>>;
     fn websocket(
         &self,
         request: WebSocketRequest,
     ) -> BoxFuture<'_, Result<Box<dyn WebSocket>, TransportError>>;
+
+    /// Opens the attached file once (CU-6): the app opens the path without following a link,
+    /// requires a regular file whose (device, inode, size, mtime) equal `file`'s, and keeps the
+    /// handle under the returned id until `close_file`. `None`: the file is gone or changed.
+    fn open_file(&self, _file: &FileIdentity) -> Option<u64> {
+        None
+    }
+
+    fn close_file(&self, _id: u64) {}
+
+    /// One upload exchange (`UploadRequest`): the upload-only allow-list, the closed header names,
+    /// the body streamed from the opened file, redirects refused, the response read through
+    /// `body_cap`.
+    fn upload(
+        &self,
+        _request: UploadRequest,
+        _progress: UploadProgress,
+    ) -> BoxFuture<'_, Result<HttpResponse, TransportError>> {
+        Box::pin(async { Err(TransportError::Rejected) })
+    }
 }
 
 /// Dropping an unfinished future cancels that operation.
@@ -602,6 +734,32 @@ mod tests {
             format!("{response:?}"),
             format!("{ws:?}"),
             format!("{:?}", auth()),
+            format!(
+                "{:?}",
+                UploadRequest::new(
+                    UploadMethod::Put,
+                    format!("https://u.test/{MARKER}?{MARKER}"),
+                    vec![("Origin".into(), MARKER.into())],
+                    Some(UploadBody {
+                        file: 1,
+                        start: 0,
+                        length: 1
+                    }),
+                    Duration::from_secs(1),
+                    1,
+                )
+                .unwrap()
+            ),
+            format!(
+                "{:?}",
+                FileIdentity {
+                    path: format!("/tmp/{MARKER}"),
+                    device: 1,
+                    inode: 2,
+                    size: 3,
+                    mtime_ns: 4
+                }
+            ),
         ] {
             assert!(!text.contains("SYNTHETIC"), "{text}");
         }

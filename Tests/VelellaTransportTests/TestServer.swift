@@ -126,6 +126,36 @@ final class Peer: @unchecked Sendable {
         return (head, body)
     }
 
+    /// The raw head only; the body stays unread (`drain` reads it piece by piece).
+    func readHead() -> String? {
+        let blank = Data("\r\n\r\n".utf8)
+        while buffer.range(of: blank) == nil { guard fill() else { return nil } }
+        let end = buffer.range(of: blank)!.upperBound
+        let head = String(decoding: buffer[buffer.startIndex..<end], as: UTF8.self)
+        buffer.removeSubrange(buffer.startIndex..<end)
+        return head
+    }
+
+    /// Reads up to `count` body bytes without keeping them, handing each piece to `piece`;
+    /// returns how many arrived before the end of stream. Reads past the buffer straight from
+    /// the socket: `Data.removeFirst` keeps its storage, so a buffer drained and refilled grows.
+    func drain(_ count: Int, _ piece: (Data) -> Void) -> Int {
+        var got = min(buffer.count, count)
+        if got > 0 {
+            piece(Data(buffer.prefix(got)))
+            buffer = Data(buffer.dropFirst(got))
+        }
+        var chunk = [UInt8](repeating: 0, count: 65536)
+        while got < count {
+            let n = read(fd, &chunk, min(chunk.count, count - got))
+            guard n > 0 else { break }
+            piece(Data(chunk[..<n]))
+            got += n
+        }
+        return got
+    }
+
+
     /// False if the peer went away before everything was written.
     @discardableResult
     func write(_ data: Data) -> Bool {

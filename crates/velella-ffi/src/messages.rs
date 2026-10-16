@@ -135,6 +135,8 @@ pub struct MessageRow {
     pub reactions: Vec<MessageReaction>,
     /// At most 10.
     pub embeds: Vec<MessageEmbed>,
+    /// A send with attachments not yet confirmed: its files, progress and outcome (CU).
+    pub upload: Option<crate::uploads::PendingUpload>,
 }
 
 #[derive(uniffi::Record)]
@@ -262,6 +264,7 @@ impl From<velella_core::MessageRow> for MessageRow {
                 })
                 .collect(),
             embeds: r.embeds.into_iter().map(Into::into).collect(),
+            upload: r.upload.map(Into::into),
         }
     }
 }
@@ -396,6 +399,7 @@ mod tests {
                 is_video: true,
                 spoiler: true,
             }],
+            upload: None,
         };
         let s = MessagesSnapshot::from(velella_core::MessagesSnapshot {
             channel_id: 9,
@@ -537,6 +541,7 @@ mod tests {
             ("https://media.discordapp.net/x", 3, 2, Some("alt"))
         );
         assert_eq!(r.files, ["f.txt"]);
+        assert!(r.upload.is_none());
         let reply = r.reply.as_ref().unwrap();
         assert_eq!((&*reply.author_name, &*reply.content), ("r", "c"));
         assert_eq!(r.failure.as_deref(), Some("Not sent"));

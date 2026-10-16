@@ -33,6 +33,11 @@
 //!   and `flags` bit 2 (SUPPRESS_EMBEDS) hides them from rows. An embed whose link the body hides
 //!   in a spoiler is marked `spoiler` in the row. Image attachments come only from `media_url`
 //!   (the proxy URL first), and IS_SPOILER or a `SPOILER_` filename marks them `spoiler`.
+//! - A send with attachments (composer plan CU, uploads.rs) is an echo row kept by nonce in the
+//!   store rather than in the open channel, so a channel switch neither loses it nor its files;
+//!   its row carries the descriptors, per-file progress (bumped at most every 50 ms, clamped to
+//!   the size) and the outcome, and is the single source the UI draws. Every update names the
+//!   run (`generation`) it comes from, so a cancelled or replaced run cannot touch the row.
 use crate::{
     embeds::{self, Embed},
     highlight::{self, Highlighted, Job},
@@ -44,6 +49,7 @@ use crate::{
     sidebar::{avatar_url, CDN},
     state::{Role, State, User},
     typing::{self, Typing},
+    uploads::{self, AttachmentDescriptor, Preflights, SendJob, UploadFailure},
 };
 use serde_json::Value;
 use std::{
@@ -169,6 +175,34 @@ pub struct MessageRow {
     pub reactions: Vec<Reaction>,
     /// At most 10; none while SUPPRESS_EMBEDS is set.
     pub embeds: Vec<Embed>,
+    /// A send with attachments not yet confirmed (composer plan CU): its files and outcome.
+    pub upload: Option<PendingUpload>,
+}
+
+/// One file of a pending attachment send.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingFile {
+    pub descriptor: AttachmentDescriptor,
+    /// Bytes the upload host has, at most the file's size.
+    pub sent: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UploadState {
+    Sending,
+    Failed(UploadFailure),
+    /// Cancelled before the message create (D14a): the UI puts the text, reply target and files
+    /// back into the composer and discards the row.
+    Cancelled,
+}
+
+/// The attachment part of a pending send's row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingUpload {
+    pub files: Vec<PendingFile>,
+    pub reply_to: Option<u64>,
+    pub instant: bool,
+    pub state: UploadState,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -798,6 +832,7 @@ fn row(m: &Stored, ctx: &Context, pending: bool, failure: Option<&'static str>) 
         }),
         pending,
         failure,
+        upload: None,
         reactions: m.reactions.clone(),
         embeds: {
             let hidden = spoilered_links(&m.body);
@@ -842,6 +877,37 @@ fn send_failure(e: RestError) -> &'static str {
     }
 }
 
+/// A local echo of `content` by `me`, with the preview of `reply_to` when it is buffered.
+fn echo(open: &Open, nonce: u64, content: &str, me: User, reply_to: Option<u64>) -> Stored {
+    let reply = reply_to
+        .and_then(|r| open.messages.iter().find(|m| m.id == r))
+        .map(|m| {
+            Box::new(Stored {
+                reply: None,
+                pending: false,
+                ..m.clone()
+            })
+        });
+    Stored {
+        id: nonce,
+        author: me,
+        nick: None,
+        roles: Vec::new(),
+        content: content.to_owned(),
+        body: markdown::parse(content),
+        pending: false, // an echo is never highlighted
+        edited: false,
+        attachments: Vec::new(),
+        mentions: Vec::new(),
+        reply,
+        nonce: None,
+        reactions: Vec::new(),
+        poll_votes: Vec::new(),
+        embeds: Vec::new(),
+        suppress_embeds: false,
+    }
+}
+
 /// A fresh nonce per send: a snowflake for now, strictly increasing within the process (Concord's
 /// `next_message_nonce`, refs/concord/src/discord/commands.rs:31-46).
 fn next_nonce() -> u64 {
@@ -868,6 +934,58 @@ struct Echo {
     nonce: String,
     message: Stored,
     failure: Option<&'static str>,
+}
+
+/// Progress bumps of one pending upload are at most this frequent (CU Upload).
+const PROGRESS_EVERY: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// A send with attachments, by nonce (composer plan CU).
+struct UploadSend {
+    nonce: u64,
+    job: SendJob,
+    message: Stored,
+    sent: Vec<u64>,
+    state: UploadState,
+    /// The current run; updates from another one are ignored.
+    generation: u64,
+    task: Option<AbortHandle>,
+    /// This run's `upload_filename`s, for the DELETEs of a cancel (CU-8, CU-9).
+    uploaded: Vec<String>,
+    /// The message create was dispatched: cancel no longer applies (CU-9).
+    dispatched: bool,
+    last_bump: Option<tokio::time::Instant>,
+}
+
+impl UploadSend {
+    fn row(&self, ctx: &Context) -> MessageRow {
+        let failure = match self.state {
+            UploadState::Failed(f) => Some(f.text()),
+            _ => None,
+        };
+        MessageRow {
+            upload: Some(PendingUpload {
+                files: self
+                    .job
+                    .files
+                    .iter()
+                    .zip(&self.sent)
+                    .map(|(d, sent)| PendingFile {
+                        descriptor: d.clone(),
+                        sent: *sent,
+                    })
+                    .collect(),
+                reply_to: self.job.reply_to,
+                instant: self.job.instant,
+                state: self.state,
+            }),
+            ..row(
+                &self.message,
+                ctx,
+                self.state == UploadState::Sending,
+                failure,
+            )
+        }
+    }
 }
 
 struct Open {
@@ -923,10 +1041,14 @@ impl Open {
 struct Inner {
     epoch: u64,
     open: Option<Open>,
+    /// Sends with attachments, of any channel, in send order.
+    uploads: Vec<UploadSend>,
 }
 
 pub(crate) struct MessageStore {
-    rest: Rest,
+    pub(crate) rest: Rest,
+    /// The upload host's preflights, reused within their max-age (D15a).
+    pub(crate) preflights: Preflights,
     inner: Mutex<Inner>,
     /// Bumped on every buffer change; message subscriptions wait on it.
     revision: watch::Sender<u64>,
@@ -975,6 +1097,7 @@ impl MessageStore {
     fn build(rest: Rest, wake: Option<SyncSender<()>>) -> MessageStore {
         MessageStore {
             rest,
+            preflights: Preflights::default(),
             inner: Mutex::default(),
             revision: watch::channel(0).0,
             wake,
@@ -1216,7 +1339,8 @@ impl MessageStore {
         if !Self::observes(name) {
             return;
         }
-        let mut inner = self.lock();
+        let mut guard = self.lock();
+        let inner = &mut *guard;
         let Some(open) = inner
             .open
             .as_mut()
@@ -1232,6 +1356,12 @@ impl MessageStore {
                 open.echoes.retain(|e| {
                     !(m.nonce.as_deref() == Some(e.nonce.as_str())
                         && m.author.id == e.message.author.id)
+                });
+                let channel_id = open.channel_id;
+                inner.uploads.retain(|u| {
+                    !(u.job.channel_id == channel_id
+                        && m.nonce.as_deref() == Some(u.nonce.to_string().as_str())
+                        && m.author.id == u.message.author.id)
                 });
                 open.insert(m, true);
             }
@@ -1274,7 +1404,7 @@ impl MessageStore {
                 }
             }
         }
-        drop(inner);
+        drop(guard);
         self.bump();
     }
 
@@ -1289,42 +1419,236 @@ impl MessageStore {
     ) -> Option<(u64, String)> {
         let mut inner = self.lock();
         let open = inner.open.as_mut().filter(|o| o.channel_id == channel_id)?;
-        let reply = reply_to
-            .and_then(|r| open.messages.iter().find(|m| m.id == r))
-            .map(|m| {
-                Box::new(Stored {
-                    reply: None,
-                    pending: false,
-                    ..m.clone()
-                })
-            });
         let nonce = next_nonce();
+        let message = echo(open, nonce, content, me, reply_to);
         open.echoes.push(Echo {
             nonce: nonce.to_string(),
-            message: Stored {
-                id: nonce,
-                author: me,
-                nick: None,
-                roles: Vec::new(),
-                content: content.to_owned(),
-                body: markdown::parse(content),
-                pending: false, // an echo is never highlighted
-                edited: false,
-                attachments: Vec::new(),
-                mentions: Vec::new(),
-                reply,
-                nonce: None,
-                reactions: Vec::new(),
-                poll_votes: Vec::new(),
-                embeds: Vec::new(),
-                suppress_embeds: false,
-            },
+            message,
             failure: None,
         });
         let epoch = open.epoch;
         drop(inner);
         self.bump();
         Some((epoch, nonce.to_string()))
+    }
+
+    /// The row of a send with attachments, in `job.channel_id` if that is the open channel, and
+    /// its first run; returns the nonce. Needs a runtime context.
+    pub(crate) fn begin_upload(self: &Arc<Self>, job: SendJob, me: User) -> Option<u64> {
+        let mut guard = self.lock();
+        let inner = &mut *guard;
+        let open = inner
+            .open
+            .as_ref()
+            .filter(|o| o.channel_id == job.channel_id)?;
+        let nonce = next_nonce();
+        let message = echo(open, nonce, &job.content, me, job.reply_to);
+        inner.uploads.push(UploadSend {
+            nonce,
+            sent: vec![0; job.files.len()],
+            job,
+            message,
+            state: UploadState::Sending,
+            generation: 0,
+            task: None,
+            uploaded: Vec::new(),
+            dispatched: false,
+            last_bump: None,
+        });
+        self.start_upload(inner, nonce);
+        drop(guard);
+        self.bump();
+        Some(nonce)
+    }
+
+    /// Starts a new run of send `nonce` (the task cannot touch the row before `inner` is
+    /// released: every update takes the store lock).
+    fn start_upload(self: &Arc<Self>, inner: &mut Inner, nonce: u64) {
+        let Some(send) = inner.uploads.iter_mut().find(|s| s.nonce == nonce) else {
+            return;
+        };
+        send.generation += 1;
+        let task = tokio::spawn(uploads::run(
+            self.clone(),
+            nonce,
+            send.generation,
+            send.job.clone(),
+        ));
+        send.task = Some(task.abort_handle());
+    }
+
+    /// Runs `f` on send `nonce` when `generation` is its current run and it is still sending;
+    /// bumps when `f` says so.
+    fn with_run(&self, nonce: u64, generation: u64, f: impl FnOnce(&mut UploadSend) -> bool) {
+        let mut inner = self.lock();
+        let Some(send) = inner.uploads.iter_mut().find(|s| {
+            s.nonce == nonce && s.generation == generation && s.state == UploadState::Sending
+        }) else {
+            return;
+        };
+        let changed = f(send);
+        drop(inner);
+        if changed {
+            self.bump();
+        }
+    }
+
+    /// File `index` of the run has `bytes` at the host: clamped to its size, bumped at most every
+    /// `PROGRESS_EVERY` (and when it reaches the size).
+    pub(crate) fn upload_progress(&self, nonce: u64, generation: u64, index: usize, bytes: u64) {
+        self.with_run(nonce, generation, |send| {
+            let Some(size) = send.job.files.get(index).map(|f| f.file.size) else {
+                return false;
+            };
+            let value = bytes.min(size);
+            if send.sent[index] == value {
+                return false;
+            }
+            send.sent[index] = value;
+            let now = tokio::time::Instant::now();
+            let due = value == size
+                || send
+                    .last_bump
+                    .is_none_or(|t| now.duration_since(t) >= PROGRESS_EVERY);
+            if due {
+                send.last_bump = Some(now);
+            }
+            due
+        });
+    }
+
+    pub(crate) fn upload_completed(&self, nonce: u64, generation: u64, index: usize, name: &str) {
+        self.with_run(nonce, generation, |send| {
+            send.uploaded.push(name.to_owned());
+            if let (Some(sent), Some(f)) = (send.sent.get_mut(index), send.job.files.get(index)) {
+                *sent = f.file.size;
+            }
+            true
+        });
+    }
+
+    /// Marks the run's message create as dispatched; false (send nothing) once it was cancelled
+    /// or replaced (CU-9).
+    pub(crate) fn dispatch_create(&self, nonce: u64, generation: u64) -> bool {
+        let mut dispatched = false;
+        self.with_run(nonce, generation, |send| {
+            send.dispatched = true;
+            dispatched = true;
+            false
+        });
+        dispatched
+    }
+
+    /// An upload of the run failed: no message is created and the row keeps its text and files.
+    pub(crate) fn upload_failed(&self, nonce: u64, generation: u64, failure: UploadFailure) {
+        self.with_run(nonce, generation, |send| {
+            send.state = UploadState::Failed(failure);
+            send.task = None;
+            true
+        });
+    }
+
+    /// The run's message create returned: the row gives way to the message, or turns failed.
+    pub(crate) fn finish_upload(
+        &self,
+        nonce: u64,
+        generation: u64,
+        channel_id: u64,
+        result: Result<Value, UploadFailure>,
+    ) {
+        let mut inner = self.lock();
+        let current = |s: &UploadSend| s.nonce == nonce && s.generation == generation;
+        match result {
+            Ok(v) => {
+                inner.uploads.retain(|s| !current(s));
+                if let Some(open) = inner.open.as_mut().filter(|o| o.channel_id == channel_id) {
+                    if let Some(m) = parse(&v, false) {
+                        open.insert(m, false);
+                    }
+                }
+            }
+            Err(failure) => {
+                let Some(send) = inner.uploads.iter_mut().find(|s| current(s)) else {
+                    return;
+                };
+                send.state = UploadState::Failed(failure);
+                send.task = None;
+            }
+        }
+        drop(inner);
+        self.bump();
+    }
+
+    /// D14a / CU-9: only before the message create is dispatched. Stops the run, deletes its
+    /// completed uploads (CU-8 paths; a refused value sends nothing) and marks the row cancelled.
+    /// Needs a runtime context.
+    pub(crate) fn cancel_upload(&self, nonce: u64) -> bool {
+        let mut inner = self.lock();
+        let Some(send) = inner
+            .uploads
+            .iter_mut()
+            .find(|s| s.nonce == nonce && s.state == UploadState::Sending && !s.dispatched)
+        else {
+            return false;
+        };
+        if let Some(task) = send.task.take() {
+            task.abort();
+        }
+        send.state = UploadState::Cancelled;
+        // ponytail: a PUT that finished in the instant before the abort, not yet recorded in
+        // `uploaded`, is not deleted; the host drops unreferenced uploads on its own.
+        let paths: Vec<String> = std::mem::take(&mut send.uploaded)
+            .iter()
+            .filter_map(|name| uploads::delete_path(name))
+            .collect();
+        drop(inner);
+        self.bump();
+        if !paths.is_empty() {
+            let rest = self.rest.clone();
+            tokio::spawn(async move {
+                for path in paths {
+                    let _ = rest.delete_upload(&path).await;
+                }
+            });
+        }
+        true
+    }
+
+    /// A failed send runs again from the slot requests. Needs a runtime context.
+    pub(crate) fn retry_upload(self: &Arc<Self>, nonce: u64) -> bool {
+        let mut guard = self.lock();
+        let inner = &mut *guard;
+        let Some(send) = inner
+            .uploads
+            .iter_mut()
+            .find(|s| s.nonce == nonce && matches!(s.state, UploadState::Failed(_)))
+        else {
+            return false;
+        };
+        send.state = UploadState::Sending;
+        send.sent.iter_mut().for_each(|s| *s = 0);
+        send.uploaded.clear();
+        send.dispatched = false;
+        send.last_bump = None;
+        self.start_upload(inner, nonce);
+        drop(guard);
+        self.bump();
+        true
+    }
+
+    /// Removes a failed or cancelled send's row.
+    pub(crate) fn discard_upload(&self, nonce: u64) -> bool {
+        let mut inner = self.lock();
+        let before = inner.uploads.len();
+        inner
+            .uploads
+            .retain(|s| !(s.nonce == nonce && s.state != UploadState::Sending));
+        let removed = inner.uploads.len() != before;
+        drop(inner);
+        if removed {
+            self.bump();
+        }
+        removed
     }
 
     fn finish_send(&self, epoch: u64, nonce: &str, result: Result<Value, RestError>) {
@@ -1362,6 +1686,13 @@ impl MessageStore {
                     .iter()
                     .map(|e| row(&e.message, ctx, e.failure.is_none(), e.failure)),
             )
+            .chain(
+                inner
+                    .uploads
+                    .iter()
+                    .filter(|u| u.job.channel_id == open.channel_id)
+                    .map(|u| u.row(ctx)),
+            )
             .collect();
         Some(MessagesSnapshot {
             channel_id: open.channel_id,
@@ -1370,6 +1701,21 @@ impl MessageStore {
             older: open.older.clone(),
             typing: open.typing.names((self.clock)()),
         })
+    }
+
+    /// The open channel's rows with no guild context, and the bump count (uploads_tests).
+    #[cfg(test)]
+    pub(crate) fn rows(&self) -> Vec<MessageRow> {
+        let epoch = self.lock().open.as_ref().map(|o| o.epoch);
+        epoch
+            .and_then(|e| self.snapshot(e, &Context::default()))
+            .map(|s| s.rows)
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn revision(&self) -> u64 {
+        *self.revision.borrow()
     }
 
     /// The reply preview (`preview`'s rules: spoilers as the placeholder, text only) of buffered
