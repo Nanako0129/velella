@@ -73,7 +73,8 @@ private struct MainWindow: View {
             onSignIn: model.isDemo ? nil : { openWindow(id: LoginWindow.id) },
             onSend: model.isDemo ? nil : { model.send($0, target: $1) },
             onLoadOlder: model.isDemo ? nil : { model.loadOlder() },
-            replyPreview: model.isDemo ? nil : { model.replyPreview($0) }
+            replyPreview: model.isDemo ? nil : { model.replyPreview($0) },
+            attachments: model.isDemo ? nil : model.attachmentServices
         )
             .onChange(of: model.shell.selectedRailID) {
                 model.syncSelection()

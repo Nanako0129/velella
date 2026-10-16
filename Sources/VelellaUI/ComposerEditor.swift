@@ -38,6 +38,46 @@ enum ComposerRules {
     }
 }
 
+/// What a paste can attach (composer plan CUA, CU-6, CU-10): read from the pasteboard here, in the
+/// composer's editor only.
+enum PasteContent: Equatable {
+    case files([URL])
+    /// PNG bytes.
+    case image(Data)
+    case longText(String)
+
+    /// Official `uploadPromptCharacterCount` (OA A21): UTF-16 units.
+    static let longTextThreshold = 4000
+
+    /// Files come only from `public.file-url` items (never `public.url`, text that looks like a path,
+    /// or a promise). Without files, image data attaches when no text is on the board (PNG preferred,
+    /// TIFF encoded to PNG), and text over 4000 UTF-16 units becomes `message.txt` (OA A21). Anything
+    /// else is nil: a plain text paste.
+    init?(_ board: NSPasteboard) {
+        let urls = (board.pasteboardItems ?? []).compactMap { $0.string(forType: .fileURL) }.compactMap { URL(string: $0) }.filter(\.isFileURL)
+        if !urls.isEmpty {
+            self = .files(urls)
+            return
+        }
+        let text = board.string(forType: .string)
+        if text == nil {
+            if let png = board.data(forType: .png) {
+                self = .image(png)
+                return
+            }
+            if let tiff = board.data(forType: .tiff), let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) {
+                self = .image(png)
+                return
+            }
+        }
+        if let text, text.utf16.count > Self.longTextThreshold {
+            self = .longText(text)
+            return
+        }
+        return nil
+    }
+}
+
 /// The composer's text view: plain text, TextKit 2, and the composer's keys.
 final class ComposerTextView: NSTextView {
     /// Return, Option-Return (when it sends).
@@ -93,8 +133,22 @@ final class ComposerTextView: NSTextView {
         }
     }
 
-    /// Plain text only, whatever the pasteboard carries.
-    override func paste(_ sender: Any?) { pasteAsPlainText(sender) }
+    /// Offered what a paste carries before the text view reads it (composer plan CUA, OA A21); true
+    /// when taken. nil while attaching is not allowed or not set up.
+    var onPaste: ((PasteContent) -> Bool)?
+    /// What a paste reads; tests give it their own board.
+    var pasteboard: NSPasteboard = .general
+
+    /// Files, an image or a long text become attachments when the composer takes them; anything else
+    /// is plain text, whatever the pasteboard carries.
+    override func paste(_ sender: Any?) {
+        if let onPaste, let content = PasteContent(pasteboard), onPaste(content) { return }
+        if pasteboard === NSPasteboard.general {
+            pasteAsPlainText(sender)
+        } else if let text = pasteboard.string(forType: .string) {
+            insertText(text, replacementRange: NSRange(location: NSNotFound, length: 0))
+        }
+    }
 
     /// The content's height at `width`: the lowest edge of the layout fragments, with the extra line
     /// fragment of a trailing newline (the SC measure).
@@ -144,6 +198,9 @@ struct ComposerEditor: NSViewRepresentable {
     var onSubmit: () -> Void
     /// nil while no reply is set.
     var onCancelReply: (() -> Void)?
+    /// nil while attaching is not allowed: every paste is plain text.
+    var onPaste: ((PasteContent) -> Bool)?
+    var pasteboard: NSPasteboard = .general
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
@@ -172,6 +229,8 @@ struct ComposerEditor: NSViewRepresentable {
         context.coordinator.parent = self
         view.onSubmit = onSubmit
         view.onCancelReply = onCancelReply
+        view.onPaste = onPaste
+        view.pasteboard = pasteboard
         view.onWindowResize = { [coordinator = context.coordinator] in coordinator.parent.windowTick &+= 1 }
         view.setAccessibilityLabel(label)
         // An outside change (a send cleared the draft, another conversation's draft): the caret
