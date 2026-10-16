@@ -1136,6 +1136,108 @@ fn a_resume_range_is_accepted_only_within_the_size() {
     assert_eq!(at(&["bytes=0-1", "bytes=0-2"]), None, "two Range headers");
 }
 
+/// The second PUT (a resume) hangs, and the clock moves `hours` past the slot response while it
+/// does; returns the world once the send settled. The file carries an MD5 (a converted image).
+async fn resumed_after(hours: u64, before_advance: impl FnOnce(&World)) -> (World, Vec<u8>) {
+    let w = world().await;
+    w.fake.host().puts.extend([Put::Drop(100), Put::Hang]);
+    let file = bytes(1000);
+    let mut d = descriptor(w.fake.file("/p/IMG_1.jpg", file.clone()));
+    d.original_md5 = Some(MD5.into());
+    w.send(w.job("x", vec![d])).unwrap();
+    w.until("the resumed PUT hangs", |w| w.fake.legs().len() == 5)
+        .await;
+    before_advance(&w);
+    tokio::time::advance(Duration::from_secs(hours * 3600)).await;
+    w.settle().await;
+    (w, file)
+}
+
+/// OA A5, CU-3: a slot response older than 12 h is requested anew (same body, same MD5 header)
+/// before the next PUT or probe, and the file goes to the new URL from byte 0.
+#[tokio::test(start_paused = true)]
+async fn a_slot_older_than_12_hours_is_requested_anew_and_the_upload_restarts() {
+    let (w, file) = resumed_after(12, |_| {}).await;
+    let slots = w.slots();
+    assert_eq!(slots.len(), 2, "one refresh");
+    assert_eq!(
+        slots[1].body, slots[0].body,
+        "the same body, slot id included"
+    );
+    assert_eq!(slots[1].header("X-Discord-Original-MD5"), Some(MD5));
+    let ups = w.fake.upload_log();
+    assert_eq!(
+        ups[5..].iter().map(Rec::leg).collect::<Vec<_>>(),
+        ["OPTIONS content-type", "PUT"],
+        "from 0, no probe"
+    );
+    assert!(ups[5..].iter().all(|r| r.url == Fake::slot_url(2)));
+    assert_eq!(ups.last().unwrap().body, file);
+    assert_eq!(w.fake.host().received[&Fake::slot_url(2)], file);
+    let create = &w.creates()[0];
+    assert_eq!(
+        create.json()["attachments"][0]["uploaded_filename"],
+        "4f1e9c2a-uuid/2/f.bin"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_slot_younger_than_12_hours_is_kept() {
+    let (w, _) = resumed_after(11, |_| {}).await;
+    assert_eq!(w.slots().len(), 1);
+    let last = w.fake.upload_log().pop().unwrap();
+    assert_eq!(
+        (last.leg(), last.url),
+        ("PUT+range".to_owned(), Fake::slot_url(1))
+    );
+    assert_eq!(w.upload_row(), None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_refreshed_slot_on_another_host_is_refused_with_no_put() {
+    let evil = format!("https://{UPLOAD_HOST}.evil.test/u?upload_id=B");
+    let (w, _) = resumed_after(12, |w| {
+        *w.fake.upload_url.lock().unwrap() = Some(evil.clone());
+    })
+    .await;
+    assert_eq!(w.slots().len(), 2);
+    assert_eq!(w.fake.upload_log().len(), 5, "nothing after the refresh");
+    assert!(w.fake.log().iter().all(|r| !r.url.contains("evil")));
+    assert_eq!(
+        w.state_of(),
+        Some(UploadState::Failed(UploadFailure::HostRefused))
+    );
+    assert!(w.creates().is_empty());
+}
+
+/// The refresh is one of the file's 13 attempts: one PUT, the refresh, then 11 more.
+#[tokio::test(start_paused = true)]
+async fn a_slot_refresh_counts_toward_the_13_attempts() {
+    let w = world().await;
+    w.fake.host().puts.push_back(Put::Hang);
+    for _ in 0..20 {
+        w.fake.host().puts.push_back(Put::Status(503));
+    }
+    w.fake.host().probe_status = Some(503);
+    w.send(w.job("x", vec![w.attach("/p/a.bin", 100)])).unwrap();
+    w.until("the first PUT hangs", |w| w.fake.legs().len() == 2)
+        .await;
+    tokio::time::advance(Duration::from_secs(12 * 3600)).await;
+    w.settle().await;
+    assert_eq!(w.slots().len(), 2);
+    let puts = w
+        .fake
+        .upload_log()
+        .iter()
+        .filter(|r| r.method == "PUT")
+        .count();
+    assert_eq!(puts, 12);
+    assert_eq!(
+        w.state_of(),
+        Some(UploadState::Failed(UploadFailure::UploadFailed))
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn the_upload_stops_after_13_attempts() {
     let w = world().await;

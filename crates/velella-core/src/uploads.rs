@@ -22,6 +22,8 @@
 //!   never through core as bytes. Resume (CU-3): a probe PUT with `Content-Range: bytes */*`; a
 //!   308 `Range` is accepted only as `bytes=0-N` with `N + 1 <= size` (`resume_at`); one counter of
 //!   at most `MAX_ATTEMPTS` over probes and PUTs; deadlines `PUT_DEADLINE` and `PROBE_DEADLINE`.
+//!   A slot older than `SLOT_LIFETIME` is requested anew first (same body and MD5 header, one of
+//!   the attempts, the D13a check again) and the upload restarts at 0 on the new URL (OA A5).
 //! - Limits are byte constants (P4), checked at add time for an account without premium and at
 //!   send for every account (OA A36), each case its own `LimitError`.
 //! - Core refuses a send with attachments unless the channel is a DM or F1 says ATTACH_FILES is
@@ -73,6 +75,9 @@ pub const MB_500: u64 = 524_288_000;
 pub const GIB_1: u64 = 1_073_741_824;
 const PUT_DEADLINE: Duration = Duration::from_secs(3600);
 const PROBE_DEADLINE: Duration = Duration::from_secs(30);
+/// A slot response older than this is requested anew before the next PUT or probe (OA A5,
+/// `isResponseUrlStale`; CU-3).
+const SLOT_LIFETIME: Duration = Duration::from_secs(12 * 3600);
 /// One counter over probes and PUTs (CU-3).
 const MAX_ATTEMPTS: u32 = 13;
 /// Upload responses are read only for their status and headers (CU Transport).
@@ -671,14 +676,27 @@ impl Uploader<'_> {
         }
     }
 
-    /// Uploads `file` to `url` (D15a, CU-3), reporting the bytes the host has (clamped to the
-    /// size) to `progress`.
-    pub(crate) async fn put(
+    /// Uploads `file` to the slot's URL (D15a, CU-3), reporting the bytes the host has (clamped
+    /// to the size) to `progress`; returns the `upload_filename` of the slot the upload finished
+    /// on. Before each PUT or probe, a slot older than `SLOT_LIFETIME` (on tokio's clock) is
+    /// requested anew through `refresh`: that request is one of the file's attempts, its failure
+    /// ends the file, and the upload restarts at 0 on the new URL (OA A5).
+    pub(crate) async fn put<F, Fut>(
         &self,
-        url: &Url,
+        slot: FreshSlot,
         file: &FileIdentity,
         progress: Arc<dyn Fn(u64) + Send + Sync>,
-    ) -> Result<(), UploadFailure> {
+        mut refresh: F,
+    ) -> Result<String, UploadFailure>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<FreshSlot, UploadFailure>>,
+    {
+        let FreshSlot {
+            mut url,
+            mut name,
+            mut issued,
+        } = slot;
         let id = self
             .transport
             .open_file(file)
@@ -700,8 +718,14 @@ impl Uploader<'_> {
             if attempts > MAX_ATTEMPTS {
                 return Err(UploadFailure::UploadFailed);
             }
+            if Instant::now().duration_since(issued) >= SLOT_LIFETIME {
+                FreshSlot { url, name, issued } = refresh().await?;
+                start = Some(0);
+                wait = false;
+                continue;
+            }
             match start {
-                None => match self.probe(url, size).await? {
+                None => match self.probe(&url, size).await? {
                     // A probe that found the resume point goes straight on to the PUT.
                     Ok(Some(at)) => {
                         start = Some(at);
@@ -709,12 +733,12 @@ impl Uploader<'_> {
                     }
                     Ok(None) => {
                         progress(size);
-                        return Ok(());
+                        return Ok(name);
                     }
                     Err(()) => wait = true,
                 },
-                Some(at) => match self.send(url, id, at, size, progress.clone()).await? {
-                    Step::Done => return Ok(()),
+                Some(at) => match self.send(&url, id, at, size, progress.clone()).await? {
+                    Step::Done => return Ok(name),
                     Step::Again => {
                         start = None;
                         wait = true;
@@ -812,31 +836,42 @@ pub(crate) struct SendJob {
     pub(crate) files: Vec<AttachmentDescriptor>,
 }
 
-/// Slot, host check and upload of file `index`; its `upload_filename` once uploaded.
-async fn upload_one(
-    store: &Arc<MessageStore>,
-    uploader: &Uploader<'_>,
-    (nonce, generation, index): (u64, u64, usize),
+/// A slot whose URL passed D13a, and when its response arrived.
+pub(crate) struct FreshSlot {
+    url: Url,
+    name: String,
+    issued: Instant,
+}
+
+/// The slot request for `file` (slot id `id`: a refresh sends the same body and MD5 header,
+/// OA A49) and the D13a check of its URL; a refused host sends nothing more.
+async fn request_slot(
+    store: &MessageStore,
     job: &SendJob,
-) -> Result<String, UploadFailure> {
-    let file = &job.files[index];
+    file: &AttachmentDescriptor,
+    id: u64,
+) -> Result<FreshSlot, UploadFailure> {
     let rest = &store.rest;
     let slot = rest
         .attachment_slot(
             job.channel_id,
             file.slot_filename(),
             file.file.size,
-            next_slot_id(),
+            id,
             &file.content_type,
             file.md5(),
         )
         .await
         .map_err(UploadFailure::of)?;
     let launch = rest.identity().launch();
-    let url = match upload_url(&slot.upload_url) {
+    match upload_url(&slot.upload_url) {
         Ok(url) => {
             launch.diagnose_once("upload-host", || format!("upload host {UPLOAD_HOST}"));
-            url
+            Ok(FreshSlot {
+                url,
+                name: slot.upload_filename,
+                issued: Instant::now(),
+            })
         }
         Err(host) => {
             // The host alone, once per launch (CU Upload host, CU-7).
@@ -846,16 +881,33 @@ async fn upload_one(
                     host.as_deref().unwrap_or("(none)")
                 )
             });
-            return Err(UploadFailure::HostRefused);
+            Err(UploadFailure::HostRefused)
         }
-    };
+    }
+}
+
+/// Slot, host check and upload of file `index`; the `upload_filename` of the slot it finished on.
+/// Only that one is recorded for a cancel's DELETE (CU-8): a slot replaced by a refresh never is.
+async fn upload_one(
+    store: &Arc<MessageStore>,
+    uploader: &Uploader<'_>,
+    (nonce, generation, index): (u64, u64, usize),
+    job: &SendJob,
+) -> Result<String, UploadFailure> {
+    let file = &job.files[index];
+    let id = next_slot_id();
+    let slot = request_slot(store, job, file, id).await?;
     let progress: Arc<dyn Fn(u64) + Send + Sync> = {
         let store = store.clone();
         Arc::new(move |bytes| store.upload_progress(nonce, generation, index, bytes))
     };
-    uploader.put(&url, &file.file, progress).await?;
-    store.upload_completed(nonce, generation, index, &slot.upload_filename);
-    Ok(slot.upload_filename)
+    let name = uploader
+        .put(slot, &file.file, progress, || {
+            request_slot(store, job, file, id)
+        })
+        .await?;
+    store.upload_completed(nonce, generation, index, &name);
+    Ok(name)
 }
 
 /// One run of send `nonce` (attempt `generation`): every file in order, then the message create
