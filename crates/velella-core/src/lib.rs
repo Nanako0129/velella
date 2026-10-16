@@ -14,6 +14,7 @@ mod member_list;
 mod messages;
 mod permissions;
 mod presence;
+mod proto;
 mod reactions;
 mod read_state;
 mod relationships;
@@ -31,6 +32,8 @@ mod voice;
 mod fixture_tests;
 #[cfg(test)]
 mod member_list_tests;
+#[cfg(test)]
+mod proto_tests;
 #[cfg(test)]
 mod rest_tests;
 #[cfg(test)]
