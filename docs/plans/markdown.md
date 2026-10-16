@@ -541,6 +541,8 @@ These are deferred to a T1 follow-up after K6, ordered by the user's live compar
 | Tests | Tooltip placement: centred above a run's frame at v2's spacing, clamped inside the view. The locale default follows the preferred language (injectable). A quote of one line has the height of one line, two trailing breaks give one empty line, and a single trailing break in a top-level paragraph is dropped. |
 | Acceptance | `make build`, `swift test`, `cargo test`, clippy and fmt pass; a fresh verifier. **Live:** hover a timestamp pill and a header time, and compare with the v2 capture; `> 單行引用` is one line; times show zh-TW formats. **Live accepted by the user (2026-10-15: "P1驗收OK").** |
 
+**P1 tooltip follow-up (user's v2 comparison, 2026-10-16):** the capsule inherited the paragraph's 22 pt line box (38 pt tall against v2's 33) and stretched to its host up to 360 pt (v2 hugs its text via `sizeThatFits`), and it waited 500 ms where v2's text views show at once (delay 0 at 0x100ba3278). Fixed in acef0b2 (line box, colour, no delay) and d53fcf3 (hug the text); tests `aTipKeepsItsOwnLineHeightUnderAParagraphsLineBox` and `aTipHugsItsTextEvenWhenItsHostOffersMore`, each failing on its faithful mutant. **Live accepted (2026-10-16: "OK沒問題").**
+
 ## K6 revision 3.1 — highlighting off the session task (user, 2026-10-14: "移到背景 worker")
 
 The K6 implementation (uncommitted, worktree `agent-a0bc5870b5bbfffa8`, on 2d08b4e) failed its release timing acceptance. Measured on a loaded machine:
