@@ -36,6 +36,20 @@ pub trait Transport: Send + Sync {
         request: Arc<WebSocketRequest>,
         completion: Arc<WebSocketCompletion>,
     ) -> Arc<dyn TransportTask>;
+    /// Opens an attached file once for its upload (composer plan CU-6): without following a
+    /// link, non-blocking, then fstat; only a regular file whose (device, inode, size, mtime)
+    /// equal `file`'s is kept, under the returned id, until `close_file`. nil: gone or changed.
+    fn open_file(&self, file: Arc<UploadFile>) -> Option<u64>;
+    fn close_file(&self, id: u64);
+    /// Starts one upload exchange (preflight or PUT) to the upload-only allow-list, the body
+    /// streamed from the opened file; the outcome goes to `completion`, the bytes sent of the
+    /// body to `progress`. A 3xx is an outcome, never followed.
+    fn upload(
+        &self,
+        request: Arc<UploadRequest>,
+        progress: Arc<UploadProgress>,
+        completion: Arc<HttpCompletion>,
+    ) -> Arc<dyn TransportTask>;
 }
 
 /// One started operation.
@@ -235,6 +249,186 @@ impl From<core::HttpRequest> for HttpRequest {
             inner,
             authorization_taken: AtomicBool::new(false),
         }
+    }
+}
+
+/// An attached file's identity (composer plan CU-6): the resolved path and (device, inode, size,
+/// mtime) recorded when it was added. An object, so nothing Swift prints shows the path (CU-7).
+#[derive(uniffi::Object)]
+#[uniffi::export(Debug, Display)]
+pub struct UploadFile(pub(crate) core::FileIdentity);
+
+impl fmt::Debug for UploadFile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl fmt::Display for UploadFile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("UploadFile([REDACTED])")
+    }
+}
+
+#[uniffi::export]
+impl UploadFile {
+    /// What the app's attach-time check recorded (`mtime_ns`: nanoseconds since the epoch).
+    #[uniffi::constructor]
+    pub fn new(path: String, device: u64, inode: u64, size: u64, mtime_ns: i64) -> Arc<Self> {
+        Arc::new(Self(core::FileIdentity {
+            path,
+            device,
+            inode,
+            size,
+            mtime_ns,
+        }))
+    }
+
+    pub fn path(&self) -> String {
+        self.0.path.clone()
+    }
+    pub fn device(&self) -> u64 {
+        self.0.device
+    }
+    pub fn inode(&self) -> u64 {
+        self.0.inode
+    }
+    pub fn size(&self) -> u64 {
+        self.0.size
+    }
+    pub fn mtime_ns(&self) -> i64 {
+        self.0.mtime_ns
+    }
+}
+
+#[derive(Clone, Copy, uniffi::Enum)]
+pub enum UploadMethod {
+    Options,
+    Put,
+}
+
+/// One upload exchange as core built it: no Authorization exists on it, and its header list is
+/// core's closed list (the transport checks the names again).
+#[derive(uniffi::Object)]
+#[uniffi::export(Debug, Display)]
+pub struct UploadRequest(core::UploadRequest);
+
+impl fmt::Debug for UploadRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl fmt::Display for UploadRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "UploadRequest({} [REDACTED])", self.0.method().as_str())
+    }
+}
+
+#[uniffi::export]
+impl UploadRequest {
+    /// For the transport's own tests, with core's header checks (no Authorization, no CR/LF).
+    #[uniffi::constructor]
+    #[allow(clippy::too_many_arguments)] // One per field of core's request; a test seam only.
+    pub fn new(
+        method: UploadMethod,
+        url: String,
+        headers: Vec<HttpHeader>,
+        file: Option<u64>,
+        start: u64,
+        length: u64,
+        deadline_ms: u64,
+        body_cap: u64,
+    ) -> Result<Arc<Self>, TransportRequestError> {
+        let method = match method {
+            UploadMethod::Options => core::UploadMethod::Options,
+            UploadMethod::Put => core::UploadMethod::Put,
+        };
+        core::UploadRequest::new(
+            method,
+            url,
+            pairs(headers),
+            file.map(|file| core::UploadBody {
+                file,
+                start,
+                length,
+            }),
+            Duration::from_millis(deadline_ms),
+            usize::try_from(body_cap).unwrap_or(usize::MAX),
+        )
+        .map(|r| Arc::new(Self(r)))
+        .map_err(|_| TransportRequestError::InvalidHeader)
+    }
+
+    /// `OPTIONS` or `PUT`.
+    pub fn method(&self) -> String {
+        self.0.method().as_str().to_owned()
+    }
+
+    /// Exactly the string to send.
+    pub fn url(&self) -> String {
+        self.0.url().to_owned()
+    }
+
+    pub fn headers(&self) -> Vec<HttpHeader> {
+        records(self.0.headers())
+    }
+
+    /// The opened file the body streams from; nil for an empty body.
+    pub fn file(&self) -> Option<u64> {
+        self.0.body().map(|b| b.file)
+    }
+
+    pub fn body_start(&self) -> u64 {
+        self.0.body().map_or(0, |b| b.start)
+    }
+
+    pub fn body_length(&self) -> u64 {
+        self.0.body().map_or(0, |b| b.length)
+    }
+
+    pub fn deadline_ms(&self) -> u64 {
+        millis(self.0.deadline())
+    }
+
+    pub fn body_cap(&self) -> u64 {
+        u64::try_from(self.0.body_cap()).unwrap_or(u64::MAX)
+    }
+}
+
+/// Where the transport reports the bytes of the current body sent so far.
+#[derive(uniffi::Object)]
+pub struct UploadProgress {
+    report: Option<core::UploadProgress>,
+    /// What a test-made progress received.
+    seen: Mutex<Vec<u64>>,
+}
+
+#[uniffi::export]
+impl UploadProgress {
+    /// For the transport's own tests: records every report.
+    #[uniffi::constructor]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            report: None,
+            seen: Mutex::new(Vec::new()),
+        })
+    }
+
+    pub fn sent(&self, bytes: u64) {
+        match &self.report {
+            Some(report) => report(bytes),
+            None => self
+                .seen
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(bytes),
+        }
+    }
+
+    /// What a test-made progress received, in order.
+    pub fn reports(&self) -> Vec<u64> {
+        self.seen.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
 
@@ -509,6 +703,37 @@ impl core::Transport for ForeignTransport {
             outcome
         })
     }
+
+    fn open_file(&self, file: &core::FileIdentity) -> Option<u64> {
+        self.0.open_file(Arc::new(UploadFile(file.clone())))
+    }
+
+    fn close_file(&self, id: u64) {
+        self.0.close_file(id);
+    }
+
+    fn upload(
+        &self,
+        request: core::UploadRequest,
+        progress: core::UploadProgress,
+    ) -> core::BoxFuture<'_, Result<core::HttpResponse, core::TransportError>> {
+        let (slot, rx) = Slot::new();
+        let progress = Arc::new(UploadProgress {
+            report: Some(progress),
+            seen: Mutex::new(Vec::new()),
+        });
+        let task = self.0.upload(
+            Arc::new(UploadRequest(request)),
+            progress,
+            Arc::new(HttpCompletion(slot)),
+        );
+        let guard = CancelOnDrop(Some(task));
+        Box::pin(async move {
+            let outcome = rx.await.unwrap_or(Err(core::TransportError::Other));
+            guard.done();
+            outcome
+        })
+    }
 }
 
 struct ForeignSocket {
@@ -562,6 +787,7 @@ mod tests {
     struct Fake {
         http: Mutex<Vec<Arc<HttpCompletion>>>,
         ws: Mutex<Vec<Arc<WebSocketCompletion>>>,
+        uploads: Mutex<Vec<Arc<HttpCompletion>>>,
         cancels: Arc<AtomicUsize>,
     }
 
@@ -583,6 +809,20 @@ mod tests {
             c: Arc<WebSocketCompletion>,
         ) -> Arc<dyn TransportTask> {
             self.ws.lock().unwrap().push(c);
+            Arc::new(Task(self.cancels.clone()))
+        }
+        fn open_file(&self, file: Arc<UploadFile>) -> Option<u64> {
+            (file.size() == 3).then_some(7)
+        }
+        fn close_file(&self, _: u64) {}
+        fn upload(
+            &self,
+            request: Arc<UploadRequest>,
+            progress: Arc<UploadProgress>,
+            c: Arc<HttpCompletion>,
+        ) -> Arc<dyn TransportTask> {
+            progress.sent(request.body_length());
+            self.uploads.lock().unwrap().push(c);
             Arc::new(Task(self.cancels.clone()))
         }
     }
@@ -785,6 +1025,64 @@ mod tests {
         assert_eq!(request.take_authorization().as_deref(), Some(MARKER));
         assert_eq!(request.take_authorization(), None);
         assert!(frame.text().unwrap().contains(MARKER));
+    }
+
+    /// The upload operation through the foreign trait: the file opens by identity, progress
+    /// reaches core's callback, the outcome comes back, and a dropped future cancels the task.
+    #[test]
+    fn uploads_cross_the_foreign_trait() {
+        let fake = Arc::new(Fake::default());
+        let transport = ForeignTransport(fake.clone());
+        let identity = |size| core::FileIdentity {
+            path: format!("/p/{MARKER}"),
+            device: 1,
+            inode: 2,
+            size,
+            mtime_ns: 3,
+        };
+        assert_eq!(
+            core::Transport::open_file(&transport, &identity(3)),
+            Some(7)
+        );
+        assert_eq!(core::Transport::open_file(&transport, &identity(4)), None);
+        let request = || {
+            core::UploadRequest::new(
+                core::UploadMethod::Put,
+                format!("https://u.test/{MARKER}?q"),
+                vec![("Origin".into(), "https://discord.com".into())],
+                Some(core::UploadBody {
+                    file: 7,
+                    start: 1,
+                    length: 2,
+                }),
+                Duration::from_secs(1),
+                8,
+            )
+            .unwrap()
+        };
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        rt().block_on(async {
+            let sink = seen.clone();
+            let pending = core::Transport::upload(
+                &transport,
+                request(),
+                Box::new(move |n| sink.lock().unwrap().push(n)),
+            );
+            fake.uploads.lock().unwrap()[0].succeed(200, vec![], vec![], false);
+            assert_eq!(pending.await.unwrap().status, 200);
+            assert_eq!(*seen.lock().unwrap(), [2]);
+            let timed_out = tokio::time::timeout(
+                Duration::from_millis(20),
+                core::Transport::upload(&transport, request(), Box::new(|_| {})),
+            )
+            .await;
+            assert!(timed_out.is_err());
+            assert_eq!(fake.cancels.load(Ordering::SeqCst), 1);
+        });
+        let ffi = UploadRequest(request());
+        for text in [format!("{ffi:?}"), format!("{ffi}")] {
+            assert!(!text.contains("SYNTHETIC"), "{text}");
+        }
     }
 
     #[test]

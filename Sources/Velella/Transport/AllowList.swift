@@ -18,6 +18,8 @@ struct AllowList: Sendable {
         case exact(String, query: Bool)
         /// `/assets/fast-connect.` + 16 of `[0-9a-f]` + `.js`, no query (D12's script).
         case fastConnect
+        /// Any path, and a query is required (the upload URL the slot names, composer plan D13a).
+        case anyWithQuery
     }
 
     struct Rule: Sendable, Equatable {
@@ -30,6 +32,9 @@ struct AllowList: Sendable {
 
     let http: [Rule]
     let webSocket: [Rule]
+    /// The upload host (composer plan CU Transport): consulted only by the upload operation, for
+    /// OPTIONS and PUT only. Nothing in `http` reaches it, and it is outside `authorizedPrefix`.
+    let upload: [Rule]
     /// Only URLs starting with this may carry an Authorization; a request elsewhere that has one
     /// is refused.
     let authorizedPrefix: String
@@ -44,11 +49,20 @@ struct AllowList: Sendable {
             Rule(scheme: "wss", host: .exact("gateway.discord.gg"), port: nil, path: .exact("/", query: true)),
             Rule(scheme: "wss", host: .gatewayLabel, port: nil, path: .exact("/", query: true)),
         ],
+        upload: [
+            Rule(
+                scheme: "https", host: .exact("discord-attachments-uploads-prd.storage.googleapis.com"), port: nil,
+                path: .anyWithQuery
+            ),
+        ],
         authorizedPrefix: "https://discord.com/api/v9/"
     )
 
     func allowsHTTP(_ url: URL) -> Bool { http.contains { Self.matches($0, url) } }
     func allowsWebSocket(_ url: URL) -> Bool { webSocket.contains { Self.matches($0, url) } }
+    func allowsUpload(_ url: URL, method: String) -> Bool {
+        ["OPTIONS", "PUT"].contains(method) && upload.contains { Self.matches($0, url) }
+    }
     func authorizes(_ url: String) -> Bool { url.hasPrefix(authorizedPrefix) }
 
     private static func matches(_ rule: Rule, _ url: URL) -> Bool {
@@ -70,6 +84,7 @@ struct AllowList: Sendable {
         case .prefix(let prefix): path.hasPrefix(prefix)
         case .exact(let exact, let allowsQuery): path == exact && (allowsQuery || query == nil)
         case .fastConnect: query == nil && isFastConnect(path)
+        case .anyWithQuery: query != nil
         }
     }
 

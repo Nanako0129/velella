@@ -50,6 +50,41 @@ struct CreateMessage<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     allowed_mentions: Option<AllowedMentions>,
     flags: u64,
+    /// After `flags` (§18.4 appends `attachments` last), only when there are attachments.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attachments: Option<Vec<AttachmentEntry<'a>>>,
+}
+
+/// One `attachments` entry of a message create, in OA A10's key order: `id` is the index as a
+/// string, `description` whenever set (`""` included), `is_spoiler` only when true,
+/// `original_content_type` only when known.
+#[derive(Serialize)]
+pub(crate) struct AttachmentEntry<'a> {
+    pub(crate) id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) description: Option<&'a str>,
+    pub(crate) filename: &'a str,
+    pub(crate) uploaded_filename: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) is_spoiler: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) original_content_type: Option<&'a str>,
+}
+
+/// The upload-slot body `{"files":[…]}` (OA A1, A2): one file per request.
+#[derive(Serialize)]
+struct SlotRequest<'a> {
+    files: [SlotFile<'a>; 1],
+}
+
+/// OA A2's order. `original_content_type` is always sent, `""` when unknown (CU-5).
+#[derive(Serialize)]
+struct SlotFile<'a> {
+    filename: &'a str,
+    file_size: u64,
+    id: String,
+    is_clip: bool,
+    original_content_type: &'a str,
 }
 
 /// Ids as decimal strings, as Discord's snowflakes travel in JSON. A reply has no `type`; a
@@ -164,9 +199,81 @@ impl Rest {
             }),
             allowed_mentions,
             flags: 0,
+            attachments: None,
         };
         self.post_message(channel_id, &body, Context::ChatInput)
             .await
+    }
+
+    /// A send with uploaded attachments (composer plan CU Message create): the chat-input body
+    /// with `attachments` after `flags`, content possibly empty (OA A11), the same D11 retry rule.
+    /// `instant` is Shift-drop's send (`instant_upload`, OA A35).
+    pub(crate) async fn send_with_attachments(
+        &self,
+        channel_id: u64,
+        content: &str,
+        nonce: &str,
+        reply: Option<Reply>,
+        attachments: Vec<AttachmentEntry<'_>>,
+        instant: bool,
+    ) -> Result<Value, ActionError> {
+        let body = CreateMessage {
+            mobile_network_type: "unknown",
+            content,
+            nonce,
+            tts: false,
+            message_reference: reply.map(|r| MessageReference {
+                guild_id: r.guild_id.map(|g| g.to_string()),
+                channel_id: channel_id.to_string(),
+                message_id: r.message_id.to_string(),
+                kind: None,
+            }),
+            allowed_mentions: None,
+            flags: 0,
+            attachments: Some(attachments),
+        };
+        let context = if instant {
+            Context::InstantUpload
+        } else {
+            Context::ChatInput
+        };
+        self.post_message(channel_id, &body, context).await
+    }
+
+    /// `POST /channels/{c}/attachments` for one file (OA A1-A3), retried per CU-10, with
+    /// `X-Discord-Original-MD5` for a converted image (D16a). The parsed response is
+    /// `attachments[0]`'s `upload_url` and `upload_filename`.
+    pub(crate) async fn attachment_slot(
+        &self,
+        channel_id: u64,
+        filename: &str,
+        file_size: u64,
+        id: u64,
+        content_type: &str,
+        original_md5: Option<String>,
+    ) -> Result<crate::uploads::Slot, ActionError> {
+        let body = SlotRequest {
+            files: [SlotFile {
+                filename,
+                file_size,
+                id: id.to_string(),
+                is_clip: false,
+                original_content_type: content_type,
+            }],
+        };
+        let call = Call::new(Method::Post, &format!("/channels/{channel_id}/attachments"))?
+            .json(&body)?
+            .original_md5(original_md5);
+        let value: Value = self.call(&call, Retry::Slot).await?;
+        crate::uploads::Slot::parse(&value).ok_or(ActionError::BadResponse)
+    }
+
+    /// `DELETE /attachments/{uploaded_filename}` (OA A6) with the CU-8-encoded path segment
+    /// (`uploads::delete_path`); never retried.
+    pub(crate) async fn delete_upload(&self, path: &str) -> Result<(), ActionError> {
+        let call = Call::new(Method::Delete, path)?;
+        let _: Value = self.call(&call, Retry::None).await?;
+        Ok(())
     }
 
     /// A forward (§7.1): `content:""` and `message_reference {guild_id (the origin's, omitted
@@ -194,6 +301,7 @@ impl Rest {
             }),
             allowed_mentions: None,
             flags: if silent { SUPPRESS_NOTIFICATIONS } else { 0 },
+            attachments: None,
         };
         self.post_message(destination_id, &body, Context::Forwarding)
             .await
@@ -215,6 +323,7 @@ impl Rest {
             message_reference: None,
             allowed_mentions: None,
             flags: if silent { SUPPRESS_NOTIFICATIONS } else { 0 },
+            attachments: None,
         };
         self.post_message(destination_id, &body, Context::Forwarding)
             .await

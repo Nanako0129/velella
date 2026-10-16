@@ -20,12 +20,14 @@ mod members;
 mod messages;
 mod permissions;
 mod transport;
+mod uploads;
 pub use actions::*;
 pub use experiments::*;
 pub use markdown::*;
 pub use messages::*;
 pub use permissions::*;
 pub use transport::*;
+pub use uploads::*;
 
 /// The one process-wide runtime. Exported async fns spawn onto it and await the
 /// JoinHandle, so bodies run on `velella-rt` threads regardless of who polls the
@@ -522,6 +524,20 @@ mod tests {
             &self,
             _: Arc<WebSocketRequest>,
             _: Arc<WebSocketCompletion>,
+        ) -> Arc<dyn TransportTask> {
+            unreachable!()
+        }
+        fn open_file(&self, _: Arc<UploadFile>) -> Option<u64> {
+            unreachable!()
+        }
+        fn close_file(&self, _: u64) {
+            unreachable!()
+        }
+        fn upload(
+            &self,
+            _: Arc<UploadRequest>,
+            _: Arc<UploadProgress>,
+            _: Arc<HttpCompletion>,
         ) -> Arc<dyn TransportTask> {
             unreachable!()
         }

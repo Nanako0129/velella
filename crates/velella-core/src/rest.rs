@@ -56,6 +56,9 @@ const MAX_RETRY_AFTER: Duration = Duration::from_secs(10);
 const TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 /// `retries:N` retries only these statuses (and transport errors), §17.3.
 const RETRY_STATUSES: [u16; 8] = [502, 504, 507, 522, 523, 524, 598, 599];
+/// The longest 429 wait the upload-slot request sits out before giving up (the route backoff's
+/// cap, §17.3).
+const MAX_SLOT_WAIT: Duration = Duration::from_secs(60);
 /// A 429 with no readable wait blocks for this long (§17.3).
 const DEFAULT_WAIT: Duration = Duration::from_secs(5);
 /// Per-route backoff: from 1 s, doubling, capped at 60 s (§17.3 entry Backoff(1000, 60000)).
@@ -118,6 +121,8 @@ pub enum ApiCode {
     TooManyReactions,
     /// 30074
     TooManySavedMessages,
+    /// 40005, an upload over the size limit (OA A18)
+    EntityTooLarge,
     /// 50001
     InvalidAccess,
     /// 50019
@@ -142,6 +147,8 @@ impl ApiCode {
             Some(30003) => Self::TooManyPins,
             Some(30010) => Self::TooManyReactions,
             Some(30074) => Self::TooManySavedMessages,
+            Some(40005) => Self::EntityTooLarge,
+
             Some(50001) => Self::InvalidAccess,
             Some(50019) => Self::InvalidPinChannel,
             Some(50021) => Self::SystemMessage,
@@ -298,6 +305,10 @@ pub(crate) enum Retry {
     Edit,
     /// D11: only a connection that failed to establish, or 522 / 523; three times, same bytes.
     Send,
+    /// The upload-slot request (composer plan CU-10): transport errors, any 5xx and 429 (after
+    /// the route's §17.3 wait, when it is at most `MAX_SLOT_WAIT`), at most 12 times with backoff;
+    /// no other status.
+    Slot,
 }
 
 /// `X-Context-Properties` locations F2 sends (§17.1).
@@ -305,6 +316,8 @@ pub(crate) enum Retry {
 pub(crate) enum Context {
     ChatInput,
     Forwarding,
+    /// Shift-drop's immediate send (composer plan D12a, OA A35).
+    InstantUpload,
 }
 
 impl Context {
@@ -313,6 +326,7 @@ impl Context {
         let location = match self {
             Self::ChatInput => "chat_input",
             Self::Forwarding => "forwarding",
+            Self::InstantUpload => "instant_upload",
         };
         base64::engine::general_purpose::STANDARD.encode(format!(r#"{{"location":"{location}"}}"#))
     }
@@ -327,6 +341,8 @@ pub(crate) struct Call {
     body: Option<Vec<u8>>,
     context: Option<Context>,
     keep_message: bool,
+    /// `X-Discord-Original-MD5` (composer plan D16a): the upload-slot request of a converted file.
+    original_md5: Option<String>,
 }
 
 impl Call {
@@ -338,6 +354,7 @@ impl Call {
             body: None,
             context: None,
             keep_message: false,
+            original_md5: None,
         })
     }
 
@@ -349,6 +366,12 @@ impl Call {
 
     pub(crate) fn context(mut self, context: Context) -> Call {
         self.context = Some(context);
+        self
+    }
+
+    /// Adds `X-Discord-Original-MD5` (a caller header: after X-Failed-Requests, §17.1).
+    pub(crate) fn original_md5(mut self, md5: Option<String>) -> Call {
+        self.original_md5 = md5;
         self
     }
 
@@ -632,6 +655,12 @@ impl Rest {
         &self.0.identity
     }
 
+    /// The session's transport, for the file upload, which does not go through `Rest` (composer
+    /// plan CU Upload: no identity header, token or API URL reaches the upload host).
+    pub(crate) fn transport(&self) -> &Arc<dyn Transport> {
+        &self.0.transport
+    }
+
     /// GET `BASE` + `path`; `path` starts with `/`. Message history only: one retry after a
     /// readable 429 of at most 10 s.
     pub(crate) async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, RestError> {
@@ -666,6 +695,7 @@ impl Rest {
             body,
             context: None,
             keep_message: false,
+            original_md5: None,
         };
         let retry = if method == Method::Get {
             Retry::History
@@ -737,6 +767,9 @@ impl Rest {
         }
         if failed_requests > 0 {
             headers.push(("X-Failed-Requests".to_owned(), failed_requests.to_string()));
+        }
+        if let Some(md5) = &call.original_md5 {
+            headers.push(("X-Discord-Original-MD5".to_owned(), md5.clone()));
         }
         if let Some(token) = mfa {
             headers.push(("X-Discord-MFA-Authorization".to_owned(), token.to_owned()));
@@ -888,6 +921,7 @@ impl Rest {
             Retry::Statuses(n) => u32::from(n),
             Retry::Edit => 1,
             Retry::Send => 3,
+            Retry::Slot => 12,
             _ => 0,
         };
         let mut once_used = false;
@@ -957,6 +991,23 @@ impl Rest {
                         // Any other status or transport error: one immediate retry.
                         _ => {}
                     }
+                }
+                Retry::Slot => {
+                    if statuses_left == 0 {
+                        return Err(fail.error());
+                    }
+                    match fail {
+                        Fail::Transport(_) => tokio::time::sleep(backoff.fail()).await,
+                        Fail::Status(s, _) if s >= 500 => tokio::time::sleep(backoff.fail()).await,
+                        Fail::Limited { until, .. }
+                            if until.saturating_duration_since(Instant::now()) <= MAX_SLOT_WAIT =>
+                        {
+                            tokio::time::sleep_until(until).await
+                        }
+                        fail => return Err(fail.error()),
+                    }
+                    statuses_left -= 1;
+                    failed_requests += 1;
                 }
                 Retry::Statuses(_) | Retry::Edit | Retry::Send => {
                     let retryable = match (&fail, retry) {

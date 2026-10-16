@@ -189,7 +189,8 @@ impl From<core::ActionError> for ActionError {
                     core::ApiCode::ArchivedThread => ApiErrorCode::ArchivedThread,
                     core::ApiCode::MfaInvalidCode => ApiErrorCode::MfaInvalidCode,
                     core::ApiCode::ReactionBlocked => ApiErrorCode::ReactionBlocked,
-                    core::ApiCode::Other => ApiErrorCode::Other,
+                    // 40005 is read only by the upload slot (composer plan CU), not by F2's actions.
+                    core::ApiCode::EntityTooLarge | core::ApiCode::Other => ApiErrorCode::Other,
                 },
                 message,
             },

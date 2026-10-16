@@ -35,6 +35,7 @@ mod threads;
 mod token;
 pub mod transport;
 mod typing;
+mod uploads;
 mod voice;
 
 #[cfg(test)]
@@ -65,7 +66,8 @@ pub use identify::{Launch, LaunchConfig, USER_AGENT};
 pub use member_list::{member_sections, MemberListEntry, MemberListSection, MemberListStatus};
 pub use messages::{
     EmojiImage, LoadState, MentionKind, MessageImage, MessageReply, MessageRow,
-    MessageSubscription, MessagesSnapshot, OlderState, ResolvedMention,
+    MessageSubscription, MessagesSnapshot, OlderState, PendingFile, PendingUpload, ResolvedMention,
+    UploadState,
 };
 pub use permissions::{
     channel_permissions, channel_permissions_at, ChannelPermissions, ALL_PERMISSIONS,
@@ -91,3 +93,7 @@ pub use state::{
     Channel, Guild, GuildFolder, MemberSub, Overwrite, PrivateChannel, Role, State, User,
 };
 pub use token::{Token, TokenError};
+pub use uploads::{
+    check_limits, conversion_config, AttachmentDescriptor, ConversionConfig, ConversionKind,
+    LimitCheck, LimitError, SendRefusal, UploadFailure, UPLOAD_HOST,
+};
