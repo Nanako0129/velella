@@ -30,6 +30,8 @@ struct MessageArea: View {
     var onLoadOlder: (() -> Void)?
     /// Who is typing in this conversation, shown under the composer.
     var typing: [String] = []
+    /// The user's `premium_type` (nil: Unknown): sets the composer's message-length limit.
+    var premiumType: UInt8?
     @State private var columnWidth: CGFloat = 0
     /// The topmost message row (or divider) in view, kept by SwiftUI as the list scrolls. Binding it
     /// makes the scroll view hold that row at its place when older rows are prepended.
@@ -118,6 +120,8 @@ struct MessageArea: View {
                     }
                     .background { SelectionResponder(coordinator: selection) }
                     .defaultScrollAnchor(.bottom)
+                    // D8: a list at its bottom stays there when the composer grows or shrinks.
+                    .defaultScrollAnchor(.bottom, for: .sizeChanges)
                     .scrollPosition(id: $topID, anchor: .top)
                     // Messages pass under the toolbar through a glass band with a hard lower edge, on a
                     // darker pane than the translucent sidebar (Swiftcord v2, user's captures 2026-10-13).
@@ -128,7 +132,7 @@ struct MessageArea: View {
             .onChange(of: conversationID) { topID = nil }
             .safeAreaInset(edge: .bottom) {
                 VStack(spacing: 0) {
-                    Composer(reply: $reply, draft: $draft, onSend: onSend)
+                    Composer(reply: $reply, draft: $draft, channelID: conversationID, premiumType: premiumType, onSend: onSend)
                     TypingIndicator(names: typing)
                         .padding(.horizontal, T.Spacing.lg + T.Spacing.md)
                         // Up into the composer's own bottom gutter, which already sits under the card.
@@ -392,22 +396,35 @@ struct ImageAttachmentView: View {
 /// Glass card: optional reply bar above one input row with a "+" on the left and GIF, sticker
 /// and emoji glyphs on the right (Swiftcord v2 layout). The card is the container shape, so the
 /// "+" and the reply bar are concentric with its corners, as in v2 (ConcentricRectangle). GIF,
-/// sticker and emoji are decoration until their pickers exist.
+/// sticker and emoji are decoration until their pickers exist. The input is a multi-line editor
+/// (`ComposerEditor`); the buttons follow its last line (plan CG, D1).
 struct Composer: View {
     @Binding var reply: ReplyPreview?
     /// The open conversation's draft (`ShellState.draft`).
     @Binding var draft: String
+    /// The open conversation: changing it clears the composer's animation (D6).
+    var channelID = ""
+    /// The user's `premium_type` (nil: Unknown), which sets the message-length limit.
+    var premiumType: UInt8?
     /// Receives the draft and the reply target on Return (`ComposerSubmit`: never blank, never an
-    /// IME commit); the reply bar clears with the draft.
+    /// IME commit, never over the limit); the reply bar clears with the draft.
     var onSend: ((String, ReplyTarget?) -> Void)?
     @State private var plusMenuOpen = false
+    @State private var windowTick = 0
+    @State private var tooLong: MessageLength.TooLong?
+    @Environment(\.openURL) private var openURL
+
+    private var limit: Int { MessageLength.limit(premiumType: premiumType) }
 
     var body: some View {
         VStack(spacing: T.Spacing.sm) {
             if let reply {
                 ReplyBar(reply: reply) { self.reply = nil }
+                    .transition(.blurReplace(.downUp))
             }
-            HStack(spacing: T.Spacing.md) {
+            // Bottom aligned: the buttons stay level with the last line (D1). Each is as tall as one
+            // line's row, so on a single line they sit as they did when centred.
+            HStack(alignment: .bottom, spacing: T.Spacing.md) {
                 Button { plusMenuOpen = true } label: {
                     Image(systemName: "plus")
                         .font(T.Typography.composerPlusGlyph)
@@ -415,36 +432,118 @@ struct Composer: View {
                         .background(T.Palette.plusButtonFill, in: ComposerInnerShape.shape)
                 }
                 .buttonStyle(.plain)
+                .frame(height: T.Size.composerRow)
                 .help("Add to message")
                 .popover(isPresented: $plusMenuOpen, arrowEdge: .bottom) {
                     PlusMenu { plusMenuOpen = false }
                 }
 
-                TextField("Message", text: $draft)
-                    .textFieldStyle(.plain)
-                    .font(T.Typography.composer)
-                    .onSubmit {
-                        // The field editor still holding marked text means this Return belongs to
-                        // the input method (it commits a candidate), not to the composer.
-                        let editor = NSApp.keyWindow?.firstResponder as? NSTextView
-                        ComposerSubmit.submit(&draft, reply: &reply, hasMarkedText: editor?.hasMarkedText() ?? false, onSend: onSend)
-                    }
+                input
 
                 // White glyphs, as in v2.
-                Group {
+                HStack(spacing: T.Spacing.md) {
                     Text("GIF").font(T.Typography.composerGif)
                     Image(systemName: "square.on.square")
                     Image(systemName: "face.smiling.inverse")
                 }
                 .font(T.Typography.composerGlyph)
                 .foregroundStyle(.primary)
+                .frame(height: T.Size.composerRow)
             }
-            .frame(minHeight: T.Size.composerHeight - 2 * T.Spacing.sm)
         }
+        // Inside the animation, so it wins: a change of channel clears the animation, and a reply
+        // the old channel left behind does not slide out in the new one.
+        .transaction(value: channelID) { $0.animation = nil }
+        .animation(T.Motion.composer, value: reply != nil)
         .padding(T.Spacing.sm)
         .containerShape(RoundedRectangle(cornerRadius: T.Radius.composer, style: .continuous))
         .glassEffect(.regular, in: .rect(cornerRadius: T.Radius.composer))
         .padding(T.Spacing.lg)
+        // A native alert is a sheet on the window. Nitro users get the official alert (OC L7); the
+        // others the upsell (D7), whose official modal is not on disk (OC L8): its copy, "Okay" as
+        // the default so a repeated Return only dismisses it, and "Learn more" for the Nitro page.
+        .alert(
+            MessageLength.tooLongTitle, isPresented: Binding(get: { tooLong != nil }, set: { if !$0 { tooLong = nil } })
+        ) {
+            Button("Okay") {}
+            if case .upsell = tooLong { Button("Learn more") { openURL(MessageLength.nitroURL) } }
+        } message: {
+            Text(verbatim: tooLongMessage)
+        }
+    }
+
+    private var tooLongMessage: String {
+        switch tooLong {
+        case .alert(_, let message), .upsell(_, let message): message
+        case nil: ""
+        }
+    }
+
+    /// The editor with its placeholder, and under it the counter at the input's bottom trailing
+    /// corner: the input reserves that line (more when the upsell wraps) while the counter shows.
+    private var input: some View {
+        let counter = MessageLength.counter(draft: draft, premiumType: premiumType)
+        return VStack(alignment: .trailing, spacing: 0) {
+            ZStack(alignment: .topLeading) {
+                ComposerEditor(
+                    text: $draft, windowTick: $windowTick, label: "Message", onSubmit: submit,
+                    onCancelReply: reply == nil ? nil : { reply = nil }
+                )
+                if draft.isEmpty {
+                    Text("Message")
+                        .font(T.Typography.composer)
+                        .foregroundStyle(T.Palette.composerPlaceholder)
+                        .padding(.top, T.Size.composerInputInset)
+                        .allowsHitTesting(false)
+                        .accessibilityHidden(true)
+                        .transition(.identity)
+                }
+            }
+            if let counter { CounterView(counter: counter) }
+        }
+        .frame(maxWidth: .infinity)
+        // VoiceOver: the counter when it appears, and "Character limit reached" when the limit is
+        // reached (OC L2).
+        .onChange(of: counter == nil) { _, hidden in
+            if !hidden, let counter { AccessibilityNotification.Announcement(counter.text).post() }
+        }
+        .onChange(of: (counter?.remaining ?? 1) <= 0) { _, reached in
+            if reached { AccessibilityNotification.Announcement("Character limit reached").post() }
+        }
+    }
+
+    /// Return, from the editor, which has already left marked text to the input method.
+    private func submit() {
+        let outcome = ComposerSubmit.submit(&draft, reply: &reply, hasMarkedText: false, limit: limit, onSend: onSend)
+        if case .tooLong(let length, let limit) = outcome {
+            tooLong = MessageLength.tooLong(length: length, limit: limit, premiumType: premiumType)
+        }
+    }
+}
+
+/// The remaining counter (OC L2-L5) and, for a user who cannot type 4000, the upsell line under it.
+private struct CounterView: View {
+    let counter: MessageLength.Counter
+
+    var body: some View {
+        VStack(alignment: .trailing, spacing: 0) {
+            Text(verbatim: counter.text)
+                .foregroundStyle(counter.isCritical ? T.Palette.counterCritical : T.Palette.counterDefault)
+            if counter.showsUpsell { Text(upsell).foregroundStyle(.secondary) }
+        }
+        .font(T.Typography.composerCounter)
+        .multilineTextAlignment(.trailing)
+        .frame(minHeight: T.Size.composerCounterLine, alignment: .bottom)
+        .accessibilityElement(children: .combine)
+    }
+
+    /// OC L6; "Learn more" opens the Nitro page in the browser (velella has no store).
+    private var upsell: AttributedString {
+        var text = AttributedString(MessageLength.upsellCopy + " ")
+        var link = AttributedString("Learn more")
+        link.link = MessageLength.nitroURL
+        text.append(link)
+        return text
     }
 }
 

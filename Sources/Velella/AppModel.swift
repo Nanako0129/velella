@@ -167,6 +167,7 @@ final class AppModel {
                 displayName: username, username: username, avatar: .initials(String(username.prefix(1)).uppercased())
             )
             subscribeSidebar(generation: gen)
+            refreshPremiumType()
             sessionUser = userID
             let token = pending?.token
             pending = nil
@@ -206,9 +207,19 @@ final class AppModel {
             // A revoked token also fails IDENTIFY with 4004, which is `.authFailed` above.
             guard gen == generation else { return }
             notice = "Discord didn't accept this sign-in for loading or sending messages. Sign out and sign in again if this continues."
-        case .resumed, .reconnecting:
+        case .resumed(let gen):
+            // Account changes made while disconnected arrive in the replay.
+            if gen == generation { refreshPremiumType() }
+        case .reconnecting:
             break
         }
+    }
+
+    /// The composer's message-length limit follows `premium_type` (READY and USER_UPDATE update it in
+    /// core's `self_state()`). The session listener has no USER_UPDATE event, so the value is read on
+    /// READY, RESUMED and each conversation switch rather than on the update itself.
+    private func refreshPremiumType() {
+        shell.premiumType = handle?.selfState().premiumType
     }
 
     private func endSession() {
@@ -280,6 +291,7 @@ final class AppModel {
         // dropped, which calls this again with nothing open.
         if let handle, shell.dropBlockedSelection({ UInt64($0).map(handle.isObfuscated) ?? false }) { return }
         noteActivity() // a channel switch is input for the idle rule
+        refreshPremiumType()
         members.retarget(handle: handle, generation: generation) // L
         // M: the message history follows `shell.openTarget` here.
         openMessages(shell.openTarget.flatMap { UInt64($0) })

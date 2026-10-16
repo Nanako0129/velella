@@ -248,8 +248,8 @@ private let returnKey: (UInt16, String) = (36, "\r"), downKey: (UInt16, String) 
     let host = NSHostingView(rootView: Composer(reply: reply, draft: draft) { _, _ in recorder.sends += 1 }.frame(width: 600))
     main.contentView = host
     host.layoutSubtreeIfNeeded()
-    func fields(_ view: NSView) -> [NSTextField] { ((view as? NSTextField).map { [$0] } ?? []) + view.subviews.flatMap(fields) }
-    let field = try #require(fields(host).first)
+    // The composer's editor (CG replaced the text field with a text view).
+    let field = try #require(TextHarness.all(ComposerTextView.self, in: host).first)
     #expect(main.makeFirstResponder(field))
 
     let pasteboard = board()

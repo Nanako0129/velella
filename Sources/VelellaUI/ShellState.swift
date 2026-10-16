@@ -272,16 +272,86 @@ public enum ComposerSubmit {
         onSend(text)
     }
 
+    /// What a Return did.
+    public enum Outcome: Equatable, Sendable {
+        case sent
+        /// Nothing to send: no handler, an input method's marked text, or a blank draft.
+        case ignored
+        /// Over the limit (official validator MESSAGE_TOO_LONG): nothing was sent and the draft is kept.
+        case tooLong(length: Int, limit: Int)
+    }
+
     /// `submit` for a composer that may be replying: the send carries the reply's whole target
     /// (message and channel), and the reply bar clears with the draft, only when something was sent.
+    /// A draft longer than `limit` UTF-16 units (`MessageLength`) sends nothing and is never truncated;
+    /// the length is checked before the blank test, as the official validator does.
+    @discardableResult
     public static func submit(
-        _ draft: inout String, reply: inout ReplyPreview?, hasMarkedText: Bool, onSend: ((String, ReplyTarget?) -> Void)?
-    ) {
-        guard let onSend, !hasMarkedText, !draft.allSatisfy(\.isWhitespace) else { return }
+        _ draft: inout String, reply: inout ReplyPreview?, hasMarkedText: Bool, limit: Int = .max,
+        onSend: ((String, ReplyTarget?) -> Void)?
+    ) -> Outcome {
+        guard let onSend, !hasMarkedText else { return .ignored }
+        let length = MessageLength.length(draft)
+        if length > limit { return .tooLong(length: length, limit: limit) }
+        guard !draft.allSatisfy(\.isWhitespace) else { return .ignored }
         let text = draft, target = reply?.target
         draft = ""
         reply = nil
         onSend(text, target)
+        return .sent
+    }
+}
+
+// MARK: Message length
+
+/// The official long-text rules (composer plan CG; OC L1-L9): the limit, the remaining counter and
+/// what a Return over the limit shows. Lengths are UTF-16 units of the draft as sent (D9).
+public enum MessageLength {
+    public static let standardLimit = 2000
+    public static let nitroLimit = 4000
+
+    /// 4000 for `premium_type` 2 (Nitro: only that tier carries INCREASED_MESSAGE_LENGTH), else 2000;
+    /// Unknown (nil, before READY) counts as 2000.
+    public static func limit(premiumType: UInt8?) -> Int { premiumType == 2 ? nitroLimit : standardLimit }
+
+    public static func length(_ draft: String) -> Int { draft.utf16.count }
+
+    public struct Counter: Equatable, Sendable {
+        /// Negative over the limit; the text never shows it.
+        public var remaining: Int
+        public var text: String
+        /// Over the limit: the critical colour.
+        public var isCritical: Bool { remaining < 0 }
+        /// A user who cannot type 4000 also sees the inline upsell line under the counter.
+        public var showsUpsell: Bool
+    }
+
+    /// The counter for `draft`, or nil while hidden: shown when remaining is at most a tenth of the
+    /// limit, or for a Nitro user once the draft passes 2000.
+    public static func counter(draft: String, premiumType: UInt8?) -> Counter? {
+        let max = limit(premiumType: premiumType), remaining = max - length(draft)
+        let nitro = max == nitroLimit
+        guard (nitro && length(draft) > standardLimit) || remaining <= max / 10 else { return nil }
+        let text = remaining > 0 ? "\(remaining) characters remaining"
+            : remaining == 0 ? "Message is at max length" : "Message is too long"
+        return Counter(remaining: remaining, text: text, showsUpsell: !nitro)
+    }
+
+    /// What a Return over the limit shows (OC L7): Nitro users the alert, the others the upsell (D7).
+    public enum TooLong: Equatable, Sendable {
+        case alert(title: String, message: String)
+        case upsell(title: String, message: String)
+    }
+
+    public static let tooLongTitle = "Your message is too long."
+    /// OC L6, with `{premiumMaxMessageLength}` filled in; the "Learn more" that follows it is a link.
+    public static let upsellCopy = "Lift off with Discord Nitro to type to your heart's content, up to \(nitroLimit) characters."
+    public static let nitroURL = URL(string: "https://discord.com/nitro")!
+
+    public static func tooLong(length: Int, limit: Int, premiumType: UInt8?) -> TooLong {
+        premiumType == 2
+            ? .alert(title: tooLongTitle, message: "Please make your message of \(length) characters shorter. We've set the limit at \(limit) characters to be courteous to others.")
+            : .upsell(title: tooLongTitle, message: upsellCopy)
     }
 }
 
@@ -461,6 +531,9 @@ public struct ShellState: Equatable, Sendable {
     public var locale: String
     /// Older-history state of the open channel's messages (wave 3 P).
     public var older: OlderState = .idle
+    /// The user's `premium_type` from core's `self_state()` (nil: Unknown, before READY); the
+    /// composer's message-length limit follows it (`MessageLength.limit`).
+    public var premiumType: UInt8?
 
     public init(
         rail: [RailItem] = [], selectedRailID: String? = nil, serverName: String? = nil,
