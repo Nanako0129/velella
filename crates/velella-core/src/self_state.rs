@@ -106,6 +106,14 @@ fn items(v: Option<&Value>) -> impl Iterator<Item = &Value> {
     v.and_then(Value::as_array).into_iter().flatten()
 }
 
+/// A guild object's `mfa_level`: on the guild or, with CLIENT_STATE_V2, in `properties`.
+fn mfa_level(raw: &Value) -> Option<u8> {
+    raw.get("mfa_level")
+        .or_else(|| raw.get("properties")?.get("mfa_level"))
+        .and_then(Value::as_u64)
+        .and_then(|l| u8::try_from(l).ok())
+}
+
 fn timeout_of(member: &Value) -> Timeout {
     match member.get("communication_disabled_until") {
         None | Some(Value::Null) => Timeout::Clear,
@@ -174,6 +182,13 @@ impl SelfState {
         self.guild_payload(d, gid, own);
     }
 
+    /// GUILD_UPDATE: a guild that turns its moderators' MFA requirement on or off.
+    pub(crate) fn guild_update(&mut self, d: &Value) {
+        if let (Some(gid), Some(level)) = (get_id(d, "id"), mfa_level(d)) {
+            self.mfa_levels.insert(gid, level);
+        }
+    }
+
     /// The own member's timeout and a guild's emojis, from a READY or GUILD_CREATE guild object.
     /// A full guild replaces the emoji list; a partial one (`partial_updates.emojis` and
     /// `deleted_emoji_ids`, identify.md §1 bit 10) changes a list already held and leaves an
@@ -183,13 +198,7 @@ impl SelfState {
         if let Some(m) = own_member(members, own) {
             self.members.insert(gid, m);
         }
-        // `mfa_level` sits on the guild or, with CLIENT_STATE_V2, in `properties`.
-        let level = raw
-            .get("mfa_level")
-            .or_else(|| raw.get("properties")?.get("mfa_level"))
-            .and_then(Value::as_u64)
-            .and_then(|l| u8::try_from(l).ok());
-        if let Some(level) = level {
+        if let Some(level) = mfa_level(raw) {
             self.mfa_levels.insert(gid, level);
         }
         if raw.get("data_mode").and_then(Value::as_str) == Some("partial") {

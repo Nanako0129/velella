@@ -964,6 +964,7 @@ impl State {
     }
 
     fn guild_update(&mut self, d: &Value) -> bool {
+        self.self_state.guild_update(d);
         let Some(guild) =
             get_id(d, "id").and_then(|id| self.guilds.iter_mut().find(|g| g.id == id))
         else {

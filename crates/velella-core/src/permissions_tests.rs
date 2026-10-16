@@ -809,6 +809,41 @@ fn a_guild_requiring_mfa_strips_moderator_bits_from_a_user_without_it() {
 }
 
 #[test]
+fn a_guild_update_turning_the_mfa_requirement_on_or_off_applies_at_once() {
+    let member_bits = bits(&[VIEW_CHANNEL, SEND_MESSAGES, MANAGE_MESSAGES]);
+    let mut s = world_in(
+        OWNER,
+        &[role(GUILD, member_bits)],
+        &[],
+        json!({}),
+        json!([]),
+        json!({"mfa_level": 0}),
+    );
+    set_mfa(&mut s, false);
+    assert_eq!(perms(&s, CHANNEL), ChannelPermissions::Bits(member_bits));
+    s.apply(
+        "GUILD_UPDATE",
+        &json!({"id": GUILD.to_string(), "mfa_level": 1}),
+    );
+    assert_eq!(
+        perms(&s, CHANNEL),
+        ChannelPermissions::Bits(bits(&[VIEW_CHANNEL, SEND_MESSAGES]))
+    );
+    // CLIENT_STATE_V2 carries it in `properties`.
+    s.apply(
+        "GUILD_UPDATE",
+        &json!({"id": GUILD.to_string(), "properties": {"mfa_level": 0}}),
+    );
+    assert_eq!(perms(&s, CHANNEL), ChannelPermissions::Bits(member_bits));
+    // An update without the field keeps the held level.
+    s.apply(
+        "GUILD_UPDATE",
+        &json!({"id": GUILD.to_string(), "name": "renamed"}),
+    );
+    assert_eq!(perms(&s, CHANNEL), ChannelPermissions::Bits(member_bits));
+}
+
+#[test]
 fn the_mfa_strip_is_unknown_when_its_inputs_are_missing() {
     let member_bits = bits(&[VIEW_CHANNEL, MANAGE_MESSAGES]);
     // The guild never said its level (and the user has no MFA on record): Unknown.
