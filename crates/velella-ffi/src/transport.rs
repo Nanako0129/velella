@@ -88,6 +88,9 @@ pub struct HttpHeader {
 pub enum HttpMethod {
     Get,
     Post,
+    Put,
+    Patch,
+    Delete,
 }
 
 /// Fixed text; never carries the rejected input.
@@ -172,6 +175,9 @@ impl HttpRequest {
         let method = match method {
             HttpMethod::Get => core::Method::Get,
             HttpMethod::Post => core::Method::Post,
+            HttpMethod::Put => core::Method::Put,
+            HttpMethod::Patch => core::Method::Patch,
+            HttpMethod::Delete => core::Method::Delete,
         };
         let inner = core::HttpRequest::new(
             method,

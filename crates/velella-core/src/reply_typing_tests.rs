@@ -59,27 +59,44 @@ fn typing_of(store: &MessageStore, epoch: u64) -> Vec<String> {
 
 // ---- Reply ----
 
-#[tokio::test]
-async fn a_reply_posts_message_reference_and_leaves_mentions_at_the_default() {
+/// The POSTed body of a reply to message 30 in channel 5, sent with `guild_id`.
+async fn reply_body(guild_id: Option<u64>) -> (String, String) {
     let (mock, store) = serve(&[ok(&json!([msg(30, 5, "question")])), ok(&json!({}))]).await;
     let epoch = store.open(5);
     settled(&store, epoch).await;
     let (_, nonce) = store.begin_send(5, "answer", me(), Some(30)).unwrap();
     let _ = store
         .rest
-        .create_message(5, "answer", &nonce, Some(30))
+        .create_message(5, guild_id, "answer", &nonce, Some(30))
         .await;
-    let raw = &mock.requests()[1];
+    let raw = mock.requests()[1].clone();
     assert!(raw.starts_with("POST /api/v9/channels/5/messages HTTP/1.1\r\n"));
-    let body: Value = serde_json::from_str(raw.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    (raw.split("\r\n\r\n").nth(1).unwrap().to_owned(), nonce)
+}
+
+/// §18.4: a reply in a guild channel names `guild_id` first in `message_reference`; no `type`,
+/// no `fail_if_not_exists`; the mention stays on (no `allowed_mentions`). Byte for byte.
+#[tokio::test]
+async fn a_guild_reply_posts_message_reference_with_its_guild_id() {
+    let (body, nonce) = reply_body(Some(100)).await;
     assert_eq!(
         body,
-        json!({
-            "content": "answer", "nonce": nonce, "tts": false, "flags": 0,
-            "message_reference": {"message_id": "30", "channel_id": "5", "fail_if_not_exists": false},
-        })
+        format!(
+            r#"{{"mobile_network_type":"unknown","content":"answer","nonce":"{nonce}","tts":false,"message_reference":{{"guild_id":"100","channel_id":"5","message_id":"30"}},"flags":0}}"#
+        )
     );
-    assert!(body.get("allowed_mentions").is_none());
+}
+
+/// §18.4: in a DM the `guild_id` key is omitted.
+#[tokio::test]
+async fn a_dm_reply_posts_message_reference_without_guild_id() {
+    let (body, nonce) = reply_body(None).await;
+    assert_eq!(
+        body,
+        format!(
+            r#"{{"mobile_network_type":"unknown","content":"answer","nonce":"{nonce}","tts":false,"message_reference":{{"channel_id":"5","message_id":"30"}},"flags":0}}"#
+        )
+    );
 }
 
 #[tokio::test]
@@ -88,7 +105,7 @@ async fn a_send_without_a_reply_has_no_message_reference() {
     let epoch = store.open(5);
     settled(&store, epoch).await;
     let (_, nonce) = store.begin_send(5, "hi", me(), None).unwrap();
-    let _ = store.rest.create_message(5, "hi", &nonce, None).await;
+    let _ = store.rest.create_message(5, None, "hi", &nonce, None).await;
     let raw = &mock.requests()[1];
     let body: Value = serde_json::from_str(raw.split("\r\n\r\n").nth(1).unwrap()).unwrap();
     assert!(body.get("message_reference").is_none(), "{raw}");

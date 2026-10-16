@@ -197,6 +197,63 @@ func capCase(cap: Int) async throws {
     #expect(line.get == "GET \(target) HTTP/1.1")
 }
 
+/// F2's methods: a PUT without a body, a PATCH with a JSON body and a DELETE carrying the MFA
+/// re-send header arrive with the method, target, body and every header core composed byte for
+/// byte, each header once, and nothing URLSession invents beyond its own transport headers.
+@Test func putPatchAndDeleteArriveByteForByte() async throws {
+    let seen = Box<[(head: String, body: Data)]>([])
+    let server = try TestServer { peer in
+        while let request = peer.readRequest() {
+            seen.update { $0.append(request) }
+            peer.write(httpResponse("204 No Content", length: false, close: false))
+        }
+    }
+    let transport = URLSessionTransport(allowList: local(server.port))
+    let base = "http://127.0.0.1:\(server.port)"
+    let context = "eyJsb2NhdGlvbiI6ImNoYXRfaW5wdXQifQ=="
+    let json = HttpHeader(name: "Content-Type", value: "application/json")
+    let cases: [(HttpMethod, String, String, [HttpHeader], Data?)] = [
+        (.put, "PUT", "/api/v9/channels/1/messages/2/reactions/%F0%9F%91%8D/@me?location=Message%20Context%20Menu&type=0",
+         [HttpHeader(name: "User-Agent", value: ua)], nil),
+        (.patch, "PATCH", "/api/v9/channels/1/messages/2",
+         [HttpHeader(name: "User-Agent", value: ua), json, HttpHeader(name: "X-Failed-Requests", value: "1")],
+         Data(#"{"content":"new \"text\" 👍"}"#.utf8)),
+        (.delete, "DELETE", "/api/v9/channels/1/messages/2/reactions/blobhaj:123/1/99?location=Message&burst=true",
+         [HttpHeader(name: "User-Agent", value: ua), HttpHeader(name: "X-Context-Properties", value: context),
+          HttpHeader(name: "X-Discord-MFA-Authorization", value: "MFA-TOKEN-XYZ")], nil),
+    ]
+    for (method, _, target, headers, body) in cases {
+        let composed = try HttpRequest(
+            method: method, url: base + target, headers: headers, body: body,
+            authorization: marker, deadlineMs: 10_000, bodyCap: 1 << 20
+        )
+        guard case .response(204, _, _, false) = await transport.perform(composed) else {
+            Issue.record("\(target): no 204"); return
+        }
+    }
+    #expect(seen.get.count == 3)
+    for ((_, name, target, headers, body), arrived) in zip(cases, seen.get) {
+        let lines = arrived.head.components(separatedBy: "\r\n")
+        #expect(lines[0] == "\(name) \(target) HTTP/1.1")
+        #expect(arrived.body == (body ?? Data()), "\(name): body")
+        for h in headers {
+            #expect(header(h.name, in: arrived.head) == [h.value], "\(name): \(h.name)")
+        }
+        #expect(header("authorization", in: arrived.head) == [marker], "\(name): Authorization")
+        // A bodiless PUT or DELETE goes out with `Content-Length: 0`.
+        #expect(header("content-length", in: arrived.head) == ["\((body ?? Data()).count)"], "\(name): Content-Length")
+        if body == nil { #expect(header("content-type", in: arrived.head).isEmpty, "\(name): Content-Type") }
+        #expect(header("cookie", in: arrived.head).isEmpty)
+        // Every header on the wire: the composed ones, Authorization, and URLSession's own
+        // transport set as measured here (this test composes no Accept-Language, so URLSession
+        // adds one; core always composes it).
+        let names = Set(lines.dropFirst().filter { !$0.isEmpty }.compactMap { $0.split(separator: ":").first?.lowercased() })
+        let extra = names.subtracting(headers.map { $0.name.lowercased() } + ["authorization"]).sorted()
+        #expect(extra == ["accept", "accept-encoding", "accept-language", "connection", "content-length", "host"],
+                "\(name): \(extra)")
+    }
+}
+
 // MARK: Failures and deadlines
 
 /// T-3: a POST the server read and then dropped without answering is not `connectFailed` (core
