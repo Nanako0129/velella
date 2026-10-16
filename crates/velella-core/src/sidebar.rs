@@ -14,6 +14,8 @@ use std::{
 };
 
 pub(crate) const CDN: &str = "https://cdn.discordapp.com";
+/// What an obfuscated channel or DM is called, whatever name it carries (identify.md §5).
+const NO_ACCESS: &str = "No Access";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SidebarGuild {
@@ -162,47 +164,72 @@ fn sidebar_guild(state: &State, g: &Guild, now: i64) -> SidebarGuild {
     }
 }
 
-/// Rail entries: guilds in no folder first (post-READY ones most recent first, then READY order),
-/// then the folders in order. A folder with a null id, or with one known guild, becomes plain
-/// guilds; a guild shows once (its first place wins); unknown ids and empty folders vanish.
-/// Without `guild_folders` every guild is ungrouped.
+/// Rail entries in the official order (identify.md §3, W:9143105). With no folders,
+/// `guild_positions` orders the guilds. Otherwise each folder entry in turn: without an id it
+/// places its first guild alone, with one (0 included) it is a folder of its known guilds, even a
+/// single one. Unknown guilds and empty folders vanish, and a guild shows once (its first place
+/// wins). Every joined guild not placed goes on top, the most recently added first. While the
+/// settings are unknown (`guild_folders` is `None`), post-READY guilds come first, newest first,
+/// then READY order.
 pub fn guild_entries(state: &State) -> Vec<SidebarEntry> {
     let now = now_ms();
-    let folders = state.guild_folders.as_deref().unwrap_or_default();
-    let foldered: HashSet<u64> = folders
-        .iter()
-        .flat_map(|f| f.guild_ids.iter().copied())
-        .collect();
     let mut seen = HashSet::new();
-    let mut out: Vec<SidebarEntry> = state
-        .post_ready_guild_ids()
-        .into_iter()
-        .rev()
-        .chain(state.ready_guild_ids())
-        .filter(|id| !foldered.contains(id))
-        .filter_map(|id| state.guild(id))
-        .filter(|g| seen.insert(g.id))
-        .map(|g| SidebarEntry::Guild(sidebar_guild(state, g, now)))
-        .collect();
-    for f in folders {
-        let known: Vec<SidebarGuild> = f
-            .guild_ids
-            .iter()
-            .filter_map(|id| state.guild(*id))
-            .filter(|g| seen.insert(g.id))
-            .map(|g| sidebar_guild(state, g, now))
+    let mut place = |id: &u64| state.guild(*id).filter(|g| seen.insert(g.id));
+    let Some(folders) = state.guild_folders.as_deref() else {
+        return state
+            .post_ready_guild_ids()
+            .into_iter()
+            .rev()
+            .chain(state.ready_guild_ids())
+            .filter_map(|id| place(&id))
+            .map(|g| SidebarEntry::Guild(sidebar_guild(state, g, now)))
             .collect();
-        if f.id.is_some() && known.len() >= 2 {
-            out.push(SidebarEntry::Folder {
-                id: f.id,
-                name: f.name.clone(),
-                color: f.color,
-                guilds: known,
-            });
-        } else {
-            out.extend(known.into_iter().map(SidebarEntry::Guild));
+    };
+    let mut placed = Vec::new();
+    if folders.is_empty() {
+        placed.extend(
+            state
+                .guild_positions
+                .iter()
+                .filter_map(&mut place)
+                .map(|g| SidebarEntry::Guild(sidebar_guild(state, g, now))),
+        );
+    }
+    for f in folders {
+        match f.id {
+            None => placed.extend(
+                f.guild_ids
+                    .first()
+                    .and_then(&mut place)
+                    .map(|g| SidebarEntry::Guild(sidebar_guild(state, g, now))),
+            ),
+            Some(_) => {
+                let known: Vec<SidebarGuild> = f
+                    .guild_ids
+                    .iter()
+                    .filter_map(&mut place)
+                    .map(|g| sidebar_guild(state, g, now))
+                    .collect();
+                if !known.is_empty() {
+                    placed.push(SidebarEntry::Folder {
+                        id: f.id,
+                        name: f.name.clone(),
+                        color: f.color,
+                        guilds: known,
+                    });
+                }
+            }
         }
     }
+    // Inserted one by one at the top in store order, so the last added ends up first.
+    let mut out: Vec<SidebarEntry> = state
+        .guilds
+        .iter()
+        .rev()
+        .filter_map(|g| place(&g.id))
+        .map(|g| SidebarEntry::Guild(sidebar_guild(state, g, now)))
+        .collect();
+    out.extend(placed);
     out
 }
 
@@ -244,7 +271,11 @@ fn sidebar_channel(state: &State, guild: &Guild, c: &Channel, now: i64) -> Sideb
     SidebarChannel {
         id: c.id,
         kind: c.kind,
-        name: c.name.clone().unwrap_or_default(),
+        name: if c.is_obfuscated() {
+            NO_ACCESS.to_owned()
+        } else {
+            c.name.clone().unwrap_or_default()
+        },
         unread: b.unread,
         mention_count: b.mentions,
         muted: b.muted,
@@ -360,6 +391,9 @@ fn display_name(user: &crate::state::User) -> &str {
 }
 
 fn dm_name(state: &State, dm: &PrivateChannel) -> String {
+    if dm.is_obfuscated() {
+        return NO_ACCESS.to_owned();
+    }
     let who = state.recipients(dm);
     if dm.kind == 3 {
         if let Some(name) = dm.name.as_deref().filter(|n| !n.is_empty()) {
@@ -413,12 +447,21 @@ pub fn dm_list(state: &State) -> Vec<SidebarDm> {
     dms.sort_by_key(|c| Reverse((c.last_message_id, c.id)));
     dms.into_iter()
         .map(|c| {
-            let b = Badge::new(
-                state,
-                c.id,
-                c.last_message_id,
-                state.settings.dm_muted(c.id, now),
-            );
+            // An obfuscated DM counts toward no total (I-5).
+            let b = if c.is_obfuscated() {
+                Badge {
+                    unread: false,
+                    mentions: 0,
+                    muted: false,
+                }
+            } else {
+                Badge::new(
+                    state,
+                    c.id,
+                    c.last_message_id,
+                    state.settings.dm_muted(c.id, now),
+                )
+            };
             SidebarDm {
                 id: c.id,
                 name: dm_name(state, c),

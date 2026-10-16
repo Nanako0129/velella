@@ -78,6 +78,9 @@ pub(crate) fn apply(list: &mut Vec<Reaction>, name: &str, d: &Value, me: Option<
     if name == "MESSAGE_REACTION_REMOVE_ALL" {
         return !std::mem::take(list).is_empty();
     }
+    if name == "MESSAGE_REACTION_ADD_MANY" {
+        return add_many(list, d, me);
+    }
     let Some(emoji) = d.get("emoji").and_then(emoji) else {
         return false;
     };
@@ -107,4 +110,30 @@ pub(crate) fn apply(list: &mut Vec<Reaction>, name: &str, d: &Value, me: Option<
         _ => return false,
     }
     true
+}
+
+/// MESSAGE_REACTION_ADD_MANY (bit 13, identify.md §1): `reactions: [{users, emoji}]`, one
+/// MESSAGE_REACTION_ADD per listed user, as the official `addReactionBatch` does.
+fn add_many(list: &mut Vec<Reaction>, d: &Value, me: Option<u64>) -> bool {
+    let mut changed = false;
+    for r in d
+        .get("reactions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(emoji) = r.get("emoji") else {
+            continue;
+        };
+        for user in r
+            .get("users")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let one = serde_json::json!({"emoji": emoji, "user_id": user});
+            changed |= apply(list, "MESSAGE_REACTION_ADD", &one, me);
+        }
+    }
+    changed
 }

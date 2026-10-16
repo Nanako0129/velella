@@ -344,6 +344,10 @@ struct Stored {
     reply: Option<Box<Stored>>,
     nonce: Option<String>,
     reactions: Vec<Reaction>,
+    /// MESSAGE_POLL_VOTE_ADD_MANY totals per answer: (answer id, votes, includes the self user).
+    /// Stored for the polls wave, which renders them; nothing reads them yet.
+    #[allow(dead_code)]
+    poll_votes: Vec<(u64, u32, bool)>,
     /// Parsed once with the message (descriptions and values included); never in `row()`.
     embeds: Vec<Embed>,
     /// `flags` bit 2: the embeds are kept but not shown.
@@ -391,6 +395,7 @@ fn parse(v: &Value, nested: bool) -> Option<Stored> {
             _ => None,
         }),
         reactions: reactions::parse(v.get("reactions")),
+        poll_votes: Vec::new(),
         // A nested reply only feeds the one-line preview: its embeds are never parsed.
         embeds: if nested {
             Vec::new()
@@ -399,6 +404,47 @@ fn parse(v: &Value, nested: bool) -> Option<Stored> {
         },
         suppress_embeds: suppress_embeds(v).unwrap_or(false),
     })
+}
+
+/// Most poll answers Discord allows; votes for more distinct answers are not kept.
+const MAX_POLL_ANSWERS: usize = 10;
+
+/// MESSAGE_POLL_VOTE_ADD_MANY `votes: [{answer_id, users: [...]}]` (identify.md §1, W:4704644).
+fn add_poll_votes(votes: &mut Vec<(u64, u32, bool)>, d: &Value, me: Option<u64>) -> bool {
+    let mut changed = false;
+    for v in d
+        .get("votes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(answer) = v.get("answer_id").and_then(Value::as_u64) else {
+            continue;
+        };
+        let users: Vec<Option<u64>> = v
+            .get("users")
+            .and_then(Value::as_array)
+            .map(|u| u.iter().map(id).collect())
+            .unwrap_or_default();
+        if users.is_empty() {
+            continue;
+        }
+        let at = match votes.iter().position(|x| x.0 == answer) {
+            Some(i) => i,
+            None if votes.len() < MAX_POLL_ANSWERS => {
+                votes.push((answer, 0, false));
+                votes.len() - 1
+            }
+            None => continue,
+        };
+        let slot = &mut votes[at];
+        slot.1 = slot
+            .1
+            .saturating_add(u32::try_from(users.len()).unwrap_or(u32::MAX));
+        slot.2 |= me.is_some() && users.contains(&me);
+        changed = true;
+    }
+    changed
 }
 
 impl Stored {
@@ -862,6 +908,7 @@ impl Open {
                 }
                 // A MESSAGE_CREATE never carries reactions; the buffered copy has the events.
                 m.reactions = std::mem::take(&mut old.reactions);
+                m.poll_votes = std::mem::take(&mut old.poll_votes);
                 *old = m;
             }
             Ok(_) => {}
@@ -1159,6 +1206,8 @@ impl MessageStore {
                 | "MESSAGE_REACTION_REMOVE"
                 | "MESSAGE_REACTION_REMOVE_ALL"
                 | "MESSAGE_REACTION_REMOVE_EMOJI"
+                | "MESSAGE_REACTION_ADD_MANY"
+                | "MESSAGE_POLL_VOTE_ADD_MANY"
         ) {
             return;
         }
@@ -1210,7 +1259,12 @@ impl MessageStore {
                     return;
                 };
                 let me = Some(self.me.load(Ordering::Relaxed)).filter(|n| *n != 0);
-                if !reactions::apply(&mut m.reactions, name, d, me) {
+                let changed = if name == "MESSAGE_POLL_VOTE_ADD_MANY" {
+                    add_poll_votes(&mut m.poll_votes, d, me)
+                } else {
+                    reactions::apply(&mut m.reactions, name, d, me)
+                };
+                if !changed {
                     return;
                 }
             }
@@ -1256,6 +1310,7 @@ impl MessageStore {
                 reply,
                 nonce: None,
                 reactions: Vec::new(),
+                poll_votes: Vec::new(),
                 embeds: Vec::new(),
                 suppress_embeds: false,
             },

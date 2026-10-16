@@ -71,11 +71,11 @@ fn guild_order_ungrouped_then_folders() {
     assert_eq!(
         guild_entries(&s),
         vec![
-            // Ungrouped: post-READY newest first, then READY order.
+            // Unplaced guilds on top, the most recently added first (official, identify.md §3).
             plain(61),
             plain(60),
-            plain(40),
             plain(50),
+            plain(40),
             plain(10),
             SidebarEntry::Folder {
                 id: Some(7),
@@ -122,7 +122,7 @@ fn ready_parses_folder_color() {
 }
 
 #[test]
-fn null_id_container_is_a_plain_guild_and_single_known_guild_folder_too() {
+fn null_id_container_is_a_plain_guild_and_single_known_guild_folder_stays_a_folder() {
     let guilds = vec![guild(10, vec![]), guild(20, vec![]), guild(30, vec![])];
     let folders = json!([
         {"id": null, "guild_ids": ["30"]},
@@ -130,7 +130,20 @@ fn null_id_container_is_a_plain_guild_and_single_known_guild_folder_too() {
         {"id": null, "guild_ids": ["20"]}
     ]);
     let s = state(ready(guilds, folders, json!([]), vec![]));
-    assert_eq!(guild_entries(&s), vec![plain(30), plain(10), plain(20)]);
+    // Official (identify.md §3): a folder with an id is a folder node even with one guild.
+    assert_eq!(
+        guild_entries(&s),
+        vec![
+            plain(30),
+            SidebarEntry::Folder {
+                id: Some(7),
+                name: Some("solo".into()),
+                color: None,
+                guilds: vec![sg(10)],
+            },
+            plain(20)
+        ]
+    );
 }
 
 #[test]

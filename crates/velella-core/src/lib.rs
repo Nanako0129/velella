@@ -8,6 +8,7 @@ mod gateway;
 mod guild_settings;
 pub mod highlight;
 mod identify;
+mod local_presence;
 pub mod markdown;
 mod media;
 mod member_list;
@@ -21,6 +22,7 @@ mod relationships;
 mod rest;
 mod rest_messages;
 mod session;
+mod settings_proto;
 mod sidebar;
 mod state;
 mod threads;
@@ -34,6 +36,8 @@ mod fixture_tests;
 mod member_list_tests;
 #[cfg(test)]
 mod proto_tests;
+#[cfg(test)]
+mod ready_shapes_tests;
 #[cfg(test)]
 mod rest_tests;
 #[cfg(test)]

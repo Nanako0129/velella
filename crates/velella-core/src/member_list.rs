@@ -498,6 +498,11 @@ impl State {
             channel.permission_overwrites.as_deref()?,
         )
     }
+
+    /// The op-37 selection for (`guild_id`, `channel_id`): none for an obfuscated channel (I-5).
+    pub(crate) fn member_list_target(&self, guild_id: u64, channel_id: u64) -> Option<(u64, u64)> {
+        (!self.is_obfuscated(channel_id)).then_some((guild_id, channel_id))
+    }
 }
 
 impl SessionHandle {
@@ -510,7 +515,8 @@ impl SessionHandle {
         channel_id: u64,
         deliver: impl Fn(Vec<MemberListSection>) + Send + 'static,
     ) -> Subscription {
-        self.set_member_subscription(Some((guild_id, channel_id)));
+        let target = self.snapshot().member_list_target(guild_id, channel_id);
+        self.set_member_subscription(target);
         self.subscribe(move |s| member_sections(s, guild_id, channel_id), deliver)
     }
 }

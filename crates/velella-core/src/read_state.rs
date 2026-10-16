@@ -131,6 +131,39 @@ impl State {
         changed
     }
 
+    /// PASSIVE_UPDATE_V2 (bit 14, identify.md §1): newer `last_message_id`s of a guild's channels
+    /// (`last_pin_timestamp` has no reader yet), voice states, and the self member's roles.
+    pub(crate) fn passive_update_v2(&mut self, d: &Value) -> bool {
+        let Some(guild) = get_id(d, "guild_id") else {
+            return false;
+        };
+        let mut changed = false;
+        for u in d
+            .get("updated_channels")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let (Some(channel), Some(last)) = (get_id(u, "id"), get_id(u, "last_message_id")) {
+                changed |= self.raise_last_message(channel, Some(guild), last);
+            }
+        }
+        changed |= self.passive_voice(d, guild);
+        if let Some(own) = self.user_id {
+            let mine = d
+                .get("updated_members")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .find_map(|m| crate::state::own_member_roles(m, own));
+            if let (Some(mine), Some(g)) = (mine, self.guilds.iter_mut().find(|g| g.id == guild)) {
+                changed |= g.member_roles.as_ref() != Some(&mine);
+                g.member_roles = Some(mine);
+            }
+        }
+        changed
+    }
+
     /// Raises the newest-message id of a guild channel, thread or private channel; never lowers it.
     fn raise_last_message(&mut self, channel: u64, guild: Option<u64>, message: u64) -> bool {
         let slot = match guild {

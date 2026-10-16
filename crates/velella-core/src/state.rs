@@ -7,6 +7,7 @@ use crate::permissions;
 use crate::presence::Presence;
 use crate::read_state::ReadStates;
 use crate::relationships::Relationships;
+use crate::settings_proto::UserSettings;
 use crate::threads::Threads;
 use crate::voice::VoiceStates;
 use serde_json::Value;
@@ -61,6 +62,17 @@ pub struct Channel {
     /// `None` when the payload carried none: permissions are then undecidable.
     pub permission_overwrites: Option<Vec<Overwrite>>,
     pub last_message_id: Option<u64>,
+    /// Channel flags; `OBFUSCATED` hides the channel whatever else it carries.
+    pub flags: u64,
+}
+
+/// Channel flag OBFUSCATED (1 << 17, identify.md §5): the server withheld the channel's data.
+pub(crate) const OBFUSCATED: u64 = 1 << 17;
+
+impl Channel {
+    pub fn is_obfuscated(&self) -> bool {
+        self.flags & OBFUSCATED != 0
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -89,6 +101,14 @@ pub struct PrivateChannel {
     pub icon: Option<String>,
     pub recipient_ids: Vec<u64>,
     pub last_message_id: Option<u64>,
+    /// Channel flags, as on `Channel`.
+    pub flags: u64,
+}
+
+impl PrivateChannel {
+    pub fn is_obfuscated(&self) -> bool {
+        self.flags & OBFUSCATED != 0
+    }
 }
 
 /// One legacy `user_settings.guild_folders` entry (`id` is null for single-guild containers).
@@ -125,7 +145,21 @@ pub struct State {
     pub threads: Threads,
     /// The adopted member list of `member_sub` (see `member_list.rs`); rebuilt by READY.
     pub(crate) member_list: crate::member_list::MemberList,
+    /// READY `user_settings_proto`, then USER_SETTINGS_PROTO_UPDATE type 1. `None` (Unknown) when
+    /// READY carried none or it could not be decoded: folders fall back to legacy, and status,
+    /// Developer Mode and presence stay unknown.
+    pub user_settings: Option<UserSettings>,
+    /// `guild_positions` from the settings: the rail order while there are no folders.
+    pub guild_positions: Vec<u64>,
+    /// An INITIAL_GUILD received before READY, merged by READY when READY lacks it (I-13).
+    pub(crate) initial_guild: Option<Value>,
+    /// Raw `apex_experiments` objects for slice X, in arrival order: READY's, then each
+    /// STATE_UPDATE's (each overwrites the units it lists). Rebuilt by READY.
+    pub apex_experiments: Vec<Value>,
 }
+
+/// STATE_UPDATEs kept after READY's entry; older ones are dropped first.
+const MAX_APEX_UPDATES: usize = 32;
 
 pub(crate) fn id(v: &Value) -> Option<u64> {
     v.as_str()
@@ -208,11 +242,27 @@ fn parse_channel(v: &Value, default_guild: u64) -> Option<Channel> {
             .and_then(Value::as_array)
             .and_then(|a| a.iter().map(parse_overwrite).collect()),
         last_message_id: get_id(v, "last_message_id"),
+        flags: flags(v),
     })
 }
 
+fn flags(v: &Value) -> u64 {
+    v.get("flags").and_then(Value::as_u64).unwrap_or(0)
+}
+
+/// JavaScript truthiness, for flags the official client tests with `||`.
+fn truthy(v: Option<&Value>) -> bool {
+    match v {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(Value::Number(n)) => n.as_f64() != Some(0.0),
+        Some(Value::String(s)) => !s.is_empty(),
+        Some(_) => true,
+    }
+}
+
 /// Own role ids from a member object (`user.id` or `user_id` identifies it).
-fn own_member_roles(member: &Value, own: u64) -> Option<Vec<u64>> {
+pub(crate) fn own_member_roles(member: &Value, own: u64) -> Option<Vec<u64>> {
     let who = member
         .get("user")
         .and_then(|u| get_id(u, "id"))
@@ -242,7 +292,8 @@ fn parse_guild(v: &Value, own: Option<u64>) -> Option<Guild> {
             .and_then(Value::as_str)
             .map(str::to_owned),
         owner_id: guild_field(v, "owner_id").and_then(id),
-        unavailable: v.get("unavailable").and_then(Value::as_bool) == Some(true),
+        unavailable: v.get("unavailable").and_then(Value::as_bool) == Some(true)
+            || v.get("data_mode").and_then(Value::as_str) == Some("unavailable"),
         after_ready: false,
         roles: v
             .get("roles")
@@ -281,11 +332,20 @@ fn parse_private(v: &Value) -> Option<(PrivateChannel, Vec<User>)> {
             icon: get_str(v, "icon"),
             recipient_ids,
             last_message_id: get_id(v, "last_message_id"),
+            flags: flags(v),
         },
         inline,
     ))
 }
 
+/// A legacy folder id: a number (0 included, which is still a folder) or a numeric string.
+fn folder_id(v: &Value) -> Option<u64> {
+    v.as_u64()
+        .or_else(|| v.as_i64().map(|i| i as u64))
+        .or_else(|| v.as_str()?.parse().ok())
+}
+
+/// Legacy `user_settings.guild_folders` (capabilities without bit 9).
 fn parse_folders(d: &Value) -> Option<Vec<GuildFolder>> {
     let folders = d.get("user_settings")?.get("guild_folders")?.as_array()?;
     Some(
@@ -294,7 +354,7 @@ fn parse_folders(d: &Value) -> Option<Vec<GuildFolder>> {
             .filter_map(|f| {
                 let guild_ids = ids(f.get("guild_ids"));
                 (!guild_ids.is_empty()).then(|| GuildFolder {
-                    id: get_id(f, "id"),
+                    id: f.get("id").and_then(folder_id),
                     name: get_str(f, "name").filter(|n| !n.is_empty()),
                     color: f
                         .get("color")
@@ -305,6 +365,133 @@ fn parse_folders(d: &Value) -> Option<Vec<GuildFolder>> {
             })
             .collect(),
     )
+}
+
+/// A guild known only by id: unavailable, so nothing in it is decidable or navigable.
+fn stub(id: u64) -> Guild {
+    Guild {
+        id,
+        name: None,
+        icon: None,
+        owner_id: None,
+        unavailable: true,
+        after_ready: false,
+        roles: None,
+        member_roles: None,
+        channels: Vec::new(),
+    }
+}
+
+fn is_partial(v: &Value) -> bool {
+    v.get("data_mode").and_then(Value::as_str) == Some("partial")
+}
+
+/// Name, icon and owner, wherever the payload carries them (top level or `properties`).
+fn merge_props(guild: &mut Guild, d: &Value) {
+    if let Some(v) = guild_field(d, "name") {
+        guild.name = v.as_str().map(str::to_owned);
+    }
+    if let Some(v) = guild_field(d, "icon") {
+        guild.icon = v.as_str().map(str::to_owned);
+    }
+    if let Some(v) = guild_field(d, "owner_id") {
+        guild.owner_id = id(v);
+    }
+}
+
+/// Insert or replace; a payload without `last_message_id` keeps the newest one known.
+fn upsert_channel(guild: &mut Guild, channel: Channel) {
+    match guild.channels.iter_mut().find(|c| c.id == channel.id) {
+        Some(slot) => {
+            let last = channel.last_message_id.max(slot.last_message_id);
+            *slot = Channel {
+                last_message_id: last,
+                ..channel
+            };
+        }
+        None => guild.channels.push(channel),
+    }
+}
+
+fn upsert_role(roles: &mut Vec<Role>, role: Role) {
+    match roles.iter_mut().find(|r| r.id == role.id) {
+        Some(slot) => *slot = role,
+        None => roles.push(role),
+    }
+}
+
+fn items(v: Option<&Value>) -> impl Iterator<Item = &Value> {
+    v.and_then(Value::as_array).into_iter().flatten()
+}
+
+/// CLIENT_STATE_V2 `data_mode: "partial"` against the guild already held (identify.md §1 bit 10,
+/// W:4679860): `properties` (may be null) and `partial_updates` writes and deletes. Whether the
+/// guild is available is left as it was.
+fn apply_partial(guild: &mut Guild, v: &Value, own: Option<u64>) {
+    merge_props(guild, v);
+    let updates = v.get("partial_updates");
+    let gid = guild.id;
+    for c in items(updates.and_then(|u| u.get("channels"))) {
+        if let Some(channel) = parse_channel(c, gid) {
+            upsert_channel(guild, channel);
+        }
+    }
+    let gone = ids(updates.and_then(|u| u.get("deleted_channel_ids")));
+    guild.channels.retain(|c| !gone.contains(&c.id));
+    // `channel_updates`: `{id, last_message_id, last_pin_timestamp}` per channel (W:9100953).
+    for u in items(v.get("channel_updates")) {
+        let (Some(cid), Some(last)) = (get_id(u, "id"), get_id(u, "last_message_id")) else {
+            continue;
+        };
+        if let Some(c) = guild.channels.iter_mut().find(|c| c.id == cid) {
+            c.last_message_id = c.last_message_id.max(Some(last));
+        }
+    }
+    // Writes onto an unknown role set would make a partial set look complete.
+    if let Some(roles) = guild.roles.as_mut() {
+        for r in items(updates.and_then(|u| u.get("roles"))) {
+            if let Some(role) = parse_role(r) {
+                upsert_role(roles, role);
+            }
+        }
+        let gone = ids(updates.and_then(|u| u.get("deleted_role_ids")));
+        roles.retain(|r| !gone.contains(&r.id));
+    }
+    if let Some(mine) = own.and_then(|own| {
+        items(v.get("members"))
+            .chain(v.get("member"))
+            .find_map(|m| own_member_roles(m, own))
+    }) {
+        guild.member_roles = Some(mine);
+    }
+}
+
+/// CHANNEL_SYNC: only the keys present replace the held values; `flags` always comes from the
+/// payload, absent meaning none (I-15).
+fn merge_present(slot: &mut Channel, c: &Value) {
+    if let Some(v) = c.get("name") {
+        slot.name = v.as_str().map(str::to_owned);
+    }
+    if let Some(kind) = c
+        .get("type")
+        .and_then(Value::as_u64)
+        .and_then(|k| u8::try_from(k).ok())
+    {
+        slot.kind = kind;
+    }
+    if let Some(v) = c.get("position") {
+        slot.position = v.as_i64();
+    }
+    if let Some(v) = c.get("parent_id") {
+        slot.parent_id = id(v);
+    }
+    if let Some(v) = c.get("permission_overwrites") {
+        slot.permission_overwrites = v
+            .as_array()
+            .and_then(|a| a.iter().map(parse_overwrite).collect());
+    }
+    slot.last_message_id = get_id(c, "last_message_id").max(slot.last_message_id);
+    slot.flags = flags(c);
 }
 
 impl State {
@@ -345,6 +532,23 @@ impl State {
         permissions::can_view_channel(self.user_id?, self.guild(channel.guild_id)?, channel)
     }
 
+    /// Whether a guild channel or private channel with this id is obfuscated (I-5): such a
+    /// channel is no target for member lists, acks or menu actions.
+    pub fn is_obfuscated(&self, channel: u64) -> bool {
+        self.guilds
+            .iter()
+            .flat_map(|g| &g.channels)
+            .find(|c| c.id == channel)
+            .map(Channel::is_obfuscated)
+            .or_else(|| {
+                self.private_channels
+                    .iter()
+                    .find(|c| c.id == channel)
+                    .map(PrivateChannel::is_obfuscated)
+            })
+            .unwrap_or(false)
+    }
+
     /// Applies one dispatch; returns whether state changed (and bumps `revision`). Unknown events
     /// and unreadable payloads change nothing.
     pub(crate) fn apply(&mut self, event: &str, d: &Value) -> bool {
@@ -373,6 +577,16 @@ impl State {
             "THREAD_MEMBER_UPDATE" => self.threads.member_update(d, self.user_id),
             "THREAD_MEMBERS_UPDATE" => self.threads.members_update(d, self.user_id),
             "GUILD_MEMBER_LIST_UPDATE" => self.member_list_update(d),
+            "USER_SETTINGS_PROTO_UPDATE" => self.settings_proto_update(d),
+            "INITIAL_GUILD" => {
+                // Sent before READY; READY merges it when its own list lacks it.
+                self.initial_guild = Some(d.clone());
+                false
+            }
+            "CHANNEL_SYNC" => self.channel_sync(d),
+            "STATE_UPDATE" => self.state_update(d),
+            "VOICE_STATE_UPDATE_BATCH" => self.voice_batch(d),
+            "PASSIVE_UPDATE_V2" => self.passive_update_v2(d),
             _ => false,
         };
         if changed {
@@ -387,6 +601,9 @@ impl State {
         };
         let revision = self.revision;
         let mut users = std::mem::take(&mut self.users);
+        // A partial guild (CLIENT_STATE_V2) applies to the guild held before this READY.
+        let mut held = std::mem::take(&mut self.guilds);
+        let initial = self.initial_guild.take();
         // The selection outlives the connection: L re-arms on the SYNC after the re-send.
         let member_sub = self.member_sub.take();
         *self = State {
@@ -407,45 +624,166 @@ impl State {
         users.insert(me.id, me.clone());
         self.users = users;
         let merged = d.get("merged_members").and_then(Value::as_array);
-        for (i, raw) in d
-            .get("guilds")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .enumerate()
-        {
-            let Some(mut guild) = parse_guild(raw, Some(me.id)) else {
-                continue;
-            };
-            if self.guild(guild.id).is_some() {
-                continue;
-            }
+        for (i, raw) in items(d.get("guilds")).enumerate() {
             // `merged_members` is index-aligned with `guilds`.
-            if let Some(roles) = merged
-                .and_then(|m| m.get(i))
-                .and_then(|m| self.merged_roles(m))
-            {
-                guild.member_roles = Some(roles);
-            }
-            let gid = guild.id;
-            self.guilds.push(guild);
-            self.guild_extras(raw, gid, false);
+            self.ready_guild(raw, merged.and_then(|m| m.get(i)), &mut held, me.id);
         }
-        for raw in d
-            .get("private_channels")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
+        // After READY's own guilds, so READY's copy wins when it lists the same guild.
+        if let Some(raw) = initial {
+            self.ready_guild(&raw, None, &mut held, me.id);
+        }
+        for raw in items(d.get("private_channels")) {
             self.upsert_private(raw);
         }
         self.read.sync(d);
         self.settings.sync(d);
         self.relationships.sync(d);
-        self.guild_folders = parse_folders(d);
-        if self.guild_folders.is_none() {
-            tracing::warn!("READY carried no user_settings.guild_folders; guild order falls back to READY order");
+        // Bit 9. A missing or broken proto leaves READY applied with the settings Unknown (I-14).
+        self.user_settings = d
+            .get("user_settings_proto")
+            .and_then(Value::as_str)
+            .and_then(|b64| match UserSettings::from_base64(b64) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    tracing::warn!(error = %e, "READY user_settings_proto unreadable; settings unknown");
+                    None
+                }
+            });
+        match &self.user_settings {
+            Some(s) => {
+                self.guild_folders = Some(s.guild_folders.clone());
+                self.guild_positions = s.guild_positions.clone();
+            }
+            // Legacy `user_settings` is the fallback while the proto is unknown.
+            None => {
+                self.guild_folders = parse_folders(d);
+                self.guild_positions = ids(d
+                    .get("user_settings")
+                    .and_then(|s| s.get("guild_positions")));
+            }
         }
+        if self.guild_folders.is_none() {
+            tracing::warn!("READY carried no guild folders; guild order falls back to READY order");
+        }
+        if let Some(a) = d.get("apex_experiments").filter(|a| a.is_object()) {
+            self.apex_experiments.push(a.clone());
+        }
+        true
+    }
+
+    /// One READY guild (or the buffered INITIAL_GUILD). A partial guild applies to the guild
+    /// held before READY, else it becomes an unavailable stub (I-13).
+    fn ready_guild(&mut self, raw: &Value, merged: Option<&Value>, held: &mut Vec<Guild>, me: u64) {
+        let Some(gid) = get_id(raw, "id") else {
+            return;
+        };
+        if self.guild(gid).is_some() {
+            return;
+        }
+        let mut guild = if is_partial(raw) {
+            match held.iter().position(|g| g.id == gid) {
+                Some(at) => {
+                    let mut g = held.swap_remove(at);
+                    g.after_ready = false;
+                    apply_partial(&mut g, raw, Some(me));
+                    g
+                }
+                None => stub(gid),
+            }
+        } else {
+            match parse_guild(raw, Some(me)) {
+                Some(g) => g,
+                None => return,
+            }
+        };
+        if let Some(roles) = merged.and_then(|m| self.merged_roles(m)) {
+            guild.member_roles = Some(roles);
+        }
+        self.guilds.push(guild);
+        self.guild_extras(raw, gid, false);
+    }
+
+    /// USER_SETTINGS_PROTO_UPDATE: type 1 updates the settings (`partial` replaces the top-level
+    /// fields it carries); type 2 belongs to the frecency owner (F2) and other types are ignored.
+    /// An unreadable update keeps the previous values (I-4).
+    fn settings_proto_update(&mut self, d: &Value) -> bool {
+        let Some(s) = d.get("settings") else {
+            return false;
+        };
+        if s.get("type").and_then(Value::as_u64) != Some(1) {
+            return false;
+        }
+        let Some(b64) = s.get("proto").and_then(Value::as_str) else {
+            return false;
+        };
+        let partial = d.get("partial").and_then(Value::as_bool).unwrap_or(false);
+        let next = crate::settings_proto::decode(b64).and_then(|m| {
+            match (&self.user_settings, partial) {
+                (_, false) => UserSettings::from_message(m).map(Some),
+                (Some(held), true) => held.merged(m).map(Some),
+                // A partial update on unknown settings would read every absent field as default.
+                (None, true) => Ok(None),
+            }
+        });
+        let next = match next {
+            Ok(Some(n)) => n,
+            Ok(None) => return false,
+            Err(e) => {
+                tracing::warn!(error = %e, "USER_SETTINGS_PROTO_UPDATE unreadable; settings kept");
+                return false;
+            }
+        };
+        if self.user_settings.as_ref() == Some(&next) {
+            return false;
+        }
+        self.guild_folders = Some(next.guild_folders.clone());
+        self.guild_positions = next.guild_positions.clone();
+        self.user_settings = Some(next);
+        true
+    }
+
+    /// CHANNEL_SYNC: skipped when `integrity_check` is set; otherwise each channel merges into
+    /// the held one (or is added), as the official CHANNEL_UPDATES batcher does (I-15).
+    fn channel_sync(&mut self, d: &Value) -> bool {
+        if truthy(d.get("integrity_check")) {
+            return false;
+        }
+        let Some(guild) =
+            get_id(d, "guild_id").and_then(|g| self.guilds.iter_mut().find(|x| x.id == g))
+        else {
+            return false;
+        };
+        let mut changed = false;
+        for c in items(d.get("channels")) {
+            let Some(cid) = get_id(c, "id") else {
+                continue;
+            };
+            match guild.channels.iter_mut().find(|x| x.id == cid) {
+                Some(slot) => {
+                    let before = slot.clone();
+                    merge_present(slot, c);
+                    changed |= *slot != before;
+                }
+                None => {
+                    if let Some(channel) = parse_channel(c, guild.id) {
+                        guild.channels.push(channel);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        changed
+    }
+
+    /// STATE_UPDATE `{apex_experiments}`: kept raw for slice X.
+    fn state_update(&mut self, d: &Value) -> bool {
+        let Some(a) = d.get("apex_experiments").filter(|a| a.is_object()) else {
+            return false;
+        };
+        if self.apex_experiments.len() > MAX_APEX_UPDATES {
+            self.apex_experiments.remove(1);
+        }
+        self.apex_experiments.push(a.clone());
         true
     }
 
@@ -550,6 +888,9 @@ impl State {
     }
 
     fn guild_create(&mut self, d: &Value) -> bool {
+        if is_partial(d) {
+            return self.partial_guild_create(d);
+        }
         let Some(mut guild) = parse_guild(d, self.user_id) else {
             return false;
         };
@@ -570,21 +911,30 @@ impl State {
         true
     }
 
+    /// A partial GUILD_CREATE: applied to the held guild, else an unavailable stub (I-13).
+    fn partial_guild_create(&mut self, d: &Value) -> bool {
+        let Some(gid) = get_id(d, "id") else {
+            return false;
+        };
+        let own = self.user_id;
+        match self.guilds.iter_mut().find(|g| g.id == gid) {
+            Some(slot) => apply_partial(slot, d, own),
+            None => self.guilds.push(Guild {
+                after_ready: true,
+                ..stub(gid)
+            }),
+        }
+        self.guild_extras(d, gid, false);
+        true
+    }
+
     fn guild_update(&mut self, d: &Value) -> bool {
         let Some(guild) =
             get_id(d, "id").and_then(|id| self.guilds.iter_mut().find(|g| g.id == id))
         else {
             return false;
         };
-        if let Some(v) = guild_field(d, "name") {
-            guild.name = v.as_str().map(str::to_owned);
-        }
-        if let Some(v) = guild_field(d, "icon") {
-            guild.icon = v.as_str().map(str::to_owned);
-        }
-        if let Some(v) = guild_field(d, "owner_id") {
-            guild.owner_id = id(v);
-        }
+        merge_props(guild, d);
         if let Some(roles) = d.get("roles").and_then(Value::as_array) {
             guild.roles = Some(roles.iter().filter_map(parse_role).collect());
         }
@@ -621,16 +971,7 @@ impl State {
         ) else {
             return false;
         };
-        match guild.channels.iter_mut().find(|c| c.id == channel.id) {
-            Some(slot) => {
-                let last = channel.last_message_id.max(slot.last_message_id);
-                *slot = Channel {
-                    last_message_id: last,
-                    ..channel
-                };
-            }
-            None => guild.channels.push(channel),
-        }
+        upsert_channel(guild, channel);
         true
     }
 
@@ -668,10 +1009,7 @@ impl State {
         let Some(roles) = self.guild_roles(d) else {
             return false;
         };
-        match roles.iter_mut().find(|r| r.id == role.id) {
-            Some(slot) => *slot = role,
-            None => roles.push(role),
-        }
+        upsert_role(roles, role);
         true
     }
 
