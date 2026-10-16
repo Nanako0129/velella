@@ -138,7 +138,7 @@ Files owned in an earlier phase are free once that phase merges. N2 touches only
 | N12 `SAVED_MESSAGE_UPDATE` | Closed: updates arrive as CREATE | I |
 | N13 Apps `source`, `section_name` | Open: read before G's contract | G |
 | N14 interaction follow-up shapes | Open: read before G's contract | G |
-| Safari request headers for a page navigation and a script load (I-11) | Open: main serves a local plain-HTTP page on `localhost` that loads one script, opens it once in Safari (announced) and records both requests' headers into identify.md, before ID starts | ID |
+| Safari request headers for a page navigation and a script load (I-11), Safari's ClientHello (NET) | Done (2026-10-17, local only): identify.md "Safari capture by main" — Safari 27.0.1, JA4 `t13d2013h2_a09f3c656075_7f0f34a4126d`, navigation and script header sets; Accept-Language follows the system languages. Over-HTTPS details (br, HTTP/2 order) stay unmeasured | ID, NET |
 | Screens of dialogs, the picker, the panel | Open: captured from the official client (announced) before each UI slice's contract | UI slices |
 | `X-Fingerprint`, `X-Installation-ID` (sent when non-empty, §17.1) | Open: X's discovery says where they come from; F2 does not add them | X |
 | Query and path encoding, JSON omission, send and reply body, `X-Failed-Requests`, MFA re-auth (S-10, S-11, S-12) | Done (§18.1-§18.6): query `%20`, insertion order, null/undefined keys dropped; emoji raw in the path (`:` literal, non-ASCII percent-encoded as UTF-8); `JSON.stringify` omission; send body order; `X-Failed-Requests: N`; MFA flow. Open: the MFA modal's exact wiring (chunk 965171 absent), fetched before B's contract | F2, B |
