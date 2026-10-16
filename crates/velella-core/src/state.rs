@@ -710,8 +710,10 @@ impl State {
         let Some(s) = d.get("settings") else {
             return false;
         };
-        if s.get("type").and_then(Value::as_u64) != Some(1) {
-            return false;
+        match s.get("type").and_then(Value::as_u64) {
+            Some(1) => {}
+            Some(2) => return self.frecency_settings_update(d),
+            _ => return false,
         }
         let Some(b64) = s.get("proto").and_then(Value::as_str) else {
             return false;
@@ -740,6 +742,19 @@ impl State {
         self.guild_positions = next.guild_positions.clone();
         self.user_settings = Some(next);
         true
+    }
+
+    /// Hook for USER_SETTINGS_PROTO_UPDATE type 2 (`FrecencyUserSettings`): consumed by slice A
+    /// (frecency read and write, D3), which replaces this body. Until then the update is ignored
+    /// and leaves folders, status and every type-1 value unchanged.
+    fn frecency_settings_update(&mut self, _d: &Value) -> bool {
+        false
+    }
+
+    /// A new IDENTIFY starts a new gateway session: an INITIAL_GUILD buffered on a connection that
+    /// died before its READY belongs to no READY and is dropped, never merged later.
+    pub(crate) fn identify_started(&mut self) {
+        self.initial_guild = None;
     }
 
     /// CHANNEL_SYNC: skipped when `integrity_check` is set; otherwise each channel merges into

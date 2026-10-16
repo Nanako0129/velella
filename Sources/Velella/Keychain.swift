@@ -1,5 +1,6 @@
 import Foundation
 import Security
+import VelellaLogin
 
 /// The saved sign-in: one generic password in the file-based login keychain. Service is fixed in
 /// every build (so `swift run`, a debug binary and a bundle all share it); account = Discord user
@@ -45,6 +46,25 @@ enum Keychain {
             kSecValueData: Data(token.utf8),
         ]
         return SecItemAdd(item as CFDictionary, nil)
+    }
+
+    /// A refreshed token (menu plan ID, T-8): `SecItemUpdate` of the item matching the service and
+    /// `account`, so an item of another account is never touched and nothing is created.
+    static func update(token: String, account: String) -> OSStatus {
+        let query: [CFString: Any] = [
+            kSecClass: kSecClassGenericPassword,
+            kSecAttrService: service,
+            kSecAttrAccount: account,
+        ]
+        let change: [CFString: Any] = [kSecValueData: Data(token.utf8)]
+        return SecItemUpdate(query as CFDictionary, change as CFDictionary)
+    }
+
+    /// The real keychain behind `applyTokenRefresh`.
+    struct Updater: SignInUpdating {
+        func update(token: String, account: String) -> OSStatus {
+            Keychain.update(token: token, account: account)
+        }
     }
 
     /// Removes every item of the service (M1 keeps one account). Not found counts as success.

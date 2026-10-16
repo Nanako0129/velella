@@ -44,6 +44,8 @@ pub struct UserSettings {
     pub custom_status: Option<CustomStatus>,
     /// `voice_and_video.afk_timeout` (5.6 UInt32Value) in seconds, absent = 60.
     pub afk_timeout_s: u32,
+    /// `localization.locale` (12.1 StringValue): the account's Discord locale, as sent.
+    pub locale: Option<String>,
 }
 
 /// Standard or url-safe base64, then one bounded protobuf level.
@@ -113,6 +115,10 @@ impl UserSettings {
                 .map_or(60, |s| u32::try_from(s).unwrap_or(u32::MAX)),
             None => 60,
         };
+        let locale = match raw.message(12)? {
+            Some(l) => l.wrapper_string(1)?.filter(|l| !l.is_empty()),
+            None => None,
+        };
         let (status, status_expires_at_ms, custom) = match raw.message(11)? {
             Some(s) => (
                 s.wrapper_string(1)?,
@@ -131,6 +137,7 @@ impl UserSettings {
             status_expires_at_ms,
             custom_status: custom,
             afk_timeout_s,
+            locale,
         })
     }
 
@@ -227,6 +234,11 @@ pub(crate) mod tests {
             (6, text),
             (5, voice),
             (11, status),
+            (12, {
+                let mut l = Message::new();
+                l.push_wrapper_string(1, "zh-TW");
+                l
+            }),
         ]);
         let s = UserSettings::from_base64(&b64).unwrap();
         assert_eq!(
@@ -249,6 +261,7 @@ pub(crate) mod tests {
         assert_eq!(s.guild_positions, vec![30, 10]);
         assert!(s.developer_mode && !s.render_reactions);
         assert_eq!(s.afk_timeout_s, 300);
+        assert_eq!(s.locale.as_deref(), Some("zh-TW"));
         assert_eq!(
             (s.status.as_deref(), s.status_expires_at_ms),
             (Some("dnd"), 9_000)

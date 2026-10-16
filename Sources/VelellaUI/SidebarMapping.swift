@@ -59,4 +59,13 @@ extension ShellState {
             selectedDMID = nil
         }
     }
+
+    /// Drops the open selection when `blocked` says its conversation is not navigable (an
+    /// obfuscated channel or DM, shown as "No Access"; menu plan ID, I-5). True when it did.
+    @discardableResult
+    public mutating func dropBlockedSelection(_ blocked: (String) -> Bool) -> Bool {
+        guard let target = openTarget, blocked(target) else { return false }
+        if isDMMode { selectedDMID = nil } else { selectedChannelID = nil }
+        return true
+    }
 }
