@@ -3,8 +3,8 @@
 //! (inputs of `permissions.rs`),
 //! and Developer Mode and the reactions setting, which come from the settings ID already parses
 //! (`settings_proto.rs`). Every value is Unknown (`None`, absent) until a payload carried it.
-//! Sources: READY, READY_SUPPLEMENTAL, GUILD_CREATE, GUILD_MEMBER_UPDATE, USER_UPDATE,
-//! GUILD_EMOJIS_UPDATE; shapes from identify.md §1 (bits 4, 5, 10) and menu-requests.md §18.7.
+//! Sources: READY, READY_SUPPLEMENTAL, GUILD_CREATE, GUILD_UPDATE (`mfa_level`), GUILD_MEMBER_UPDATE,
+//! USER_UPDATE, GUILD_EMOJIS_UPDATE; shapes from identify.md §1 (bits 4, 5, 10) and menu-requests.md §18.7.
 use crate::embeds::timestamp_ms;
 use crate::state::{get_id, get_str, id, ids, own_member_roles, State};
 use serde_json::Value;
@@ -85,8 +85,8 @@ pub struct SelfState {
     pub emojis: HashMap<u64, Vec<GuildEmoji>>,
     /// Own member by guild id; a guild missing here is Unknown.
     pub members: HashMap<u64, OwnMember>,
-    /// Guild `mfa_level` by guild id; a guild missing here is Unknown. Set by READY and
-    /// GUILD_CREATE only: a later GUILD_UPDATE does not reach it.
+    /// Guild `mfa_level` by guild id; a guild missing here is Unknown. Set by READY (and the
+    /// buffered INITIAL_GUILD), GUILD_CREATE and GUILD_UPDATE.
     pub mfa_levels: HashMap<u64, u8>,
 }
 
