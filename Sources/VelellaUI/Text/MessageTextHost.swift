@@ -12,6 +12,12 @@ struct PasteboardBox: @unchecked Sendable { var board: NSPasteboard? }
 extension EnvironmentValues {
     /// The owning `MarkdownView`'s selection.
     @Entry var textCoordinator = CoordinatorBox()
+    /// The message column's selection (N2), set by `MessageArea`; a text view uses it only when
+    /// `textMessage` is set too.
+    @Entry var selectionColumn = CoordinatorBox()
+    /// The message whose body (and header) the text views below belong to. Set on a row's body only:
+    /// embeds and attachments leave it unset, so they take no part in the column's selection.
+    @Entry var textMessage: String?
     /// Where a copy goes; nil is the general pasteboard. Tests inject their own.
     @Entry var textPasteboard = PasteboardBox()
     /// Text in the secondary colour (quotes, subtext).
@@ -25,6 +31,14 @@ struct TextSource: Equatable {
 }
 
 // MARK: Representable
+
+/// Which coordinator a text view reports to and under which message: the column's for a row's
+/// body or header, else the nearest `MarkdownView`'s own (a message id of "").
+@MainActor
+func selectionTarget(_ environment: EnvironmentValues) -> (coordinator: SelectionCoordinator?, message: String) {
+    if let column = environment.selectionColumn.coordinator, let message = environment.textMessage { return (column, message) }
+    return (environment.textCoordinator.coordinator, "")
+}
 
 struct MessageTextRep: NSViewRepresentable {
     let leaves: [TextLeaf]
@@ -48,11 +62,12 @@ struct MessageTextRep: NSViewRepresentable {
             // Each URL is fetched once per run, and only from Discord's CDN (`EmojiImages.load`).
             for url in leaves.flatMap(\.imageURLs) { EmojiImages.shared.load(url) }
         }
-        let coordinator = environment.textCoordinator.coordinator
-        if view.coordinator !== coordinator || view.participant != participant {
+        let (coordinator, message) = selectionTarget(environment)
+        if view.coordinator !== coordinator || view.participant != participant || view.message != message {
             view.coordinator?.detach(view)
             view.coordinator = coordinator
             view.participant = participant
+            view.message = message
         }
         coordinator?.attach(view)
     }
@@ -69,6 +84,48 @@ struct MessageTextRep: NSViewRepresentable {
         let scale = max(context.environment.displayScale, 1)
         let height = (view.height(forWidth: width) * scale).rounded(.up) / scale
         return CGSize(width: natural ? view.naturalWidth(at: width) : width, height: height)
+    }
+}
+
+/// The header participant (N2 Headers): a text view behind the SwiftUI header, holding the name and
+/// the time with clear glyphs. It takes part in hit-testing and paints the selection, and is not an
+/// accessibility element: the SwiftUI text above it says the same.
+struct HeaderTextRep: NSViewRepresentable {
+    let name: String
+    let time: String
+    var font: DisplayNameStyle.Font?
+
+    func makeNSView(context: Context) -> MessageTextView {
+        let view = MessageTextView(frame: .zero)
+        view.isAccessible = false
+        return view
+    }
+
+    func updateNSView(_ view: MessageTextView, context: Context) {
+        view.pasteboard = context.environment.textPasteboard.board ?? .general
+        let key = name + HeaderText.separator + time + String(describing: font)
+        if view.contentKey != key {
+            view.setContent(HeaderText.content(name: name, time: time, font: font))
+            view.contentKey = key
+            view.invalidateIntrinsicContentSize()
+        }
+        let (coordinator, message) = selectionTarget(context.environment)
+        if view.coordinator !== coordinator || view.participant != PartID.headerPart || view.message != message {
+            view.coordinator?.detach(view)
+            view.coordinator = coordinator
+            view.participant = PartID.headerPart
+            view.message = message
+        }
+        coordinator?.attach(view)
+    }
+
+    static func dismantleNSView(_ view: MessageTextView, coordinator: ()) {
+        view.coordinator?.detach(view)
+    }
+
+    /// Fills the header it sits behind.
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView view: MessageTextView, context: Context) -> CGSize? {
+        CGSize(width: proposal.width ?? view.naturalWidth(at: MessageTextView.unbounded), height: proposal.height ?? DesignTokens.Message.headerLineHeight)
     }
 }
 
@@ -141,17 +198,27 @@ enum TextLeaves {
     /// The leaves numbered `limit` and later, in document order, with every rule the views keep:
     /// covered runs, the spoiler of a covered block, the code escapes.
     static func remainder(_ blocks: [MarkdownBlock], text: MarkdownText, context: RenderContext) -> [TextLeaf] {
+        leaves(blocks, from: limit, text: text, context: context)
+    }
+
+    /// Every leaf, the ones the views show one each and the remainder alike (N2 builds the parts of
+    /// rows that no view shows from these).
+    static func all(_ blocks: [MarkdownBlock], text: MarkdownText, context: RenderContext) -> [TextLeaf] {
+        leaves(blocks, from: 0, text: text, context: context)
+    }
+
+    private static func leaves(_ blocks: [MarkdownBlock], from first: Int, text: MarkdownText, context: RenderContext) -> [TextLeaf] {
         var out: [TextLeaf] = []
         var next = 0
-        collect(blocks, style: InlineStyle(), text: text, listDepth: 0, secondary: false, context: context, next: &next, into: &out)
+        collect(blocks, from: first, style: InlineStyle(), text: text, listDepth: 0, secondary: false, context: context, next: &next, into: &out)
         return out
     }
 
-    private static func collect(_ blocks: [MarkdownBlock], style: InlineStyle, text: MarkdownText, listDepth: Int, secondary: Bool,
+    private static func collect(_ blocks: [MarkdownBlock], from first: Int, style: InlineStyle, text: MarkdownText, listDepth: Int, secondary: Bool,
                                 context: RenderContext, next: inout Int, into out: inout [TextLeaf]) {
         for block in blocks {
             let n = count(block)
-            if next + n <= limit { next += n; continue }
+            if next + n <= first { next += n; continue }
             switch BlockModel(block, base: text, listDepth: listDepth) {
             case .text(let inlines, let size, let weight, let sec, _, _):
                 var sized = text
@@ -160,23 +227,23 @@ enum TextLeaves {
                 for part in InlinePart.paragraph(inlines, style: style) {
                     switch part {
                     case .inlines(let run):
-                        if next >= limit { out.append(.text(segments: sized.segments(run, style: style, context: context), size: size, weight: weight, secondary: secondary || sec)) }
+                        if next >= first { out.append(.text(segments: sized.segments(run, style: style, context: context), size: size, weight: weight, secondary: secondary || sec)) }
                         next += 1
                     case .block(let inner, let innerStyle):
-                        collect([inner], style: innerStyle, text: sized, listDepth: listDepth, secondary: secondary || sec, context: context, next: &next, into: &out)
+                        collect([inner], from: first, style: innerStyle, text: sized, listDepth: listDepth, secondary: secondary || sec, context: context, next: &next, into: &out)
                     }
                 }
             case .quote(let inner):
-                collect(inner, style: style, text: text, listDepth: listDepth, secondary: true, context: context, next: &next, into: &out)
+                collect(inner, from: first, style: style, text: text, listDepth: listDepth, secondary: true, context: context, next: &next, into: &out)
             case .list(_, let items):
                 for item in items {
-                    collect(item, style: style, text: text, listDepth: listDepth + 1, secondary: secondary, context: context, next: &next, into: &out)
+                    collect(item, from: first, style: style, text: text, listDepth: listDepth + 1, secondary: secondary, context: context, next: &next, into: &out)
                 }
             case .code(let code, let header, let highlight, let size):
-                if next >= limit { out.append(.code(code: code, header: header, highlight: highlight, size: size, hidden: style.hiddenSpoiler(revealed: text.revealed))) }
+                if next >= first { out.append(.code(code: code, header: header, highlight: highlight, size: size, hidden: style.hiddenSpoiler(revealed: text.revealed))) }
                 next += 1
             case .plainCode(let code, let size):
-                if next >= limit { out.append(.plain(code: code, size: size, hidden: style.hiddenSpoiler(revealed: text.revealed))) }
+                if next >= first { out.append(.plain(code: code, size: size, hidden: style.hiddenSpoiler(revealed: text.revealed))) }
                 next += 1
             }
         }
