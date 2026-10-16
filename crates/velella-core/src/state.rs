@@ -7,6 +7,7 @@ use crate::permissions;
 use crate::presence::Presence;
 use crate::read_state::ReadStates;
 use crate::relationships::Relationships;
+use crate::self_state::SelfState;
 use crate::settings_proto::UserSettings;
 use crate::threads::Threads;
 use crate::voice::VoiceStates;
@@ -159,6 +160,8 @@ pub struct State {
     /// Slice X: legacy experiments, guild units and info, user flags, session overrides (see
     /// `experiments.rs`). Rebuilt by READY.
     pub(crate) experiments: crate::experiments::Experiments,
+    /// Slice F1: premium type, guild emojis and the own member's timeouts. Rebuilt by READY.
+    pub self_state: SelfState,
 }
 
 /// STATE_UPDATEs kept after READY's entry; older ones are dropped first.
@@ -600,7 +603,12 @@ impl State {
             "PASSIVE_UPDATE_V2" => self.passive_update_v2(d),
             "EXPERIMENT_SESSION_OVERRIDE_CREATE" => self.session_override(d, true),
             "EXPERIMENT_SESSION_OVERRIDE_DELETE" => self.session_override(d, false),
-            "USER_UPDATE" => self.user_flags_update(d),
+            "GUILD_EMOJIS_UPDATE" => self.self_state.emojis_update(d),
+            // X keeps the staff flag (Translate), F1 `premium_type` and `mfa_enabled`; both run.
+            "USER_UPDATE" => {
+                let flags = self.user_flags_update(d);
+                self.self_state.user_update(d, self.user_id) | flags
+            }
             _ => {
                 known = false;
                 false
@@ -686,6 +694,7 @@ impl State {
             self.apex_experiments.push(a.clone());
         }
         self.experiments.ready(d);
+        self.self_state.ready(d);
         true
     }
 
@@ -719,6 +728,7 @@ impl State {
             guild.member_roles = Some(roles);
         }
         self.guilds.push(guild);
+        self.self_state.ready_guild(raw, merged, me);
         self.guild_extras(raw, gid, false);
     }
 
@@ -850,6 +860,7 @@ impl State {
                 changed = true;
             }
         }
+        self.self_state.ready_supplemental(d, self.user_id);
         // Voice occupants (and threads, when present) per guild; the roles loop above skips a guild
         // without a usable merged member, so this walks the guilds again on their own.
         for raw in d
@@ -923,6 +934,7 @@ impl State {
 
     fn guild_create(&mut self, d: &Value) -> bool {
         self.experiments.guild(d);
+        self.self_state.guild_create(d, self.user_id);
         if is_partial(d) {
             return self.partial_guild_create(d);
         }
@@ -965,6 +977,7 @@ impl State {
 
     fn guild_update(&mut self, d: &Value) -> bool {
         self.experiments.guild(d);
+        self.self_state.guild_update(d);
         let Some(guild) =
             get_id(d, "id").and_then(|id| self.guilds.iter_mut().find(|g| g.id == id))
         else {
@@ -1062,6 +1075,7 @@ impl State {
     }
 
     fn self_member_update(&mut self, d: &Value) -> bool {
+        self.self_state.member_update(d, self.user_id);
         let (Some(own), Some(gid)) = (self.user_id, get_id(d, "guild_id")) else {
             return false;
         };

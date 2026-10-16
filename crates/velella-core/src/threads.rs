@@ -18,6 +18,13 @@ pub struct Thread {
     pub archived: bool,
     pub last_message_id: Option<u64>,
     pub joined: bool,
+    /// Whether `thread_metadata.archived` was present: `archived` is false otherwise, which
+    /// then says nothing (F1).
+    pub archived_known: bool,
+    /// `thread_metadata.locked`; `None` when the metadata or the key was absent (F1).
+    pub locked: Option<bool>,
+    /// Channel type: 10 announcement thread, 11 public, 12 private (F1).
+    pub kind: u8,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -43,7 +50,14 @@ fn parse(v: &Value, default_guild: Option<u64>) -> Option<Thread> {
             .get("member")
             .or_else(|| v.get("thread_member"))
             .is_some_and(Value::is_object),
+        archived_known: metadata_bool(v, "archived").is_some(),
+        locked: metadata_bool(v, "locked"),
+        kind: u8::try_from(v.get("type")?.as_u64()?).ok()?,
     })
+}
+
+fn metadata_bool(v: &Value, key: &str) -> Option<bool> {
+    v.get("thread_metadata")?.get(key)?.as_bool()
 }
 
 impl Threads {
