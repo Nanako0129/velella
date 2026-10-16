@@ -1,4 +1,4 @@
-# velella Selection and Copy Plan (revision 1.2)
+# velella Selection and Copy Plan (revision 2)
 
 Repo: /Users/nanako/side-project/velella, branch `m1`. `docs/plans/markdown.md` still applies: its F5 rendering rules, link confirmation, spoiler and bidi rules, and every K/T/P contract this plan moves to a new renderer. The ground truth is `docs/element-map.md` (captures in git-excluded `refs/`).
 
@@ -99,17 +99,54 @@ Revision 1.1 folds in the plan review of rev 1 (REVISE, 7 blockers) and the secu
 | U3 | Every N0-16 drag case the harness could not drive, on the same spike build | Main |
 | E1 | Official client: does ⌘C of a selection keep the author's U+001B and U+202E? **Done 2026-10-15:** keeps U+001B and U+202C; U+202E never arrives (stripped by the server) | Main + user |
 
-## N1 — Message text on TextKit 2 (SECURITY slice), outline
+## Revision 2 (after N0; the user chose B)
 
-Each message's text renders through the view chosen under D6, in the block layout N0-3 picks; a code block keeps its Vencord chrome with its code in its own text view. Every behaviour of K2-K4, T1, P1 and K6's view carries over: fonts and the 22 pt line box, mention and inline-code fills, link routing through `LinkRouter` (S-3), spoiler covers that never draw hidden glyphs (S-1, S-2, S-10) with click-to-reveal and hidden links inert, custom emoji through `EmojiImages`' allow-list (S-17), timestamp tips and relative refresh, bidi isolation, accessibility that never exposes hidden text (S-4), quote bars, list markers, the trailing-break rule. Selection within a message and ⌘C per D2 and D4, through AppKit's own copy paths (S-6). With A, the defaults in S-5 are off. Tests that drive SwiftUI `Text` today (`renderingATippedSegmentRecordsItsFrame`, `pillFillsAndSpoilerCoversDrawUnderTheRenderer`, `theDrawnParagraphSpeaksItsLabelNotHiddenText`, the MessageLayout geometry tests, the MarkdownBlock pixel tests, `copyShowsOnHoverAndIsAbsentWhileCovered`, the header height tests, the Polish line-height tests) move to the hosted-window pixel method N0 proves, with the same assertions. Contract fixed in revision 2.
+N0 (5e521f6, kept on branch `spike/n0-textkit2`) measured both prototypes; the user chose **B** and accepted the spike window (2026-10-16). Revision 2 turns the outlines into contracts. **Order and owners:** **N1** (pilotfish:security-executor) and **C1** (pilotfish:security-executor) run in parallel worktrees from m1; **N2** (pilotfish:executor) starts after N1 merges; main wires C1's link and selection items to N1/N2 when both are in. **Process (user, 2026-10-15):** one plan review and one security review of this revision together, then start; each slice gets a fresh pilotfish:verifier.
 
-## N2 — Selection across messages, outline
+The spike code is a reference, not a merge source: executors port what they use into production files (`Sources/VelellaUI/Text/`), keeping the techniques N0 proved, and delete nothing from the spike branch.
 
-A `SelectionCoordinator` per message column keeps the selection as model positions (message id, part, UTF-16 offset), so rows can leave and re-enter the `LazyVStack`. Participants: each row's header (N0-16 technique) and its body parts. It tracks the drag itself, autoscrolls at the column's edges, paints each visible participant's sub-range, clears on a click elsewhere, builds ⌘C per D2-D4, drops a part whose message content changed or left the store, and clamps offsets (S-9). A code block part copies its displayed text or maps through the escape table (S-15). Contract fixed in revision 2.
+## N1 — Message text on B (SECURITY slice)
 
-## C1 — Discord-layout glass menu (SECURITY slice), outline
+| Part | Contract |
+|---|---|
+| View | `MessageTextView`: an `NSView` driving its own `NSTextLayoutManager` + `NSTextContentStorage` (N0's B); no `NSTextView`, no `NSLayoutManager`. An `NSViewRepresentable` hosts it. |
+| Block layout | N0-3 (b): today's SwiftUI block layout stays (quote bars, list markers, block gaps, `BlockList`/`BlockView`); each text block (paragraph, heading, subtext, list item text) is one `MessageTextView`; a code block keeps its Vencord chrome with its code in one `MessageTextView`. |
+| Metrics | N0-2/N0-3 technique: min = max line height (T1's box), the fragment lifts glyphs by `lineHeight - ceil(natural)`, the representable reports its first baseline for `.firstTextBaseline`, heights round to the display scale. Pass: the current MessageLayout, MarkdownBlock, Polish and CodeBlock geometry assertions, unchanged in value, against hosted-window renders. |
+| Content | Built from velella's AST through `MarkdownText`'s segments with `NSAttributedString(string:attributes:)` only; no importer, no `AttributedString(markdown:)`. Mention and inline-code fills, link styling, fonts and colours as today; the inline-code border T1 could not draw (F3) is drawn now. |
+| Links | No `.link` and no URL value in storage: a private attribute holds the link or spoiler index; a click resolves the character under the pointer inside a segment frame (N0-14) and calls `LinkRouter.handle(MarkdownText.linkURL(n) or spoilerURL(n))`; a drag starting on a link opens nothing. |
+| Spoilers | Hidden runs come from `Segment.covered`. Layer 1: the fragment clips out hidden segment rects and fills the cover; layer 2: hidden glyph attributes are clear. Covers are computed at draw time from the current storage; the storage is replaced when `content` or `revealed` changes. A hidden code block stays under today's `SpoilerCover` (`.hidden()` removes it from drawing and accessibility, N0-7/N0-10). |
+| Emoji | `NSTextAttachment` subclass with no file wrapper, contents or cell; image from `EmojiImages.loaded`; bounds 18 × 18 at y −3.375 so the line keeps 22 (today's +2 pt growth goes away); swapped in when loaded. |
+| Hover tips | The view's own tracking area; the character under the pointer → its tip → a rect converted from TK2's line-box segment to the font's ascent + descent; shown at once through `TooltipOverlay` (P1 follow-up). Relative timestamps refresh as today (`RefreshSchedule`). |
+| Accessibility | Each text view exposes static text whose value is `ParagraphView.spoken`'s text; no range-based text API returns stored text; hidden spoiler text appears in no accessibility output (N0-10 walk, kept as a test). |
+| Selection and copy | A `SelectionCoordinator` (N0-16 prototype) spans the text views of one message: drag selects across its blocks; ⌘C (`copy:` to the coordinator) writes D2's text through `CopyFeedback.copy` to an injected pasteboard (`.string` plus AppKit's own alias only); hidden spoiler text is included without a trailing newline; substituted runs (mentions, channels, roles) emit their raw text from a private attribute (S-14); code text copies as displayed or maps through the escape table (S-15); the author's characters are copied unchanged (E1: U+001B survives). Selection colour: the system's selected-text background, unemphasized when the window is not key. |
+| Defaults | B has none of NSTextView's: `menu(for:)` returns nil until C1's hook; `quickLook(with:)`, `validRequestor` return nothing. |
+| Limits | At most 64 code-block views per message; later code blocks render as plain monospace text in one view (N0-6: each block view costs ~2.4 ms). Every N0-6 adversarial row's first frame ≤ 1 s and ≤ 2× today in release; the N0-6 corpus ≤ 1.5× today on both metrics. |
+| Tests | Port the N0 harness (offscreen window subclass with asserted key state, `cacheDisplay` pixels, injected pasteboard, `NSPasteboard.general.changeCount` unchanged). Move the tests that drove SwiftUI `Text` (`renderingATippedSegmentRecordsItsFrame`, `pillFillsAndSpoilerCoversDrawUnderTheRenderer`, `theDrawnParagraphSpeaksItsLabelNotHiddenText`, the MessageLayout geometry tests, the MarkdownBlock pixel tests, `copyShowsOnHoverAndIsAbsentWhileCovered`, the header height and Polish line-height tests) to the new view with the same assertions. Keep N0-7's four-state cover test with both single-layer mutations, N0-10's walk, N0-12's pasteboard test, N0-13's link tests, N0-15's edit-under-selection and cover tests, the E1 ESC copy test, the 64-block limit and the adversarial bound. |
+| Mutants (verifier) | no clip (layer 1), no clear glyphs (layer 2), `.link` in storage, nearest-character hit instead of segment frames, hidden text in the spoken value, RTF on the pasteboard, a stale cover after an edit, no 64-block limit |
 
-Right-click anywhere on a message row opens a glass panel at the cursor in Discord's layout (D5): Copy ⌘C (selection only), Copy Text, Copy Message Link, Copy Message ID; on a visible link under the pointer (S-13), Copy Link and Open Link. The menu captures the message id, raw content and `LinkTarget` when it opens and is dismissed by a body change, a channel switch or a scroll (S-8). Open Link calls that row's `LinkRouter.handle(MarkdownText.linkURL(n))`, never the opener. Copy Message Link and Copy Message ID appear only for sent messages whose ids pass `UInt64(_:)`, built from the snapshot's channel and guild (`@me` for a DM) (S-11). The menu is the key responder while open; Escape and dismissal restore the previous responder; no key reaches the composer (S-7); the dismissing click is consumed and menu actions ignore key repeats (S-16). With A, `menu(for:)` and `accessibilityPerformShowMenu` open this menu (S-5). Pasteboard per D4. Contract fixed in revision 2.
+## N2 — Selection across messages (after N1)
+
+| Part | Contract |
+|---|---|
+| Model | The coordinator moves up to the message column and keeps the selection as model positions (message id, part, UTF-16 offset), so rows leave and re-enter the `LazyVStack`; a part whose message content changed or left the store is dropped and offsets are clamped (S-9). |
+| Headers | N0-16 technique: the SwiftUI header (styled name, time, tooltip) stays; a transparent-glyph `MessageTextView` behind it takes part in hit-testing and paints the selection. ⌘C emits `name⏎ — time⏎` for a message entered from above (D3). |
+| Drag | The coordinator tracks the drag, autoscrolls at the column's edges (a timer while the pointer stays past the edge) and survives the origin row being recycled; a click elsewhere clears. |
+| Copy | D2-D4 across messages; one newline between messages; plain text only. |
+| Tests | N0-16's cases (body to body, recycled-origin autoscroll, ⌘C text with headers), edit/delete under a selection, the SwiftUI handlers U3 lists (gutter time hover, spoiler tap, code Copy, header tooltip) where a hosted test can observe them, else main's live check. |
+
+## C1 — Discord-layout glass menu (SECURITY slice, parallel with N1)
+
+| Part | Contract |
+|---|---|
+| Panel | A borderless key panel at the cursor with Discord's layout on glass: rows of 36 pt pitch (D5), label row min-height 32, padding 8, item radius 2, separators 1 pt with 8 above and below, SF Symbols at the capture's size, the danger colour reserved; widths from the capture. |
+| Items | Reply (sent messages only; sets the reply bar's target, `ReplyPreview(messageID:)`, which turns on track R's sending), Copy Text (the raw `content`, D1), Copy Message Link (`https://discord.com/channels/<guild id or @me>/<channel id>/<message id>`), Copy Message ID; plus, when the caller supplies them, Copy ⌘C (a selection) and Copy Link / Open Link (a visible link under the pointer). Sections and order follow `e0-menu-other.png`; items velella cannot do yet are absent. |
+| Ids | Copy Message Link and Copy Message ID appear only for sent messages whose message, channel and guild ids pass `UInt64(_:)`, re-formatted with `String(_:)`, taken from the snapshot that produced the row; `@me` for a DM (S-11). |
+| Capture and dismissal | The menu captures the message id, raw content and `LinkTarget` at open; a body change, a channel switch or a scroll dismisses it (S-8). Open Link calls that row's `LinkRouter.handle(MarkdownText.linkURL(n))`, never an opener. |
+| Focus | The panel is the key responder while open; Escape, an outside click or an action restores the previous responder; the dismissing click is consumed; no key reaches the composer; actions ignore key repeats (S-7, S-16). |
+| Trigger | Right-click anywhere on a message row (today's SwiftUI rows); after N1 merges, main routes `MessageTextView`'s right-click to the same presenter with the link and selection under the pointer. |
+| Pasteboard | Through `CopyFeedback.copy` to an injected pasteboard; plain text only (D4). |
+| Tests | Item sets for a sent message, an echo (no Reply, link or ID items), a DM (`@me`); id rejection (`"m1"`, `""`, an echo nonce); the link regex; Copy Text exact bytes; capture then body change dismisses; Open Link goes through the router (masked → confirmation); keyboard: Down + Return runs the item and a focused composer with a draft never sends (`onSend` not called); Escape restores focus; layout values against D5. |
+| Mutants (verifier) | Return reaching the composer, link resolved at choose time instead of open time, ids not checked, Open Link calling the opener directly, RTF on the pasteboard |
 
 ## Security dispositions (security review of rev 1, 93f2cb3)
 
