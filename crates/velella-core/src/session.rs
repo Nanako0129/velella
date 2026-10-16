@@ -10,7 +10,7 @@
 //! Logging policy: tracing records op codes and event names only, never payloads or the token.
 use crate::{
     compression::{DecodeError, Decoder, MAX_GATEWAY_WIRE},
-    experiments::{Gate, MenuGate},
+    experiments::{gate_lines, Gate, MenuGate},
     gateway::{backoff, close_action, jitter_ms, member_frames, validated_resume_url, CloseAction},
     identify::{
         self, normal_capabilities, now_ms, obfuscated_capabilities, AppState, Identity, Launch,
@@ -21,7 +21,7 @@ use crate::{
     local_presence::{local_presence, EmojiLookup, LocalPresence},
     messages::MessageStore,
     rest::{Rest, TokenSlot},
-    state::{MemberSub, State},
+    state::{get_id, MemberSub, State},
     token::Token,
     transport::{Frame, Received, Transport, WebSocket, WebSocketRequest},
 };
@@ -208,9 +208,14 @@ impl Shared {
     fn apply(&self, event: &str, d: &Value) -> bool {
         let user_id;
         let known;
+        let mut initial = None;
         let changed = {
             let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
             let changed;
+            if event == "READY" {
+                // The buffered INITIAL_GUILD is consumed by READY; the gate line names its gates.
+                initial = guard.initial_guild.as_ref().and_then(|g| get_id(g, "id"));
+            }
             (changed, known) = Arc::make_mut(&mut guard).apply_known(event, d);
             if changed {
                 self.revision.send_replace(guard.revision);
@@ -235,6 +240,16 @@ impl Shared {
         }
         let handled = known || MessageStore::observes(event) || event == "TYPING_START";
         diagnose(self.rest.identity().launch(), event, d, handled);
+        if changed && event == "READY" {
+            // The live check of slice X: Unknown on a gate whose inputs READY carries is a shape
+            // mismatch. Names and states only.
+            let launch = self.rest.identity().launch();
+            let (gates, guild_gates) = gate_lines(&self.snapshot(), initial);
+            launch.diagnose_once("GATES", || gates);
+            if let Some(line) = guild_gates {
+                launch.diagnose_once("GUILD_GATES", || line);
+            }
+        }
         changed
     }
 }

@@ -801,3 +801,67 @@ fn ready_replaces_everything_a_previous_one_loaded() {
         Gate::Unknown
     );
 }
+
+#[test]
+fn a_guild_update_flips_the_guild_gates() {
+    let mut s = synthetic(vec![guild(B, &[])]);
+    let gate = |s: &State| s.menu_gate(MenuGate::OfficialMessage, Some(B));
+    assert_eq!(gate(&s), Gate::Disabled);
+    // A feature added (CLIENT_STATE_V2 shape: under `properties`).
+    s.apply("GUILD_UPDATE", &guild(B, &["VERIFIED"]));
+    assert_eq!(gate(&s), Gate::Enabled);
+    // A feature removed.
+    s.apply("GUILD_UPDATE", &guild(B, &["COMMUNITY"]));
+    assert_eq!(gate(&s), Gate::Disabled);
+    // The top-level shape works too, and an update without `features` keeps what was held.
+    s.apply(
+        "GUILD_UPDATE",
+        &json!({"id": B.to_string(), "features": ["VERIFIED"]}),
+    );
+    assert_eq!(gate(&s), Gate::Enabled);
+    s.apply(
+        "GUILD_UPDATE",
+        &json!({"id": B.to_string(), "properties": {"name": "n"}}),
+    );
+    assert_eq!(gate(&s), Gate::Enabled);
+    // moderator_reporting changes.
+    let report = |s: &State| s.menu_gate(MenuGate::ReportToModerators, Some(B));
+    assert_eq!(report(&s), Gate::Disabled);
+    let mut on = guild(B, &["VERIFIED"]);
+    on["properties"]["moderator_reporting"] =
+        json!({"moderator_reporting_enabled": true, "moderator_report_channel_id": "9"});
+    s.apply("GUILD_UPDATE", &on);
+    assert_eq!(report(&s), Gate::Enabled);
+    s.apply("GUILD_UPDATE", &guild(B, &["VERIFIED"]));
+    assert_eq!(report(&s), Gate::Disabled);
+}
+
+#[test]
+fn a_guild_that_arrives_only_as_initial_guild_is_known_after_ready() {
+    let tuple = official(
+        verified_pops(),
+        json!([]),
+        Value::Null,
+        (Value::Null, Value::Null),
+    );
+    let mut s = State::default();
+    assert!(!s.apply("INITIAL_GUILD", &guild(B, &["VERIFIED"])));
+    assert!(s.apply(
+        "READY",
+        &json!({"user": {"id": "1", "flags": 0}, "guilds": [], "private_channels": [],
+                "guild_experiments": [tuple]})
+    ));
+    assert_eq!(
+        s.menu_gate(MenuGate::OfficialMessage, Some(B)),
+        Gate::Enabled
+    );
+    assert_eq!(
+        s.menu_gate(MenuGate::ReportToModerators, Some(B)),
+        Gate::Disabled
+    );
+    // A guild neither READY nor INITIAL_GUILD carried stays unknown.
+    assert_eq!(
+        s.menu_gate(MenuGate::OfficialMessage, Some(A)),
+        Gate::Unknown
+    );
+}

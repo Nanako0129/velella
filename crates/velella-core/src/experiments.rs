@@ -419,7 +419,8 @@ fn parse_legacy<T>(
 }
 
 impl Experiments {
-    /// READY: the legacy arrays, the user's flags and every guild it lists.
+    /// READY: the legacy arrays and the user's flags. The guilds come through `guild`, called from
+    /// `ready_guild` for READY's own and for the buffered INITIAL_GUILD.
     pub(crate) fn ready(&mut self, d: &Value) {
         self.flags = d
             .get("user")
@@ -431,17 +432,9 @@ impl Experiments {
         self.guild_exps = d
             .get("guild_experiments")
             .and_then(|l| parse_legacy(l, parse_guild_exp));
-        for g in d
-            .get("guilds")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            self.guild(g);
-        }
     }
 
-    /// A guild object (READY, GUILD_CREATE, full or partial): its apex unit, and its info when the
+    /// A guild object (READY, INITIAL_GUILD, GUILD_CREATE, GUILD_UPDATE, full or partial): its apex unit, and its info when the
     /// payload carries the guild's own fields (a partial guild without them keeps what was held).
     pub(crate) fn guild(&mut self, d: &Value) {
         let Some(gid) = get_id(d, "id") else {
@@ -899,4 +892,40 @@ impl State {
         self.experiments.flags = Some(flags);
         true
     }
+}
+
+/// The two names-only lines of the live check (`diagnose_once`, menu plan X): every gate's state
+/// for the account, then the guild gates for `initial` (the buffered INITIAL_GUILD) or else the
+/// first guild held. Gate names and states only: no ids, names, config values or buckets.
+pub(crate) fn gate_lines(state: &State, initial: Option<u64>) -> (String, Option<String>) {
+    let account = [
+        ("Translate", MenuGate::Translate),
+        ("TidaWebform", MenuGate::TidaWebform),
+        ("BookmarksV1", MenuGate::BookmarksV1),
+        ("BookmarksV2", MenuGate::BookmarksV2),
+        ("BookmarksVisible", MenuGate::BookmarksVisible),
+        ("ChannelObfuscation", MenuGate::ChannelObfuscation),
+    ];
+    let line = |prefix: &str, gates: &[(&str, MenuGate)], guild: Option<u64>| {
+        let states: Vec<String> = gates
+            .iter()
+            .map(|(name, g)| format!("{name}={:?}", state.menu_gate(*g, guild)))
+            .collect();
+        format!("{prefix} {}", states.join(" "))
+    };
+    let guild = initial.or_else(|| state.guilds.first().map(|g| g.id));
+    (
+        line("GATES", &account, None),
+        guild.map(|g| {
+            line(
+                "GUILD_GATES",
+                &[
+                    ("ViewConversation", MenuGate::ViewConversation),
+                    ("OfficialMessage", MenuGate::OfficialMessage),
+                    ("ReportToModerators", MenuGate::ReportToModerators),
+                ],
+                Some(g),
+            )
+        }),
+    )
 }

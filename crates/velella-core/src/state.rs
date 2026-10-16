@@ -698,6 +698,7 @@ impl State {
         if self.guild(gid).is_some() {
             return;
         }
+        self.experiments.guild(raw);
         let mut guild = if is_partial(raw) {
             match held.iter().position(|g| g.id == gid) {
                 Some(at) => {
@@ -963,6 +964,7 @@ impl State {
     }
 
     fn guild_update(&mut self, d: &Value) -> bool {
+        self.experiments.guild(d);
         let Some(guild) =
             get_id(d, "id").and_then(|id| self.guilds.iter_mut().find(|g| g.id == id))
         else {
