@@ -42,6 +42,12 @@ private struct Files: Sendable {
             mtimeNs: Int64(st.st_mtimespec.tv_sec) * 1_000_000_000 + Int64(st.st_mtimespec.tv_nsec))
     }
 
+    func makeDirectory() throws -> URL {
+        let directory = root.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        return directory
+    }
+
     func write(_ data: Data, _ name: String) throws -> URL {
         let directory = root.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -84,7 +90,7 @@ private struct Files: Sendable {
     var services: AttachmentServices {
         let files = files
         return AttachmentServices(
-            identity: files.identity, write: files.write, remove: files.remove,
+            identity: files.identity, write: files.write, remove: files.remove, makeDirectory: files.makeDirectory,
             limits: { [self] conversation, sizes, stage in
                 limitCalls.append((conversation, sizes, stage))
                 return limit(sizes, stage)
@@ -110,6 +116,7 @@ private struct Files: Sendable {
     var premium: UInt8? = 2
     var messages: [MessageItem] = []
     var sentTexts: [String] = []
+    var opened: [URL] = []
 }
 
 private struct Host: View {
@@ -125,6 +132,9 @@ private struct Host: View {
             premiumType: model.premium,
             attachmentQueues: Binding(get: { model.queues }, set: { model.queues = $0 }),
             attachPermission: model.permission, attachmentServices: services, attachmentController: controller)
+            // What ShellView puts around the whole window.
+            .attachmentDropTarget(controller, conversation: "1", name: "general")
+            .environment(\.openURL, OpenURLAction { model.opened.append($0); return .handled })
     }
 }
 
@@ -332,12 +342,29 @@ private func queued(_ name: String, size: UInt64 = 10, contentType: String = "",
     #expect(rig.fake.limitCalls.allSatisfy { $0.stage == .add && $0.conversation == "1" })
 }
 
-@MainActor @Test func aBrokenLimitAddsNothingAndShowsTheOfficialAlert() async throws {
+@Test func theUpsellSizesFollowTheOfficialFormatter() {
+    // `formatFileSize(bytes / 1024, {useKibibytes: true})` with no `useSpace`: whole MB rounded up,
+    // whole GB from 1024 MB, no space.
+    #expect(AttachmentAlert.upsellSize(20_971_520) == "20MB")
+    #expect(AttachmentAlert.upsellSize(20_971_521) == "21MB")
+    #expect(AttachmentAlert.upsellSize(52_428_800) == "50MB")
+    #expect(AttachmentAlert.upsellSize(524_288_000) == "500MB")
+    #expect(AttachmentAlert.upsellSize(1_073_741_824) == "1GB")
+    #expect(AttachmentAlert.upsellSize(1_610_612_736) == "2GB")
+}
+
+@Test func eachLimitHasTheOfficialAlertCopy() {
+    let upsell = "The max file size is %@. Upgrade to Discord Nitro to upload files up to 500MB."
     let cases: [(UInt8?, AttachmentLimit, String, String, Bool)] = [
-        (nil, .fileTooLarge(limit: 20_971_520), "Your files are too powerful", "Max file size is 20 MB please.", true),
-        (1, .fileTooLarge(limit: 52_428_800), "Your files are too powerful", "Max file size for Nitro Classic is 50 MB please.", true),
+        // Anyone but a Nitro user gets the upsell modal for a file over its limit.
+        (nil, .fileTooLarge(limit: 20_971_520), "Uh oh, this file exceeds the size limit.", String(format: upsell, "20MB"), true),
+        (1, .fileTooLarge(limit: 52_428_800), "Uh oh, this file exceeds the size limit.", String(format: upsell, "50MB"), true),
+        (3, .fileTooLarge(limit: 52_428_800), "Uh oh, this file exceeds the size limit.", String(format: upsell, "50MB"), true),
+        // A Nitro user gets the plain modal.
         (2, .fileTooLarge(limit: 524_288_000), "Your files are too powerful", "Max file size is 500 MB please.", false),
-        (nil, .totalTooLarge(limit: 524_288_000), "Your files are too powerful", "Total message size must be less than 500 MB", true),
+        // The total has no upsell for anyone (the official call passes no showPremiumUpsell).
+        (nil, .totalTooLarge(limit: 524_288_000), "Your files are too powerful", "Total message size must be less than 500 MB", false),
+        (2, .totalTooLarge(limit: 1_073_741_824), "Your files are too powerful", "Total message size must be less than 1 GB", false),
         (2, .emptyFile, "Upload Failed", "File cannot be empty", false),
         (nil, .tooManyFiles(limit: 10), "Too many uploads!", "You can only upload 10 files at a time!", false),
     ]
@@ -345,7 +372,10 @@ private func queued(_ name: String, size: UInt64 = 10, contentType: String = "",
         let alert = AttachmentAlert(for: limit, premiumType: premium)
         #expect(alert == AttachmentAlert(title: title, message: message, showsUpsell: upsell), "\(limit) \(String(describing: premium))")
     }
-    // On screen: the alert is a sheet with the copy, "Okay", and for the others "Learn more".
+    #expect(AttachmentAlert.upsellPrimary == "Get Nitro" && AttachmentAlert.upsellSecondary == "View All Nitro Perks" && AttachmentAlert.dismiss == "Got It")
+}
+
+@MainActor @Test func aBrokenLimitAddsNothingAndShowsTheAlertWithItsOfficialButtons() async throws {
     for premium in [UInt8?.none, 2] {
         let rig = await Rig(premium: premium)
         rig.fake.limit = { _, _ in .fileTooLarge(limit: 10_485_760) }
@@ -353,10 +383,22 @@ private func queued(_ name: String, size: UInt64 = 10, contentType: String = "",
         await rig.controller.dropped([a], shift: false, conversation: "1")
         #expect(rig.queue.isEmpty, "nothing is added")
         let shown = await rig.alertTexts()
-        #expect(shown.contains("Okay"), "\(shown)")
-        #expect(shown.contains { $0.hasPrefix("Max file size is 10 MB please.") }, "\(shown)")
-        #expect(shown.contains("Learn more") == (premium == nil), "\(shown)")
-        #expect(shown.contains { $0.contains(AttachmentAlert.upsellCopy) } == (premium == nil), "\(shown)")
+        if premium == nil {
+            #expect(shown.contains("Uh oh, this file exceeds the size limit."), "\(shown)")
+            #expect(shown.contains { $0 == "The max file size is 10MB. Upgrade to Discord Nitro to upload files up to 500MB." }, "\(shown)")
+            #expect(shown.contains("Get Nitro") && shown.contains("View All Nitro Perks") && shown.contains("Close") && !shown.contains("Got It"), "\(shown)")
+            // Both Nitro buttons lead to the Nitro page.
+            func button(_ title: String) -> NSButton? {
+                func find(_ view: NSView) -> NSButton? { (view as? NSButton).flatMap { $0.title == title ? $0 : nil } ?? view.subviews.lazy.compactMap(find).first }
+                return find(rig.window.attachedSheet!.contentView!)
+            }
+            try #require(button("View All Nitro Perks")).performClick(nil)
+            #expect(rig.model.opened == [MessageLength.nitroURL])
+        } else {
+            #expect(shown.contains("Your files are too powerful") && shown.contains("Got It"), "\(shown)")
+            #expect(shown.contains { $0.hasPrefix("Max file size is 10 MB please.") }, "\(shown)")
+            #expect(!shown.contains("Get Nitro") && !shown.contains("View All Nitro Perks"), "\(shown)")
+        }
         if let sheet = rig.window.attachedSheet { rig.window.endSheet(sheet) }
     }
 }
@@ -437,10 +479,14 @@ private final class FakeDrag: NSObject, NSDraggingInfo {
 }
 
 /// The view SwiftUI registers for `onDrop`, and a drag of `files` over it.
-@MainActor private func drag(_ rig: Rig, files: [URL]) throws -> (target: NSView, info: FakeDrag) {
+@MainActor private func drag(_ rig: Rig, files: [URL], promised: Bool = false) throws -> (target: NSView, info: FakeDrag) {
     func find(_ view: NSView) -> NSView? { view.registeredDraggedTypes.isEmpty ? view.subviews.lazy.compactMap(find).first : view }
     let board = TextHarness.board()
-    board.writeObjects(files as [NSURL])
+    if !files.isEmpty { board.writeObjects(files as [NSURL]) }
+    if promised {
+        // What a promising drag (Photos, Mail) carries instead of file URLs.
+        for type in NSFilePromiseReceiver.readableDraggedTypes { board.setString("public.data", forType: NSPasteboard.PasteboardType(type)) }
+    }
     return (try #require(find(rig.window.contentView!)), FakeDrag(board: board, window: rig.window))
 }
 
@@ -493,6 +539,241 @@ private final class FakeDrag: NSObject, NSDraggingInfo {
         await settle(rig.host, 4)
         #expect(rig.queue.isEmpty && rig.fake.sent.isEmpty, "\(permission)")
     }
+}
+
+// MARK: The whole window is the drop target (OA A27, D12a)
+
+@MainActor @Observable private final class WindowModel {
+    var state: ShellState
+    init(_ state: ShellState) { self.state = state }
+}
+
+private struct WindowHost: View {
+    let model: WindowModel
+    let services: AttachmentServices
+    var body: some View {
+        ShellView(state: Binding(get: { model.state }, set: { model.state = $0 }), attachments: services)
+    }
+}
+
+@MainActor private final class WindowRig {
+    let fake = Fake()
+    let model: WindowModel
+    let host: NSHostingView<WindowHost>
+    let window: TextWindow
+
+    init(permission: AttachPermission) async {
+        var state = ShellState(
+            rail: [.guild(RailGuild(id: "g", name: "G", icon: .initials("G")))], selectedRailID: "g",
+            categories: [ChannelCategory(id: "c", name: nil, channels: [ChannelItem(id: "1", name: "general")])], selectedChannelID: "1")
+        state.attachPermission = permission
+        state.messageLoad = .loaded
+        state.premiumType = 2
+        model = WindowModel(state)
+        (host, window) = TextHarness.hosting(WindowHost(model: model, services: fake.services), size: CGSize(width: 1300, height: 800))
+        await settle(host, 10)
+    }
+
+    var queue: [QueuedAttachment] { model.state.attachmentQueues["1"] ?? [] }
+
+    /// The view SwiftUI registers for the window's `onDrop`: the only one, and the window's size.
+    var target: NSView {
+        get throws {
+            func all(_ view: NSView) -> [NSView] { (view.registeredDraggedTypes.isEmpty ? [] : [view]) + view.subviews.flatMap(all) }
+            // SwiftUI's destination view of the window-level onDrop: the one as large as the window.
+            let views = all(window.contentView!).filter { $0.frame.size == window.contentView!.frame.size }
+            return try #require(views.first, "\(all(window.contentView!).map { $0.frame })")
+        }
+    }
+
+    func drag(files: [URL]) throws -> FakeDrag {
+        let board = TextHarness.board()
+        board.writeObjects(files as [NSURL])
+        return FakeDrag(board: board, window: window)
+    }
+}
+
+@MainActor @Test func aDragOverTheWindowDimsTheRailTheSidebarAndTheColumnUnderTheDropCard() async throws {
+    let rig = await WindowRig(permission: .allowed)
+    let target = try rig.target
+    #expect(target.frame.size == CGSize(width: 1300, height: 800), "the drop target is the whole window: \(target.frame)")
+    let spots: [(String, CGFloat, CGFloat)] = [("rail", 30, 400), ("sidebar", 200, 400), ("column", 1000, 400), ("column top", 760, 700)]
+    let before = try #require(TextHarness.Pixels(rig.host))
+    let file = try rig.fake.files.source("a.txt", Data("a".utf8))
+    let info = try rig.drag(files: [file])
+    #expect(target.draggingEntered(info) == .copy)
+    await settle(rig.host, 8)
+    let during = try #require(TextHarness.Pixels(rig.host))
+    for (name, x, y) in spots {
+        let was = before.rgb(x, y), now = during.rgb(x, y)
+        #expect(now.0 < was.0 || was.0 < 10, "\(name) is dimmed: \(was) -> \(now)")
+    }
+    // The blurple card is centred in the window (330 x 190): its left upper part is blue, not grey.
+    let card = during.rgb(650 - 140, 400 + 70), card2 = during.rgb(650 + 140, 400 - 70)
+    #expect(card.2 > card.0 + 60 && card2.2 > card2.0 + 60, "\(card) \(card2)")
+    target.draggingExited(info)
+    await settle(rig.host, 8)
+    let after = try #require(TextHarness.Pixels(rig.host))
+    for (name, x, y) in spots { #expect(after.rgb(x, y) == before.rgb(x, y), "\(name) is back") }
+}
+
+@MainActor @Test func aDropAnywhereInTheWindowAttachesToTheOpenConversationAndShiftSendsThere() async throws {
+    let rig = await WindowRig(permission: .allowed)
+    let target = try rig.target
+    let file = try rig.fake.files.source("a.txt", Data("aa".utf8))
+    let info = try rig.drag(files: [file])
+    // The drop is the same wherever it falls in the window: one destination covers it all.
+    _ = target.draggingEntered(info)
+    #expect(target.performDragOperation(info))
+    for _ in 0..<40 where rig.queue.isEmpty { await settle(rig.host, 1) }
+    #expect(rig.queue.map(\.filename) == ["a.txt"] && rig.fake.sent.isEmpty)
+}
+
+@MainActor @Test func aDragOverAWindowThatForbidsAttachingDimsNothingAndTakesNothing() async throws {
+    for permission in [AttachPermission.unknown, .denied] {
+        let rig = await WindowRig(permission: permission)
+        let target = try rig.target
+        let before = try #require(TextHarness.Pixels(rig.host))
+        let file = try rig.fake.files.source("a.txt", Data("aa".utf8))
+        let info = try rig.drag(files: [file])
+        #expect(target.draggingEntered(info) == [], "\(permission)")
+        await settle(rig.host, 8)
+        let during = try #require(TextHarness.Pixels(rig.host))
+        #expect(during.rgb(200, 400) == before.rgb(200, 400) && during.rgb(1000, 400) == before.rgb(1000, 400), "\(permission)")
+        #expect(!target.performDragOperation(info), "\(permission)")
+        await settle(rig.host, 6)
+        #expect(rig.queue.isEmpty && rig.fake.sent.isEmpty, "\(permission)")
+    }
+}
+
+// MARK: File promises (CU-6)
+
+/// A promise that writes `files` into the directory it is given, off the main thread, or fails or
+/// stalls on request. Stands in for `NSFilePromiseReceiver`, whose in-process round trip does not
+/// resolve its file names offscreen (probed): the receive-and-attach path is what is tested.
+private final class PromiseStub: FilePromiseSource, @unchecked Sendable {
+    enum Mode { case deliver, failSecond, neverReport, lateWrite }
+    let files: [(String, Data)]
+    let mode: Mode
+    let received = Log<Int>(0)
+    init(_ files: [(String, Data)], mode: Mode = .deliver) { self.files = files; self.mode = mode }
+    var count: Int { files.count }
+
+    func receive(into directory: URL, report: @escaping @Sendable (Result<URL, any Error>) -> Void) {
+        received.update { $0 += 1 }
+        let files = files, mode = mode
+        DispatchQueue.global().async {
+            for (index, (name, data)) in files.enumerated() {
+                let url = directory.appendingPathComponent(name)
+                switch mode {
+                case .deliver:
+                    try? data.write(to: url)
+                    report(.success(url))
+                case .failSecond:
+                    if index == 0 { try? data.write(to: url); report(.success(url)) } else { report(.failure(CocoaError(.fileReadUnknown))) }
+                case .neverReport:
+                    try? data.write(to: url)
+                case .lateWrite:
+                    Thread.sleep(forTimeInterval: 0.4)
+                    try? data.write(to: url) // the directory is gone by now: nothing lands
+                    report(.success(url))
+                }
+            }
+        }
+    }
+}
+
+@MainActor @Test func aPromisedFileIsReceivedIntoCU1sDirectoryAndAttachedLikeADroppedOne() async throws {
+    let rig = await Rig()
+    let stub = PromiseStub([("holiday.png", try #require(encoded(png(width: 8, height: 8), as: .png)))])
+    await rig.controller.dropped([], promises: [stub], shift: false, conversation: "1")
+    let entry = try #require(rig.queue.first)
+    #expect(rig.queue.count == 1 && entry.filename == "holiday.png" && entry.contentType == "image/png" && entry.size > 0)
+    #expect(entry.url.deletingLastPathComponent().deletingLastPathComponent().resolvingSymlinksInPath().path == rig.fake.files.root.resolvingSymlinksInPath().path, "<root>/<UUID>/holiday.png")
+    #expect(rig.fake.files.synthesized.count == 1)
+    // The same checks as a dropped file: the limits ran on its size.
+    #expect(rig.fake.limitCalls.last?.sizes == [entry.size] && rig.fake.limitCalls.last?.stage == .add)
+}
+
+@MainActor @Test func aPromiseThatFailsOrStallsAddsNothingAndLeavesNoFiles() async throws {
+    let rig = await Rig()
+    // One of two files fails: the whole promise is dropped, the file already written with it.
+    await rig.controller.dropped([], promises: [PromiseStub([("a.txt", Data("a".utf8)), ("b.txt", Data("b".utf8))], mode: .failSecond)], shift: false, conversation: "1")
+    #expect(rig.queue.isEmpty && rig.fake.files.synthesized.isEmpty && rig.fake.limitCalls.isEmpty)
+    // A promise that never reports times out.
+    rig.controller.promiseTimeout = .milliseconds(150)
+    await rig.controller.dropped([], promises: [PromiseStub([("a.txt", Data("a".utf8))], mode: .neverReport)], shift: false, conversation: "1")
+    #expect(rig.queue.isEmpty && rig.fake.files.synthesized.isEmpty)
+    // One that delivers after the timeout lands nowhere.
+    await rig.controller.dropped([], promises: [PromiseStub([("late.txt", Data("a".utf8))], mode: .lateWrite)], shift: false, conversation: "1")
+    try? await Task.sleep(for: .milliseconds(600))
+    #expect(rig.queue.isEmpty && rig.fake.files.synthesized.isEmpty, "\(rig.fake.files.synthesized)")
+}
+
+@MainActor @Test func aPromisedFileThatIsNotARegularFileOrBreaksALimitLeavesNothingBehind() async throws {
+    let rig = await Rig()
+    // The stub "delivers" a directory.
+    final class DirectoryPromise: FilePromiseSource, @unchecked Sendable {
+        var count: Int { 1 }
+        func receive(into directory: URL, report: @escaping @Sendable (Result<URL, any Error>) -> Void) {
+            let folder = directory.appendingPathComponent("folder", isDirectory: true)
+            try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            report(.success(folder))
+        }
+    }
+    await rig.controller.dropped([], promises: [DirectoryPromise()], shift: false, conversation: "1")
+    #expect(rig.queue.isEmpty && rig.fake.files.synthesized.isEmpty)
+    rig.fake.limit = { _, _ in .fileTooLarge(limit: 5) }
+    await rig.controller.dropped([], promises: [PromiseStub([("big.bin", Data("0123456789".utf8))])], shift: false, conversation: "1")
+    #expect(rig.queue.isEmpty && rig.fake.files.synthesized.isEmpty && rig.controller.alert != nil)
+}
+
+@MainActor @Test func aPromisedHEICIsConvertedAndItsOriginalIsNotKept() async throws {
+    let rig = await Rig()
+    rig.fake.conversion = .enabled(quality: 70, maxFileSizeBytes: 20_971_520)
+    let heic = try jpegWithOrientation(width: 30, height: 20, orientation: 1)
+    await rig.controller.dropped([], promises: [PromiseStub([("IMG_9.HEIC", heic)])], shift: false, conversation: "1")
+    let entry = try #require(rig.queue.first)
+    #expect(entry.filename == "IMG_9.jpg" && entry.contentType == "image/heic" && entry.originalMD5?.count == 32)
+    #expect(rig.fake.files.synthesized.count == 1, "only the converted file's directory remains")
+}
+
+@MainActor @Test func aShiftDropOfAPromiseSendsTheReceivedFileAtOnce() async throws {
+    let rig = await Rig()
+    rig.model.draft = "kept"
+    await rig.controller.dropped([], promises: [PromiseStub([("clip.txt", Data("c".utf8))])], shift: true, conversation: "9")
+    let request = try #require(rig.fake.sent.first)
+    #expect(request.conversation == "9" && request.text == "" && request.instant && request.files.map(\.filename) == ["clip.txt"])
+    #expect(rig.model.draft == "kept" && rig.queue.isEmpty)
+}
+
+@MainActor @Test func promisesAreNotReceivedWhereAttachingIsForbiddenOrWhenFilesAreNamed() async throws {
+    let denied = await Rig(permission: .unknown)
+    let stub = PromiseStub([("a.txt", Data("a".utf8))])
+    await denied.controller.dropped([], promises: [stub], shift: false, conversation: "1")
+    #expect(stub.received.get == 0 && denied.queue.isEmpty && denied.fake.files.synthesized.isEmpty, "Unknown hides the drop")
+    // A drag that names files is those files: its promises (a second copy of the same items) are not received.
+    let rig = await Rig()
+    let named = try rig.fake.files.source("named.txt", Data("n".utf8))
+    let twin = PromiseStub([("named.txt", Data("n".utf8))])
+    await rig.controller.dropped([named], promises: [twin], shift: false, conversation: "1")
+    #expect(twin.received.get == 0 && rig.queue.map(\.filename) == ["named.txt"])
+}
+
+@MainActor @Test func aPromiseOnlyDragIsAcceptedAndReceivedThroughTheRealDropDestination() async throws {
+    let rig = await Rig()
+    let stub = PromiseStub([("from-mail.pdf", Data("%PDF".utf8))])
+    rig.controller.promiseSources = { [stub] }
+    // No file URL on the drag: the files are only promised.
+    let (target, info) = try drag(rig, files: [], promised: true)
+    #expect(target.draggingEntered(info) == .copy, "a promise alone makes the drag acceptable")
+    #expect(target.performDragOperation(info))
+    for _ in 0..<60 where rig.queue.isEmpty { await settle(rig.host, 1) }
+    #expect(rig.queue.map(\.filename) == ["from-mail.pdf"] && stub.received.get == 1)
+    // Without a promise, an empty drag is refused.
+    rig.controller.promiseSources = { [] }
+    let (other, otherInfo) = try drag(rig, files: [])
+    #expect(other.draggingEntered(otherInfo) == [])
 }
 
 // MARK: Overlay
@@ -707,7 +988,7 @@ private final class FakeDrag: NSObject, NSDraggingInfo {
     await settle(rig.host)
     #expect(rig.model.draft == "caption" && rig.queue.map(\.filename) == ["a.txt"])
     let shown = await rig.alertTexts()
-    #expect(shown.contains { $0.hasPrefix("Total message size must be less than 500 MB") }, "\(shown)")
+    #expect(shown.contains { $0.hasPrefix("Total message size must be less than 500 MB") } && shown.contains("Got It"), "\(shown)")
     if let sheet = rig.window.attachedSheet { rig.window.endSheet(sheet) }
 }
 

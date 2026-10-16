@@ -319,6 +319,12 @@ final class AppModel {
         },
         write: { try AttachmentFiles.write($0, named: $1) },
         remove: { AttachmentFiles.remove($0) },
+        makeDirectory: {
+            // CU-1: the same `<root>/<UUID>/` shape `AttachmentFiles.write` makes, for received promises.
+            let directory = AttachmentFiles.root.appendingPathComponent(UUID().uuidString, isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            return directory
+        },
         limits: { [unowned self] conversation, sizes, stage in
             guard let handle, let channel = UInt64(conversation) else { return nil }
             return handle.attachmentLimits(channelId: channel, sizes: sizes, at: stage == .add ? .add : .send).map(Self.limit)

@@ -63,16 +63,22 @@ struct MessageArea: View {
             services: attachmentServices, permission: attachPermission, premiumType: premiumType,
             conversation: conversationID, queues: attachmentQueues)
         Group { content }
-            // The attachment limits' alerts (OA A18, A37): the copy, "Okay", and for everyone but a
-            // Nitro user the upsell line with "Learn more".
+            // The attachment limits' alerts (OA A18, A37): the official copy and "Got It"; the upsell
+            // modal has "Get Nitro" and "View All Nitro Perks", which open the Nitro page (velella has
+            // no store). A native alert needs a way out, which the official modal's cross gave: "Close".
             .alert(
                 attachments.alert?.title ?? "",
                 isPresented: Binding(get: { attachments.alert != nil }, set: { if !$0 { attachments.alert = nil } })
             ) {
-                Button("Okay") {}
-                if attachments.alert?.showsUpsell == true { Button("Learn more") { openURL(MessageLength.nitroURL) } }
+                if attachments.alert?.showsUpsell == true {
+                    Button(AttachmentAlert.upsellPrimary) { openURL(MessageLength.nitroURL) }
+                    Button(AttachmentAlert.upsellSecondary) { openURL(MessageLength.nitroURL) }
+                    Button("Close", role: .cancel) {}
+                } else {
+                    Button(AttachmentAlert.dismiss) {}
+                }
             } message: {
-                Text(verbatim: (attachments.alert?.message ?? "") + (attachments.alert?.showsUpsell == true ? "\n" + AttachmentAlert.upsellCopy : ""))
+                Text(verbatim: attachments.alert?.message ?? "")
             }
             // N2 Model: the coordinator follows the rows in display order, so a selection reaches rows no view shows.
             .onChange(of: messages, initial: true) {
@@ -190,12 +196,6 @@ struct MessageArea: View {
             // Under the toolbar too, so the toolbar band carries the pane's tint (a band of bare
             // window material over the messages read as a separate, lighter strip).
             .background(T.Palette.messagePane)
-            // D12a: files dropped on the column attach (Shift sends); the overlay shows while a drag
-            // is over it. Only where attaching is allowed (OA A26): Unknown shows and takes nothing.
-            .onDrop(of: [.fileURL], delegate: AttachmentDropDelegate(controller: attachments, conversation: conversationID))
-            .overlay {
-                if attachments.isDropTargeted && attachments.enabled { DropOverlay(conversationName: header?.name ?? "") }
-            }
         } else if isSignedIn {
             ContentUnavailableView("No channel selected", systemImage: "number", description: Text("Pick a channel on the left."))
         } else {

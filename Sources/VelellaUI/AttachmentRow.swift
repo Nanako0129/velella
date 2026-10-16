@@ -86,6 +86,10 @@ final class AttachmentController {
     @ObservationIgnored private var queues: Binding<[String: [QueuedAttachment]]> = .constant([:])
     /// The "Upload a File" panel; tests stand in for it.
     @ObservationIgnored var chooseFiles: @MainActor () async -> [URL] = AttachmentOpenPanel.choose
+    /// The promises the current drag carries (Photos, Mail), read from the drag pasteboard; tests
+    /// stand in for it.
+    @ObservationIgnored var promiseSources: @MainActor () -> [any FilePromiseSource] = { FilePromises.sources(on: NSPasteboard(name: .drag)) }
+    @ObservationIgnored var promiseTimeout = FilePromises.timeout
     /// Whether Shift is held as files fall (a drop carries no modifiers, so the keyboard's state at
     /// that moment); tests stand in for it.
     @ObservationIgnored var shiftHeld: @MainActor () -> Bool = { NSEvent.modifierFlags.contains(.shift) }
@@ -141,13 +145,25 @@ final class AttachmentController {
         alert = AttachmentAlert(for: limit, premiumType: premiumType)
     }
 
-    /// A drop on the column. `conversation` was captured when the files fell; `shift` was read from
-    /// the drop. Shift sends the files at once with no text, leaving the draft and the queue alone
-    /// (OA A35, D12a); without it they join the queue.
-    func dropped(_ urls: [URL], shift: Bool, conversation: String) async {
+    /// A drop on the window. `conversation` was captured when the files fell; `shift` was read as they
+    /// fell. A drag that names files is those files; one that only promises them (Photos, Mail) is
+    /// received into CU-1's directories first (CU-6), and each received file is then handled exactly
+    /// like a dropped one. Shift sends the files at once with no text, leaving the draft and the queue
+    /// alone (OA A35, D12a); without it they join the queue.
+    func dropped(_ urls: [URL], promises: [any FilePromiseSource] = [], shift: Bool, conversation: String) async {
         isDropTargeted = false
         guard enabled, let services else { return }
-        let entries = await AttachmentIntake.entries(for: urls, services: services)
+        var files = urls
+        var received: [URL] = []
+        if urls.isEmpty {
+            for source in promises { received += await FilePromises.receive(source, services: services, timeout: promiseTimeout) }
+            files = received
+        }
+        let entries = await AttachmentIntake.entries(for: files, services: services)
+        // A received file that did not become an entry (not a regular file, or replaced by its
+        // conversion) is no one's: it goes with its directory.
+        let kept = Set(entries.map(\.file.path))
+        for url in received where !kept.contains(url.resolvingSymlinksInPath().path) { services.remove(url) }
         guard !entries.isEmpty else { return }
         guard shift else { return admit(entries, to: conversation) }
         if let limit = services.limits(conversation, entries.map(\.size), .add) { return refuse(entries, limit) }

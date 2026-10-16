@@ -831,6 +831,9 @@ public struct AttachmentServices: Sendable {
     public var write: @Sendable (Data, String) throws -> URL
     /// Deletes a synthesized file with its directory; leaves any other file alone.
     public var remove: @Sendable (URL) -> Void
+    /// CU-1 for received file promises: creates a fresh `<temporary>/velella-attachments/<UUID>/` and
+    /// returns it; `remove` of any file inside it deletes it again.
+    public var makeDirectory: @Sendable () throws -> URL
     public var limits: @MainActor @Sendable (_ conversation: String, _ sizes: [UInt64], _ stage: LimitStage) -> AttachmentLimit?
     public var conversion: @MainActor @Sendable (ConvertibleKind) -> ImageConversionSetting
     public var send: @MainActor @Sendable (AttachmentSendRequest) -> AttachmentSendOutcome
@@ -843,6 +846,7 @@ public struct AttachmentServices: Sendable {
         identity: @escaping @Sendable (URL) -> QueuedFileIdentity?,
         write: @escaping @Sendable (Data, String) throws -> URL,
         remove: @escaping @Sendable (URL) -> Void,
+        makeDirectory: @escaping @Sendable () throws -> URL,
         limits: @escaping @MainActor @Sendable (String, [UInt64], LimitStage) -> AttachmentLimit?,
         conversion: @escaping @MainActor @Sendable (ConvertibleKind) -> ImageConversionSetting,
         send: @escaping @MainActor @Sendable (AttachmentSendRequest) -> AttachmentSendOutcome,
@@ -850,39 +854,58 @@ public struct AttachmentServices: Sendable {
         retry: @escaping @MainActor @Sendable (String) -> Void,
         discard: @escaping @MainActor @Sendable (String) -> Void
     ) {
-        self.identity = identity; self.write = write; self.remove = remove; self.limits = limits
+        self.identity = identity; self.write = write; self.remove = remove; self.makeDirectory = makeDirectory; self.limits = limits
         self.conversion = conversion; self.send = send; self.cancel = cancel; self.retry = retry; self.discard = discard
     }
 }
 
-/// The official alert copy for each limit (OA A18, A37). The dialog layout is not on disk (A32): the
-/// alert carries the copy.
+/// The official alert copy for each limit (OA A18, A37), read from the web client's upload-error path
+/// (`openUploadError`): a per-file limit for anyone but a Nitro user (`premium_type` 2) opens the
+/// upsell modal, every other case the plain one with a single "Got It".
 public struct AttachmentAlert: Equatable, Sendable {
     public var title: String
     public var message: String
-    /// Everyone but a Nitro user (`premium_type` 2) also gets the upsell line and "Learn more".
+    /// The Nitro upsell modal: "Get Nitro" and "View All Nitro Perks" (both lead to the Nitro page,
+    /// velella having no store) instead of "Got It".
     public var showsUpsell: Bool
 
     public static let tooPowerful = "Your files are too powerful"
-    /// Not on disk (A18 says only "a Nitro upsell"): written for velella.
-    public static let upsellCopy = "Get Discord Nitro to upload bigger files."
+    /// The upsell modal's title (`9C+41g`) and its two buttons (`pj0XBN`, `ZnqyZ2`); the primary label
+    /// is the default one (a trial or discount replaces it for some accounts).
+    public static let upsellTitle = "Uh oh, this file exceeds the size limit."
+    public static let upsellPrimary = "Get Nitro"
+    public static let upsellSecondary = "View All Nitro Perks"
+    /// The plain modal's only button (`NX+WJN`).
+    public static let dismiss = "Got It"
+    /// What the upsell says a Nitro user may upload (`getMaxFileSizeForPremiumType(TIER_2)`): 500 MB.
+    /// Unverified: under the 1 GiB rollout experiment the official client says "1GB", which the UI
+    /// does not know (core's per-account answer is not passed this far).
+    public static let nitroLimit: UInt64 = 524_288_000
 
-    /// `ByteCountFormatter` in binary units, so 10 MiB reads "10 MB" and 500 MB (524,288,000) "500 MB".
+    /// `filesize()` as the plain modals format it (binary units): 10 MiB reads "10 MB".
     static func size(_ bytes: UInt64) -> String {
         ByteCountFormatter.string(fromByteCount: Int64(clamping: bytes), countStyle: .binary)
     }
 
+    /// The official `formatFileSize(bytes / 1024, {useKibibytes: true})` the upsell uses, with no
+    /// `useSpace` (so no space): whole MB rounded up, and from 1024 MB whole GB. 20 MiB is "20MB".
+    static func upsellSize(_ bytes: UInt64) -> String {
+        let megabytes = Int((Double(bytes) / 1024 / 1024).rounded(.up))
+        return megabytes < 1024 ? "\(megabytes)MB" : "\(Int((Double(megabytes) / 1024).rounded()))GB"
+    }
+
     public init(for limit: AttachmentLimit, premiumType: UInt8?) {
-        let upsell = premiumType != 2
         switch limit {
-        case .fileTooLarge(let max):
-            // The help text is by tier: "Nitro Classic" is premium_type 1.
+        case .fileTooLarge(let max) where premiumType != 2:
+            // `+R2TzS` with maxSize = the effective limit and premiumMaxSize = TIER_2's.
             self.init(
-                title: Self.tooPowerful,
-                message: premiumType == 1 ? "Max file size for Nitro Classic is \(Self.size(max)) please." : "Max file size is \(Self.size(max)) please.",
-                showsUpsell: upsell)
+                title: Self.upsellTitle,
+                message: "The max file size is \(Self.upsellSize(max)). Upgrade to Discord Nitro to upload files up to \(Self.upsellSize(Self.nitroLimit)).",
+                showsUpsell: true)
+        case .fileTooLarge(let max):
+            self.init(title: Self.tooPowerful, message: "Max file size is \(Self.size(max)) please.", showsUpsell: false)
         case .totalTooLarge(let max):
-            self.init(title: Self.tooPowerful, message: "Total message size must be less than \(Self.size(max))", showsUpsell: upsell)
+            self.init(title: Self.tooPowerful, message: "Total message size must be less than \(Self.size(max))", showsUpsell: false)
         case .emptyFile:
             self.init(title: "Upload Failed", message: "File cannot be empty", showsUpsell: false)
         case .tooManyFiles(let limit):

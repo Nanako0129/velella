@@ -17,6 +17,8 @@ public struct ShellView: View {
     private let onLoadOlder: (() -> Void)?
     private let replyPreview: ((String) -> String?)?
     private let attachmentServices: AttachmentServices?
+    /// Shared with the message column, which feeds it the open conversation's state.
+    @State private var attachmentController = AttachmentController()
     @State private var showMembers = true
     @State private var search = ""
     /// Starts at the sidebar's ideal width, not 0: the title's frame is this minus the reserved
@@ -81,7 +83,7 @@ public struct ShellView: View {
                 older: state.older, onLoadOlder: onLoadOlder, typing: state.typing,
                 premiumType: state.premiumType,
                 attachmentQueues: $state.attachmentQueues, attachPermission: state.attachPermission,
-                attachmentServices: attachmentServices
+                attachmentServices: attachmentServices, attachmentController: attachmentController
             )
                 // No minimum of its own: SwiftUI's `.inspector` adds the floating sidebar's current
                 // width to this column's minimum twice (measured 2026-10-13, macOS 27.0.1,
@@ -124,6 +126,9 @@ public struct ShellView: View {
         .frame(minWidth: T.Size.windowMinWidth, minHeight: T.Size.windowMinHeight)
         .containerBackground(T.Palette.windowMaterial, for: .window)
         .environment(\.discordLocale, Locale(identifier: state.locale))
+        // OA A27, D12a: the whole window is the drop target and dims under the drop card, rail and
+        // sidebar included; the conversation is the open one.
+        .attachmentDropTarget(attachmentController, conversation: state.openTarget ?? "", name: state.header?.name ?? "")
     }
 
     /// DM mode: search; a server: its menu, whose "⌄" is the native toolbar menu indicator
