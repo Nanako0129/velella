@@ -8,6 +8,10 @@ const ADMINISTRATOR: u64 = 1 << 3;
 pub(crate) const VIEW_CHANNEL: u64 = 1 << 10;
 
 pub(crate) fn can_view_channel(user_id: u64, guild: &Guild, channel: &Channel) -> Option<bool> {
+    // Obfuscated (I-5): no access, whoever asks and whatever the channel carries.
+    if channel.is_obfuscated() {
+        return Some(false);
+    }
     if guild.owner_id == Some(user_id) {
         return Some(true);
     }

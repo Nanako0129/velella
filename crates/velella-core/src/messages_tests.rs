@@ -1853,3 +1853,43 @@ async fn a_message_update_leaves_reactions_alone() {
     );
     assert_eq!(shown(&store, epoch), [("a".into(), 1, false)]);
 }
+
+#[tokio::test]
+async fn reaction_add_many_adds_one_per_listed_user() {
+    let (_mock, store, epoch) =
+        reacted(json!([{"count": 1, "me": false, "emoji": unicode("a")}])).await;
+    store.observe(
+        "MESSAGE_REACTION_ADD_MANY",
+        &json!({"channel_id": "5", "message_id": "10", "reactions": [
+            {"users": ["7", "1"], "emoji": unicode("a")},
+            {"users": ["8"], "emoji": unicode("b")},
+            {"users": ["9"], "emoji": {"id": null, "name": null}},
+        ]}),
+    );
+    assert_eq!(
+        shown(&store, epoch),
+        [("a".into(), 3, true), ("b".into(), 1, false)]
+    );
+    // Another channel's batch changes nothing.
+    store.observe(
+        "MESSAGE_REACTION_ADD_MANY",
+        &json!({"channel_id": "6", "message_id": "10", "reactions": [
+            {"users": ["7"], "emoji": unicode("a")}]}),
+    );
+    assert_eq!(shown(&store, epoch)[0].1, 3);
+}
+
+#[tokio::test]
+async fn poll_vote_add_many_is_stored_and_not_shown_as_reactions() {
+    let (_mock, store, epoch) = reacted(json!([])).await;
+    store.observe(
+        "MESSAGE_POLL_VOTE_ADD_MANY",
+        &json!({"channel_id": "5", "message_id": "10", "votes": [
+            {"answer_id": 1, "users": ["7", "1"]}, {"answer_id": 2, "users": ["8"]}]}),
+    );
+    assert!(shown(&store, epoch).is_empty());
+    let votes = store.lock().open.as_ref().unwrap().messages[0]
+        .poll_votes
+        .clone();
+    assert_eq!(votes, [(1, 2, true), (2, 1, false)]);
+}

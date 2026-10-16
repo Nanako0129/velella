@@ -100,4 +100,35 @@ impl State {
         }
         changed
     }
+
+    /// VOICE_STATE_UPDATE_BATCH `{voice_states: [...]}`: each one as a VOICE_STATE_UPDATE.
+    pub(crate) fn voice_batch(&mut self, d: &Value) -> bool {
+        let mut changed = false;
+        for v in d
+            .get("voice_states")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            changed |= self.voice_update(v, None);
+        }
+        changed
+    }
+
+    /// PASSIVE_UPDATE_V2's `updated_voice_states` and `removed_voice_states` (user ids).
+    pub(crate) fn passive_voice(&mut self, d: &Value, guild: u64) -> bool {
+        let mut changed = false;
+        for v in d
+            .get("updated_voice_states")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            changed |= self.voice_update(v, Some(guild));
+        }
+        for user in crate::state::ids(d.get("removed_voice_states")) {
+            changed |= self.voice.leave(guild, user);
+        }
+        changed
+    }
 }
