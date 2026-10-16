@@ -109,6 +109,33 @@ private func hasLoneSurrogate(_ s: String) -> Bool { s.unicodeScalars.contains("
     }
 }
 
+/// Stands in for `NSEvent`'s monitor calls and counts the monitors installed (swapped in only inside
+/// synchronous stretches of a test, so no other test sees it).
+@MainActor private final class MonitorSpy {
+    private(set) var live: Set<Int> = []
+    private(set) var added = 0
+
+    /// Swaps the coordinator's monitor calls for counting ones; the returned closure puts them back.
+    func install() -> () -> Void {
+        let (add, remove) = (SelectionCoordinator.addMonitor, SelectionCoordinator.removeMonitor)
+        SelectionCoordinator.addMonitor = { [self] _ in
+            let token: Int = MainActor.assumeIsolated {
+                added += 1
+                live.insert(added)
+                return added
+            }
+            return token
+        }
+        SelectionCoordinator.removeMonitor = { [self] token in
+            MainActor.assumeIsolated { _ = live.remove(token as? Int ?? -1) }
+        }
+        return {
+            SelectionCoordinator.addMonitor = add
+            SelectionCoordinator.removeMonitor = remove
+        }
+    }
+}
+
 @MainActor @Suite(.serialized) struct SelectionAcrossTests {
     private func threeMessages() -> [MessageItem] { [message(1, text: "alpha bravo"), message(2, text: "delta echo"), message(3, text: "golf hotel")] }
 
@@ -232,6 +259,8 @@ private func hasLoneSurrogate(_ s: String) -> Bool { s.unicodeScalars.contains("
         let between = ((k + 1)..<60).map { header($0) + "\nmessage \($0) body" }
         let expected = (["\(String("message \(k) body".dropFirst(8)))"] + between + [header(60) + "\nmessage "]).joined(separator: "\n")
         #expect(rig.copy() == expected)
+        // D4 through the column's own responder: plain text only.
+        #expect(Set(rig.board.types?.map(\.rawValue) ?? []) == TextHarness.stringFlavours, "\(String(describing: rig.board.types))")
         #expect(NSPasteboard.general.changeCount == before)
     }
 
@@ -339,5 +368,51 @@ private func hasLoneSurrogate(_ s: String) -> Bool { s.unicodeScalars.contains("
         #expect(coordinator.hasSelection)
         coordinator.handle(rig.event(.leftMouseDown, at: CGPoint(x: 3, y: 3)))
         #expect(!coordinator.hasSelection)
+    }
+
+    // MARK: The monitor and the timer live only as long as a selection
+
+    @Test func theMonitorIsRemovedWithTheSelectionAndAClickThatSelectsNothingLeavesNone() async throws {
+        let rig = try await Rig(threeMessages())
+        let a = try #require(rig.body(1)), b = try #require(rig.body(2))
+        let coordinator = a.selection
+        let spy = MonitorSpy()
+        let restore = spy.install()
+        defer { restore() }
+        for _ in 0..<100 {
+            rig.select(from: a, 2, to: b, 4)
+            #expect(spy.live.count == 1, "one monitor while a selection exists")
+            coordinator.clear()
+            #expect(spy.live.isEmpty, "clear removes it")
+        }
+        #expect(spy.added == 100)
+        // A click: pressed, released, nothing selected.
+        let r = a.rects(for: NSRange(location: 3, length: 1))[0]
+        TextHarness.click(a, at: CGPoint(x: r.midX, y: r.midY))
+        #expect(spy.added == 101)
+        #expect(spy.live.isEmpty, "a click that selected nothing keeps no monitor")
+        #expect(coordinator.timer == nil)
+    }
+
+    @Test func aCoordinatorReleasedMidPressTakesItsMonitorAndTimerWithIt() {
+        let spy = MonitorSpy()
+        let restore = spy.install()
+        defer { restore() }
+        weak var coordinator: SelectionCoordinator?
+        var timer: Timer?
+        autoreleasepool {
+            let (view, window) = TextHarness.paragraph(TextHarness.segments([.text("some words here")]).segments)
+            let r = view.rects(for: NSRange(location: 2, length: 1))[0]
+            TextHarness.send(TextHarness.mouse(.leftMouseDown, at: CGPoint(x: r.midX, y: r.midY), in: view), to: window)
+            coordinator = view.selection
+            timer = view.selection.timer
+            #expect(spy.live.count == 1)
+            #expect(timer?.isValid == true)
+            TextHarness.captured = nil
+            window.contentView = nil
+        }
+        #expect(coordinator == nil, "the coordinator is still alive")
+        #expect(spy.live.isEmpty, "its monitor outlived it")
+        #expect(timer?.isValid == false, "its timer outlived it")
     }
 }

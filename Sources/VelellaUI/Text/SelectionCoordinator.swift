@@ -126,8 +126,16 @@ final class SelectionCoordinator {
     private var moved = false
     private var lastPoint: CGPoint?
     private weak var scroller: NSScrollView?
-    private var timer: Timer?
+    private(set) var timer: Timer?
     private var monitor: Any?
+    /// How a monitor is installed and removed; tests swap these to count the installed ones.
+    static var addMonitor: (@escaping (NSEvent) -> Void) -> Any? = { handler in
+        NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .leftMouseDragged, .leftMouseUp]) { event in
+            handler(event)
+            return event
+        }
+    }
+    static var removeMonitor: (Any) -> Void = { NSEvent.removeMonitor($0) }
     /// The selection's colour follows the window's key state: repaint when it changes, while there is one.
     private var keyObservers: [NSObjectProtocol] = []
     /// Points scrolled per autoscroll step while the pointer is past the column's edge.
@@ -157,9 +165,8 @@ final class SelectionCoordinator {
             // The gesture belongs to the coordinator, not to the view that took the press: that view
             // can be recycled while the pointer is past the edge, and AppKit then drops the drag.
             // The same monitor clears the selection on a press anywhere but in its own text.
-            monitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .leftMouseDragged, .leftMouseUp]) { [weak self] event in
+            monitor = Self.addMonitor { [weak self] event in
                 MainActor.assumeIsolated { self?.handle(event) }
-                return event
             }
         }
         timer?.invalidate()
@@ -209,6 +216,8 @@ final class SelectionCoordinator {
         dragging = false
         timer?.invalidate()
         timer = nil
+        // A click that selected nothing has no use for the monitor.
+        if !hasSelection { clear() }
         guard hasSelection, let responder, let window = responder.window, !owns(window.firstResponder) else { return }
         window.makeFirstResponder(responder)
     }
@@ -217,14 +226,21 @@ final class SelectionCoordinator {
         anchor = nil
         focus = nil
         dragging = false
+        releaseResources()
+        repaint()
+    }
+
+    /// The timer, the monitor and the key observers: alive only while there is a selection.
+    private func releaseResources() {
         timer?.invalidate()
         timer = nil
-        if let monitor { NSEvent.removeMonitor(monitor) }
+        if let monitor { Self.removeMonitor(monitor) }
         monitor = nil
         keyObservers.forEach { NotificationCenter.default.removeObserver($0) }
         keyObservers = []
-        repaint()
     }
+
+    isolated deinit { releaseResources() }
 
     func repaint() { views.values.forEach { $0.view?.needsDisplay = true } }
 
