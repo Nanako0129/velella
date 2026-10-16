@@ -348,9 +348,10 @@ private func hasIsolates(_ s: String) -> Bool { s.unicodeScalars.contains { (0x2
         let (host, window) = TextHarness.hosting(MarkdownView(content: body).frame(width: 400), size: CGSize(width: 400, height: 600))
         #expect(TextHarness.all(NSTextView.self, in: host).isEmpty)
         let views = TextHarness.textViews(in: host)
-        // Seven text views for eight text blocks: in this hosted render the code block under a
-        // hidden spoiler (inside `SpoilerCover`'s `.hidden()`) has no text view in the AppKit tree,
-        // so no selection in this body reaches its text.
+        // Seven text views in the AppKit tree for eight text blocks: the code block under a hidden
+        // spoiler (inside `SpoilerCover`'s `.hidden()`) draws nothing here, but its view still
+        // registers with the body's coordinator, so a selection across it copies its code (D2:
+        // hidden text is copied; measured by the N1 recheck verifier, 2026-10-16).
         #expect(views.count == 7, "\(views.count)")
         #expect(!views.contains { $0.attributed.string.contains("covered") })
         for view in views {
