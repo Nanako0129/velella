@@ -51,9 +51,11 @@
     {
       "layers": [
         {
-          "image-name": "body-light.png",
           "name": "body",
           "image-name-specializations": [
+            {
+              "value": "body-light.png"
+            },
             {
               "appearance": "dark",
               "value": "body-dark.png"
@@ -73,9 +75,11 @@
     {
       "layers": [
         {
-          "image-name": "bg-light.png",
           "name": "background",
           "image-name-specializations": [
+            {
+              "value": "bg-light.png"
+            },
             {
               "appearance": "dark",
               "value": "bg-dark.png"
