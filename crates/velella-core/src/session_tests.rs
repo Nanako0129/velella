@@ -2174,3 +2174,88 @@ mod identity {
         assert!(c2.quiet().await, "op 37 for an obfuscated channel");
     }
 }
+
+/// The Live row's names-only stderr lines: READY's, its first guild's and READY_SUPPLEMENTAL's
+/// key names and each unhandled dispatch name, once per launch; never a value, id or token.
+mod live_log {
+    use super::*;
+    use crate::identify::{Launch, LaunchConfig};
+
+    #[tokio::test]
+    async fn key_names_and_unhandled_dispatches_are_logged_once_without_values() {
+        const SECRET: &str = "SYNTHETIC_REFRESHED_TOKEN_0123456789";
+        let launch = Launch::new(LaunchConfig::default());
+        let mut rig = Rig::start_with(crate::SessionOptions {
+            launch: launch.clone(),
+            expected_user: None,
+            identity_events: None,
+        })
+        .await;
+        let mut conn = Conn::accept(&rig.initial).await;
+        conn.hello(30_000).await;
+        assert_eq!(conn.recv_non_beat().await["op"], 2);
+        let mut ready = ready(1, "wss://gateway-resume.discord.gg/");
+        ready["d"]["user"]["id"] = json!("123456789012345678");
+        ready["d"]["auth_token"] = json!(SECRET);
+        ready["d"]["987654321"] = json!("map-keyed-by-id");
+        ready["d"]["guilds"] = json!([{"id": "555666777888", "data_mode": "full",
+            "properties": {"name": "SecretGuildName", "owner_id": "444"}, "channels": []}]);
+        conn.send(ready).await;
+        assert!(matches!(rig.event().await, SessionEvent::Ready { .. }));
+        conn.send(json!({"op": 0, "t": "READY_SUPPLEMENTAL", "s": 2, "d": {
+            "guilds": [], "merged_presences": {"friends": [{"user_id": "321"}]}}}))
+            .await;
+        for (s, t) in [
+            (3, "SOME_NEW_EVENT"),
+            (4, "SOME_NEW_EVENT"),
+            (5, "MESSAGE_CREATE"),
+            (6, "TYPING_START"),
+            (7, "GUILD_CREATE"),
+            (8, "lower;case"),
+        ] {
+            conn.send(json!({"op": 0, "t": t, "s": s, "d": {"secret": SECRET}}))
+                .await;
+        }
+        // A second READY on the launch writes nothing more.
+        conn.send(json!({"op": 9, "d": false})).await;
+        let mut again = Conn::accept(&rig.initial).await;
+        again.hello(30_000).await;
+        assert_eq!(again.recv_non_beat().await["op"], 2);
+        again
+            .send(json!({"op": 0, "t": "READY", "s": 1, "d": {
+            "user": {"id": "1", "username": "x"}, "other_key": 1, "guilds": []}}))
+            .await;
+        loop {
+            if let SessionEvent::Ready { .. } = rig.event().await {
+                break;
+            }
+        }
+        let lines = launch.diagnostics.lock().unwrap().clone();
+        assert_eq!(
+            lines,
+            [
+                "READY_KEYS <other>,auth_token,guilds,private_channels,resume_gateway_url,session_id,user,user_settings",
+                "READY_GUILD_KEYS channels,data_mode,id,properties; properties: name,owner_id",
+                "READY_SUPPLEMENTAL_KEYS guilds,merged_presences",
+                "UNHANDLED_DISPATCH SOME_NEW_EVENT",
+                "UNHANDLED_DISPATCH <other>",
+            ]
+        );
+        let all = lines.join("\n");
+        for value in [
+            SECRET,
+            "123456789012345678",
+            "987654321",
+            "555666777888",
+            "SecretGuildName",
+            "444",
+            "321",
+            "sess-1",
+            "synthetic",
+            "map-keyed-by-id",
+            "lower",
+        ] {
+            assert!(!all.contains(value), "{value} in {all}");
+        }
+    }
+}

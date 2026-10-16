@@ -247,6 +247,10 @@ pub struct Launch {
     notified_unsupported: AtomicBool,
     /// The account of the launch's last READY (an account switch clears the heartbeat session).
     pub(crate) last_account: Mutex<Option<u64>>,
+    /// Live-check lines already written this launch (each once).
+    diagnosed: Mutex<std::collections::HashSet<String>>,
+    #[cfg(test)]
+    pub(crate) diagnostics: Mutex<Vec<String>>,
 }
 
 impl Launch {
@@ -277,6 +281,9 @@ impl Launch {
             notified_fetch: AtomicBool::new(false),
             notified_unsupported: AtomicBool::new(false),
             last_account: Mutex::new(None),
+            diagnosed: Mutex::default(),
+            #[cfg(test)]
+            diagnostics: Mutex::default(),
         })
     }
 
@@ -309,6 +316,27 @@ impl Launch {
         } else {
             "NO_REASONS"
         }
+    }
+
+    /// Writes `velella: <line>` to stderr the first time this launch sees `key` (menu plan ID,
+    /// Live row). The caller builds the line from names only, never values; the shipped build
+    /// installs no logger, so this is the one place these names reach the terminal.
+    pub(crate) fn diagnose_once(&self, key: &str, line: impl FnOnce() -> String) {
+        if !self
+            .diagnosed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.to_owned())
+        {
+            return;
+        }
+        let line = line();
+        eprintln!("velella: {line}");
+        #[cfg(test)]
+        self.diagnostics
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(line);
     }
 
     pub(crate) fn ready_seen(&self) {

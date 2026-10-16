@@ -551,7 +551,15 @@ impl State {
 
     /// Applies one dispatch; returns whether state changed (and bumps `revision`). Unknown events
     /// and unreadable payloads change nothing.
+    #[cfg(test)]
     pub(crate) fn apply(&mut self, event: &str, d: &Value) -> bool {
+        self.apply_known(event, d).0
+    }
+
+    /// `apply`, and whether `event` has a handler here at all (the live check logs the names
+    /// nothing handles).
+    pub(crate) fn apply_known(&mut self, event: &str, d: &Value) -> (bool, bool) {
+        let mut known = true;
         let changed = match event {
             "READY" => self.ready(d),
             "READY_SUPPLEMENTAL" => self.ready_supplemental(d),
@@ -587,12 +595,15 @@ impl State {
             "STATE_UPDATE" => self.state_update(d),
             "VOICE_STATE_UPDATE_BATCH" => self.voice_batch(d),
             "PASSIVE_UPDATE_V2" => self.passive_update_v2(d),
-            _ => false,
+            _ => {
+                known = false;
+                false
+            }
         };
         if changed {
             self.revision += 1;
         }
-        changed
+        (changed, known)
     }
 
     fn ready(&mut self, d: &Value) -> bool {

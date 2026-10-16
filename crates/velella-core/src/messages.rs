@@ -1193,11 +1193,9 @@ impl MessageStore {
         self.bump();
     }
 
-    /// Runs on the session task for every dispatch; must not block.
-    pub(crate) fn observe(&self, name: &str, d: &Value) {
-        #[cfg(test)]
-        self.seen.lock().unwrap().push(name.to_owned());
-        if !matches!(
+    /// The dispatches `observe` acts on.
+    pub(crate) fn observes(name: &str) -> bool {
+        matches!(
             name,
             "MESSAGE_CREATE"
                 | "MESSAGE_UPDATE"
@@ -1208,7 +1206,14 @@ impl MessageStore {
                 | "MESSAGE_REACTION_REMOVE_EMOJI"
                 | "MESSAGE_REACTION_ADD_MANY"
                 | "MESSAGE_POLL_VOTE_ADD_MANY"
-        ) {
+        )
+    }
+
+    /// Runs on the session task for every dispatch; must not block.
+    pub(crate) fn observe(&self, name: &str, d: &Value) {
+        #[cfg(test)]
+        self.seen.lock().unwrap().push(name.to_owned());
+        if !Self::observes(name) {
             return;
         }
         let mut inner = self.lock();

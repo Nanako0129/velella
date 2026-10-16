@@ -202,9 +202,11 @@ impl Shared {
     // switch to per-guild Arcs if profiling says otherwise.
     fn apply(&self, event: &str, d: &Value) -> bool {
         let user_id;
+        let known;
         let changed = {
             let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            let changed = Arc::make_mut(&mut guard).apply(event, d);
+            let changed;
+            (changed, known) = Arc::make_mut(&mut guard).apply_known(event, d);
             if changed {
                 self.revision.send_replace(guard.revision);
             }
@@ -226,7 +228,76 @@ impl Shared {
                 store.typing_start(d, &self.snapshot());
             }
         }
+        let handled = known || MessageStore::observes(event) || event == "TYPING_START";
+        diagnose(self.rest.identity().launch(), event, d, handled);
         changed
+    }
+}
+
+/// A key fit for the live-check log: an identifier. Anything else (an id used as a map key, a
+/// value-like string) is written as `<other>`, so no id or value can reach the line.
+fn key_name(key: &str) -> &str {
+    let mut bytes = key.bytes();
+    let first_ok = bytes
+        .next()
+        .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_');
+    if first_ok && key.len() <= 64 && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        key
+    } else {
+        "<other>"
+    }
+}
+
+/// The sorted top-level key names of an object (nothing for anything else); never a value.
+fn key_list(v: &Value) -> String {
+    let mut names: Vec<&str> = v
+        .as_object()
+        .map(|o| o.keys().map(|k| key_name(k)).collect())
+        .unwrap_or_default();
+    names.sort_unstable();
+    names.dedup();
+    names.join(",")
+}
+
+/// The Live row's names-only lines (menu plan ID): READY's and its first guild's key names,
+/// READY_SUPPLEMENTAL's, and every dispatch name nothing handles — each once per launch.
+fn diagnose(launch: &Launch, event: &str, d: &Value, handled: bool) {
+    match event {
+        "READY" => {
+            launch.diagnose_once("READY_KEYS", || format!("READY_KEYS {}", key_list(d)));
+            if let Some(guild) = d
+                .get("guilds")
+                .and_then(Value::as_array)
+                .and_then(|g| g.first())
+                .filter(|g| g.is_object())
+            {
+                launch.diagnose_once("READY_GUILD_KEYS", || {
+                    let mut line = format!("READY_GUILD_KEYS {}", key_list(guild));
+                    if let Some(p) = guild.get("properties").filter(|p| p.is_object()) {
+                        line.push_str(&format!("; properties: {}", key_list(p)));
+                    }
+                    line
+                });
+            }
+        }
+        "READY_SUPPLEMENTAL" => launch.diagnose_once("READY_SUPPLEMENTAL_KEYS", || {
+            format!("READY_SUPPLEMENTAL_KEYS {}", key_list(d))
+        }),
+        _ if !handled => {
+            let name = if !event.is_empty()
+                && event.len() <= 64
+                && event
+                    .bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+            {
+                event
+            } else {
+                "<other>"
+            };
+            let line = format!("UNHANDLED_DISPATCH {name}");
+            launch.diagnose_once(&line.clone(), || line);
+        }
+        _ => {}
     }
 }
 
