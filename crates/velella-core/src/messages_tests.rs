@@ -721,7 +721,7 @@ async fn sends_post_the_exact_body_with_a_fresh_nonce_each() {
         let body: Value = serde_json::from_str(raw.split("\r\n\r\n").nth(1).unwrap()).unwrap();
         assert_eq!(
             body,
-            json!({"content": "hi", "nonce": nonce, "tts": false, "flags": 0})
+            json!({"mobile_network_type": "unknown", "content": "hi", "nonce": nonce, "tts": false, "flags": 0})
         );
     }
     let s = now(&store, epoch);

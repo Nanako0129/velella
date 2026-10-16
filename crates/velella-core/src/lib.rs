@@ -4,6 +4,7 @@
 //! runtime. Nothing here owns a runtime.
 mod compression;
 pub mod embeds;
+mod frecency_proto;
 mod gateway;
 mod guild_settings;
 pub mod highlight;
@@ -20,6 +21,7 @@ mod reactions;
 mod read_state;
 mod relationships;
 mod rest;
+mod rest_actions;
 mod rest_messages;
 mod session;
 mod settings_proto;
@@ -40,6 +42,8 @@ mod proto_tests;
 #[cfg(test)]
 mod ready_shapes_tests;
 #[cfg(test)]
+mod rest_actions_tests;
+#[cfg(test)]
 mod rest_tests;
 #[cfg(test)]
 mod session_tests;
@@ -56,6 +60,11 @@ pub use messages::{
 };
 pub use presence::PresenceStatus;
 pub use reactions::Reaction;
+pub use rest::{ActionError, ApiCode, MfaChallenge, MfaKind, MfaMethod};
+pub use rest_actions::{
+    thread_state, AckFlags, Actions, Emoji, PinnedMessage, PinsPage, ReactionLocation,
+    ReactionType, SaveSource, SavedMessage, ThreadState, Tri,
+};
 pub use session::{Session, SessionEvent, SessionHandle, Subscription};
 pub use sidebar::{
     channel_categories, dm_list, guild_entries, SidebarCategory, SidebarChannel, SidebarDm,

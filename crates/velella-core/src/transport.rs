@@ -21,6 +21,10 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub enum Method {
     Get,
     Post,
+    /// PUT, PATCH and DELETE: slice F2's actions.
+    Put,
+    Patch,
+    Delete,
 }
 
 impl Method {
@@ -28,6 +32,9 @@ impl Method {
         match self {
             Self::Get => "GET",
             Self::Post => "POST",
+            Self::Put => "PUT",
+            Self::Patch => "PATCH",
+            Self::Delete => "DELETE",
         }
     }
 }

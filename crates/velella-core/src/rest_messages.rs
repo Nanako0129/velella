@@ -1,27 +1,98 @@
-//! Typed message endpoints on the session's `Rest` (plan M). Paths are built from `u64` ids only,
-//! so nothing from a payload or the UI can shape the URL; `Rest` still validates it.
-use crate::rest::{Rest, RestError};
+//! Typed message endpoints on the session's `Rest` (plan M, menu plan F2). Paths are built from
+//! `u64` ids only, so nothing from a payload or the UI can shape the URL; `Rest` still validates
+//! it.
+//!
+//! Sends, replies, forwards and forward comments are one `POST /channels/{c}/messages` whose
+//! body follows §18.4 in key order: `mobile_network_type`, `content`, `nonce`, `tts`, then
+//! `message_reference` and `allowed_mentions` when present, then `flags` (always). Each carries
+//! `X-Context-Properties` (`chat_input`, or `forwarding`, §17.1) and is retried only when the
+//! request provably never reached Discord (D11: connect failed, 522, 523), with the same bytes.
+use crate::{
+    rest::{ActionError, Call, Context, Rest, RestError, Retry},
+    transport::Method,
+};
 use serde::Serialize;
 use serde_json::Value;
+use std::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
-/// The send body: `{content, nonce, tts:false, flags:0}`, plus `message_reference` for a reply.
-/// No `allowed_mentions`, so Discord's default applies (the replied user is pinged).
+/// SUPPRESS_NOTIFICATIONS (`@silent`, §7.3, §18.4).
+const SUPPRESS_NOTIFICATIONS: u64 = 1 << 12;
+const DISCORD_EPOCH_MS: u64 = 1_420_070_400_000;
+
+/// `{parse:["users","roles","everyone"], replied_user:false}`: a reply (or the edit of one) that
+/// does not ping its author (§4.2, §18.4).
+#[derive(Serialize)]
+pub(crate) struct AllowedMentions {
+    parse: [&'static str; 3],
+    replied_user: bool,
+}
+
+impl AllowedMentions {
+    pub(crate) fn reply_ping_off() -> AllowedMentions {
+        AllowedMentions {
+            parse: ["users", "roles", "everyone"],
+            replied_user: false,
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct CreateMessage<'a> {
+    mobile_network_type: &'static str,
     content: &'a str,
     nonce: &'a str,
     tts: bool,
-    flags: u8,
     #[serde(skip_serializing_if = "Option::is_none")]
     message_reference: Option<MessageReference>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    allowed_mentions: Option<AllowedMentions>,
+    flags: u64,
 }
 
-/// Ids as decimal strings, as Discord's snowflakes travel in JSON.
+/// Ids as decimal strings, as Discord's snowflakes travel in JSON. A reply has no `type`; a
+/// forward has `type: 1` (§7.1).
 #[derive(Serialize)]
 struct MessageReference {
-    message_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    guild_id: Option<String>,
     channel_id: String,
-    fail_if_not_exists: bool,
+    message_id: String,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    kind: Option<u8>,
+}
+
+/// The message a send replies to (same channel). `guild_id` is omitted in DMs.
+pub(crate) struct Reply {
+    pub(crate) guild_id: Option<u64>,
+    pub(crate) message_id: u64,
+    /// The reply's mention toggle: off sends `allowed_mentions` with `replied_user: false`.
+    pub(crate) mention: bool,
+}
+
+/// A fresh nonce: a snowflake of the current millisecond, strictly increasing within the
+/// process. Bit 21 is set so it never equals a nonce of the existing send's generator in
+/// `messages.rs` (which counts up from bit 0 within a millisecond).
+// ponytail: a second generator beside messages.rs's private one; slice B folds them into one
+// when it moves the send caller here.
+pub(crate) fn nonce() -> String {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(DISCORD_EPOCH_MS, |d| {
+            u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+        });
+    let candidate = (now_ms.saturating_sub(DISCORD_EPOCH_MS) << 22) | (1 << 21);
+    let mut previous = LAST.load(Ordering::Relaxed);
+    loop {
+        let next = candidate.max(previous.saturating_add(1));
+        match LAST.compare_exchange_weak(previous, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return next.to_string(),
+            Err(seen) => previous = seen,
+        }
+    }
 }
 
 impl Rest {
@@ -37,8 +108,8 @@ impl Rest {
             .await
     }
 
-    /// One plain-text message, a reply to `reply_to` in the same channel if given. POST is never
-    /// retried (`Rest` rule).
+    /// The existing send (its caller has no guild id or mention toggle yet): a reply pings its
+    /// author and carries no `guild_id`. Slice B moves the caller to `send_message`.
     pub(crate) async fn create_message(
         &self,
         channel_id: u64,
@@ -46,18 +117,104 @@ impl Rest {
         nonce: &str,
         reply_to: Option<u64>,
     ) -> Result<Value, RestError> {
+        let reply = reply_to.map(|message_id| Reply {
+            guild_id: None,
+            message_id,
+            mention: true,
+        });
+        Ok(self.send_message(channel_id, content, nonce, reply).await?)
+    }
+
+    async fn post_message(
+        &self,
+        channel_id: u64,
+        body: &CreateMessage<'_>,
+        context: Context,
+    ) -> Result<Value, ActionError> {
+        let call = Call::new(Method::Post, &format!("/channels/{channel_id}/messages"))?
+            .json(body)?
+            .context(context);
+        self.call(&call, Retry::Send).await
+    }
+
+    /// One chat-input message (§18.4), a reply when `reply` is given.
+    pub(crate) async fn send_message(
+        &self,
+        channel_id: u64,
+        content: &str,
+        nonce: &str,
+        reply: Option<Reply>,
+    ) -> Result<Value, ActionError> {
+        let allowed_mentions = reply
+            .as_ref()
+            .filter(|r| !r.mention)
+            .map(|_| AllowedMentions::reply_ping_off());
         let body = CreateMessage {
+            mobile_network_type: "unknown",
             content,
             nonce,
             tts: false,
-            flags: 0,
-            message_reference: reply_to.map(|message_id| MessageReference {
-                message_id: message_id.to_string(),
+            message_reference: reply.map(|r| MessageReference {
+                guild_id: r.guild_id.map(|g| g.to_string()),
                 channel_id: channel_id.to_string(),
-                fail_if_not_exists: false,
+                message_id: r.message_id.to_string(),
+                kind: None,
             }),
+            allowed_mentions,
+            flags: 0,
         };
-        self.post(&format!("/channels/{channel_id}/messages"), &body)
+        self.post_message(channel_id, &body, Context::ChatInput)
+            .await
+    }
+
+    /// A forward (§7.1): `content:""` and `message_reference {guild_id (the origin's, omitted
+    /// for a DM), channel_id, message_id, type:1}` to `destination_id`. Always the whole message
+    /// (`forward_only` is never sent).
+    pub(crate) async fn forward_message(
+        &self,
+        destination_id: u64,
+        origin_guild_id: Option<u64>,
+        origin_channel_id: u64,
+        origin_message_id: u64,
+        nonce: &str,
+        silent: bool,
+    ) -> Result<Value, ActionError> {
+        let body = CreateMessage {
+            mobile_network_type: "unknown",
+            content: "",
+            nonce,
+            tts: false,
+            message_reference: Some(MessageReference {
+                guild_id: origin_guild_id.map(|g| g.to_string()),
+                channel_id: origin_channel_id.to_string(),
+                message_id: origin_message_id.to_string(),
+                kind: Some(1),
+            }),
+            allowed_mentions: None,
+            flags: if silent { SUPPRESS_NOTIFICATIONS } else { 0 },
+        };
+        self.post_message(destination_id, &body, Context::Forwarding)
+            .await
+    }
+
+    /// A forward's comment (§7.3): a plain message to the same destination, `forwarding`.
+    pub(crate) async fn forward_comment(
+        &self,
+        destination_id: u64,
+        content: &str,
+        nonce: &str,
+        silent: bool,
+    ) -> Result<Value, ActionError> {
+        let body = CreateMessage {
+            mobile_network_type: "unknown",
+            content,
+            nonce,
+            tts: false,
+            message_reference: None,
+            allowed_mentions: None,
+            flags: if silent { SUPPRESS_NOTIFICATIONS } else { 0 },
+        };
+        self.post_message(destination_id, &body, Context::Forwarding)
             .await
     }
 }

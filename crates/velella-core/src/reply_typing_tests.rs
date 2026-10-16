@@ -75,8 +75,8 @@ async fn a_reply_posts_message_reference_and_leaves_mentions_at_the_default() {
     assert_eq!(
         body,
         json!({
-            "content": "answer", "nonce": nonce, "tts": false, "flags": 0,
-            "message_reference": {"message_id": "30", "channel_id": "5", "fail_if_not_exists": false},
+            "mobile_network_type": "unknown", "content": "answer", "nonce": nonce, "tts": false,
+            "flags": 0, "message_reference": {"channel_id": "5", "message_id": "30"},
         })
     );
     assert!(body.get("allowed_mentions").is_none());
