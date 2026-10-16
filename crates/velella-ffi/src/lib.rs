@@ -17,10 +17,12 @@ mod actions;
 mod markdown;
 mod members;
 mod messages;
+mod permissions;
 mod transport;
 pub use actions::*;
 pub use markdown::*;
 pub use messages::*;
+pub use permissions::*;
 pub use transport::*;
 
 /// The one process-wide runtime. Exported async fns spawn onto it and await the

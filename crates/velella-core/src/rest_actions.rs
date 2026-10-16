@@ -157,10 +157,31 @@ pub struct ThreadState {
     pub manage_threads: Tri,
 }
 
-/// The thread state of `channel_id` from current state. All Unknown until slice F1 fills it
-/// from `threads.rs` and MANAGE_THREADS (phase 3).
-pub fn thread_state(_state: &State, _channel_id: u64) -> ThreadState {
-    ThreadState::default()
+impl From<Option<bool>> for Tri {
+    fn from(known: Option<bool>) -> Self {
+        match known {
+            Some(true) => Tri::Yes,
+            Some(false) => Tri::No,
+            None => Tri::Unknown,
+        }
+    }
+}
+
+/// The thread state of `channel_id` from current state (slice F1): `archived` and `locked` from
+/// the thread's metadata (Unknown when the payload carried none), `joined` as `threads.rs` tracks
+/// it, `manage_threads` from the permissions. All Unknown for a channel that is not a known thread.
+pub fn thread_state(state: &State, channel_id: u64) -> ThreadState {
+    let Some(t) = state.threads.get(channel_id) else {
+        return ThreadState::default();
+    };
+    ThreadState {
+        archived: t.archived_known.then_some(t.archived).into(),
+        locked: t.locked.into(),
+        joined: Some(t.joined).into(),
+        manage_threads: crate::permissions::channel_permissions(state, channel_id)
+            .can(crate::permissions::MANAGE_THREADS)
+            .into(),
+    }
 }
 
 /// The guild a channel or thread belongs to, from current state; `None` for DMs and unknown

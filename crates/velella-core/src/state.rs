@@ -7,6 +7,7 @@ use crate::permissions;
 use crate::presence::Presence;
 use crate::read_state::ReadStates;
 use crate::relationships::Relationships;
+use crate::self_state::SelfState;
 use crate::settings_proto::UserSettings;
 use crate::threads::Threads;
 use crate::voice::VoiceStates;
@@ -156,6 +157,8 @@ pub struct State {
     /// Raw `apex_experiments` objects for slice X, in arrival order: READY's, then each
     /// STATE_UPDATE's (each overwrites the units it lists). Rebuilt by READY.
     pub apex_experiments: Vec<Value>,
+    /// Slice F1: premium type, guild emojis and the own member's timeouts. Rebuilt by READY.
+    pub self_state: SelfState,
 }
 
 /// STATE_UPDATEs kept after READY's entry; older ones are dropped first.
@@ -595,6 +598,8 @@ impl State {
             "STATE_UPDATE" => self.state_update(d),
             "VOICE_STATE_UPDATE_BATCH" => self.voice_batch(d),
             "PASSIVE_UPDATE_V2" => self.passive_update_v2(d),
+            "GUILD_EMOJIS_UPDATE" => self.self_state.emojis_update(d),
+            "USER_UPDATE" => self.self_state.user_update(d, self.user_id),
             _ => {
                 known = false;
                 false
@@ -679,6 +684,7 @@ impl State {
         if let Some(a) = d.get("apex_experiments").filter(|a| a.is_object()) {
             self.apex_experiments.push(a.clone());
         }
+        self.self_state.ready(d, me.id);
         true
     }
 
@@ -842,6 +848,7 @@ impl State {
                 changed = true;
             }
         }
+        self.self_state.ready_supplemental(d, self.user_id);
         // Voice occupants (and threads, when present) per guild; the roles loop above skips a guild
         // without a usable merged member, so this walks the guilds again on their own.
         for raw in d
@@ -914,6 +921,7 @@ impl State {
     }
 
     fn guild_create(&mut self, d: &Value) -> bool {
+        self.self_state.guild_create(d, self.user_id);
         if is_partial(d) {
             return self.partial_guild_create(d);
         }
@@ -1052,6 +1060,7 @@ impl State {
     }
 
     fn self_member_update(&mut self, d: &Value) -> bool {
+        self.self_state.member_update(d, self.user_id);
         let (Some(own), Some(gid)) = (self.user_id, get_id(d, "guild_id")) else {
             return false;
         };

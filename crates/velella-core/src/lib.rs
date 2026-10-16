@@ -25,6 +25,7 @@ mod relationships;
 mod rest;
 mod rest_actions;
 mod rest_messages;
+mod self_state;
 mod session;
 mod settings_proto;
 mod sidebar;
@@ -39,6 +40,8 @@ mod voice;
 mod fixture_tests;
 #[cfg(test)]
 mod member_list_tests;
+#[cfg(test)]
+mod permissions_tests;
 #[cfg(test)]
 mod proto_tests;
 #[cfg(test)]
@@ -60,6 +63,10 @@ pub use messages::{
     EmojiImage, LoadState, MentionKind, MessageImage, MessageReply, MessageRow,
     MessageSubscription, MessagesSnapshot, OlderState, ResolvedMention,
 };
+pub use permissions::{
+    channel_permissions, channel_permissions_at, ChannelPermissions, ALL_PERMISSIONS,
+    PERMISSION_TABLE,
+};
 pub use presence::PresenceStatus;
 pub use reactions::Reaction;
 pub use rest::{ActionError, ApiCode, MfaChallenge, MfaKind, MfaMethod};
@@ -67,6 +74,7 @@ pub use rest_actions::{
     thread_state, AckFlags, Actions, Emoji, PinnedMessage, PinsPage, ReactionLocation,
     ReactionType, SaveSource, SavedMessage, ThreadState, Tri,
 };
+pub use self_state::{GuildEmoji, SelfState, Timeout};
 pub use session::{
     IdentityEvent, IdentityNotice, RefreshedToken, Session, SessionEvent, SessionHandle,
     SessionOptions, Subscription,
