@@ -1312,6 +1312,17 @@ impl MessageStore {
         })
     }
 
+    /// The reply preview (`preview`'s rules: spoilers as the placeholder, text only) of buffered
+    /// message `id` of the channel opened at `epoch`: one flatten under the store lock. `None` once
+    /// that buffer was left or replaced, or when `id` is not buffered (echoes are not looked up:
+    /// the menu offers Reply on sent rows only).
+    fn preview(&self, epoch: u64, id: u64, ctx: &Context) -> Option<String> {
+        let inner = self.lock();
+        let open = inner.open.as_ref().filter(|o| o.epoch == epoch)?;
+        let i = open.messages.binary_search_by_key(&id, |s| s.id).ok()?;
+        Some(preview(&open.messages[i], ctx))
+    }
+
     /// TYPING_START (`d`), called by the session after `State::apply` with the state it left.
     /// Only the open channel counts and the self user never does; a user the payload and the state
     /// both fail to name is skipped. The entry's expiry bumps the store (`expire_typing`). Needs a
@@ -1397,6 +1408,8 @@ pub struct MessageSubscription {
     store: Arc<MessageStore>,
     epoch: u64,
     task: JoinHandle<()>,
+    /// The role and channel names the snapshots resolve mentions with.
+    names: watch::Receiver<Context>,
     _context: Subscription,
 }
 
@@ -1405,6 +1418,15 @@ impl MessageSubscription {
     /// `MessageStore::load_older`); the result arrives as a snapshot. Needs a runtime context.
     pub fn load_older(&self) {
         self.store.load_older(self.epoch);
+    }
+
+    /// The one-line reply preview of buffered message `message_id` of this subscription's
+    /// channel, by the rules of a row's reply preview (a spoiler and everything in it become the
+    /// placeholder; emoji `:name:`; text only). `None` when the message is not buffered or this
+    /// subscription's channel is no longer the open one.
+    pub fn preview(&self, message_id: u64) -> Option<String> {
+        let ctx = self.names.borrow().clone();
+        self.store.preview(self.epoch, message_id, &ctx)
     }
 }
 
@@ -1436,6 +1458,7 @@ impl SessionHandle {
                 names_tx.send_replace(c);
             },
         );
+        let preview_names = names.clone();
         let mut revision = store.revision.subscribe();
         let buffer = store.clone();
         let task = tokio::spawn(async move {
@@ -1460,6 +1483,7 @@ impl SessionHandle {
             store,
             epoch,
             task,
+            names: preview_names,
             _context: state,
         }
     }

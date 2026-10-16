@@ -1392,6 +1392,43 @@ mod messages_live {
         assert_eq!(mock.count(), 1, "only the history GET");
     }
 
+    /// Selection plan C1 Reply: the menu's per-message preview call flattens one buffered message
+    /// by core's spoiler-safe rules, so hidden spoiler text never reaches the reply bar; it answers
+    /// only for its own, still open channel.
+    #[tokio::test]
+    async fn the_per_message_preview_never_returns_spoiler_text() {
+        let author = json!({"id": "9", "username": "u9"});
+        let history = json!([
+            {"id": "12", "channel_id": "20", "content": "||```secret```||", "author": author},
+            {"id": "11", "channel_id": "20", "content": "a ||secret|| b", "author": author},
+        ]);
+        let mock = MockHttp::start(vec![ok(history), ok(json!([]))]).await;
+        mock.install();
+        let rig = Rig::start().await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sub = rig.handle.subscribe_messages(20, move |s| {
+            let _ = tx.send(s);
+        });
+        until(&mut rx, |s| s.load == LoadState::Loaded).await;
+        let placeholder = "\u{2592}\u{2592}\u{2592}";
+        assert_eq!(
+            sub.preview(11).as_deref(),
+            Some(&*format!("a {placeholder} b"))
+        );
+        assert_eq!(sub.preview(12).as_deref(), Some(placeholder));
+        for id in [11, 12] {
+            assert!(!sub.preview(id).unwrap().contains("secret"));
+        }
+        assert_eq!(sub.preview(99), None, "not buffered");
+        // Another channel opened: the first subscription answers nothing.
+        let (tx2, mut rx2) = mpsc::unbounded_channel();
+        let _other = rig.handle.subscribe_messages(21, move |s| {
+            let _ = tx2.send(s);
+        });
+        until(&mut rx2, |s| s.load == LoadState::Loaded).await;
+        assert_eq!(sub.preview(11), None);
+    }
+
     /// D and M both read MESSAGE_CREATE: the state (unread, mentions) and the message buffer.
     #[tokio::test]
     async fn one_message_create_reaches_both_the_sidebar_state_and_the_buffer() {

@@ -13,8 +13,9 @@ public struct ShellView: View {
     /// Owned by the app (or a fixture), so its later changes reach the window.
     @Binding private var state: ShellState
     private let onSignIn: (() -> Void)?
-    private let onSend: ((String, String?) -> Void)?
+    private let onSend: ((String, ReplyTarget?) -> Void)?
     private let onLoadOlder: (() -> Void)?
+    private let replyPreview: ((String) -> String?)?
     @State private var showMembers = true
     @State private var search = ""
     /// Starts at the sidebar's ideal width, not 0: the title's frame is this minus the reserved
@@ -24,17 +25,20 @@ public struct ShellView: View {
 
     /// - Parameters:
     ///   - onSignIn: shown as "Sign In…" on the signed-out placeholder when set.
-    ///   - onSend: receives the composer's text and the reply target's message id (nil without a
-    ///     reply); nil (fixtures, `--demo`) sends nothing.
+    ///   - onSend: receives the composer's text and the reply target (nil without a reply); nil
+    ///     (fixtures, `--demo`) sends nothing.
     ///   - onLoadOlder: asks for the page of messages before the oldest shown; nil sends nothing.
+    ///   - replyPreview: core's one-line reply preview of a message of the open conversation, by
+    ///     id, flattened when the message menu opens; nil leaves the reply bar's line empty.
     public init(
-        state: Binding<ShellState>, onSignIn: (() -> Void)? = nil, onSend: ((String, String?) -> Void)? = nil,
-        onLoadOlder: (() -> Void)? = nil
+        state: Binding<ShellState>, onSignIn: (() -> Void)? = nil, onSend: ((String, ReplyTarget?) -> Void)? = nil,
+        onLoadOlder: (() -> Void)? = nil, replyPreview: ((String) -> String?)? = nil
     ) {
         _state = state
         self.onSignIn = onSignIn
         self.onSend = onSend
         self.onLoadOlder = onLoadOlder
+        self.replyPreview = replyPreview
     }
 
     public var body: some View {
@@ -68,6 +72,7 @@ public struct ShellView: View {
                 header: state.header, conversationID: state.openTarget ?? "",
                 isSignedIn: state.isSignedIn, messages: state.messages,
                 load: state.messageLoad, reply: $state.reply, draft: $state.draft, onSend: onSend,
+                conversation: state.conversation, replyPreview: replyPreview,
                 older: state.older, onLoadOlder: onLoadOlder, typing: state.typing
             )
                 // No minimum of its own: SwiftUI's `.inspector` adds the floating sidebar's current
