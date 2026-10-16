@@ -801,6 +801,90 @@ mod subscriptions {
         // The handle is still alive, yet the driver has returned and dropped its closure.
         assert_eq!(timeout(WAIT, rx.recv()).await.unwrap(), None);
     }
+
+    // ---- Self state (composer plan CG: the message-length limit follows premium_type) ----
+
+    /// A READY for user 1 whose `premium_type` is `premium` and, when given, whose settings proto
+    /// has Developer Mode `developer_mode`.
+    fn self_ready(premium: u8, developer_mode: Option<bool>) -> Value {
+        let mut d = world(vec![], Value::Null, json!([]), vec![]);
+        d["user"]["premium_type"] = json!(premium);
+        if let Some(on) = developer_mode {
+            d["user_settings_proto"] = json!(crate::settings_proto::tests::settings(&[(
+                13,
+                crate::permissions_tests::appearance(on),
+            )]));
+        }
+        d
+    }
+
+    #[tokio::test]
+    async fn a_user_update_of_premium_type_emits_a_snapshot_and_nothing_else_does() {
+        let mut rig = Rig::start().await;
+        let mut conn = send_ready(&mut rig, self_ready(0, None)).await;
+        let (_sub, mut rx) = watch(&rig, crate::self_snapshot);
+        let first = next(&mut rx).await;
+        assert_eq!(first.premium_type, Some(0));
+        // Another user's update, and the user's own with nothing changed: no delivery.
+        conn.send(dispatch(
+            2,
+            "USER_UPDATE",
+            json!({"id": "77", "premium_type": 2}),
+        ))
+        .await;
+        conn.send(dispatch(
+            3,
+            "USER_UPDATE",
+            json!({"id": "1", "premium_type": 0}),
+        ))
+        .await;
+        assert!(
+            silent(&mut rx).await,
+            "an update that changes nothing here emitted"
+        );
+        conn.send(dispatch(
+            4,
+            "USER_UPDATE",
+            json!({"id": "1", "premium_type": 2}),
+        ))
+        .await;
+        let after = next(&mut rx).await;
+        assert_eq!(after.premium_type, Some(2));
+        assert_eq!((after.developer_mode, after.guild_emojis.len()), (None, 0));
+        assert!(silent(&mut rx).await, "one change, one snapshot");
+    }
+
+    #[tokio::test]
+    async fn subscribing_before_ready_gets_unknown_and_then_the_ready_value() {
+        let mut rig = Rig::start().await;
+        let (_sub, mut rx) = watch(&rig, crate::self_snapshot);
+        assert_eq!(next(&mut rx).await.premium_type, None);
+        let _conn = send_ready(&mut rig, self_ready(2, None)).await;
+        assert_eq!(next(&mut rx).await.premium_type, Some(2));
+    }
+
+    #[tokio::test]
+    async fn a_settings_update_flipping_developer_mode_emits_a_snapshot_with_it_flipped() {
+        let mut rig = Rig::start().await;
+        let mut conn = send_ready(&mut rig, self_ready(0, Some(false))).await;
+        let (_sub, mut rx) = watch(&rig, crate::self_snapshot);
+        assert_eq!(next(&mut rx).await.developer_mode, Some(false));
+        let flip = crate::settings_proto::tests::settings(&[(
+            13,
+            crate::permissions_tests::appearance(true),
+        )]);
+        conn.send(dispatch(
+            2,
+            "USER_SETTINGS_PROTO_UPDATE",
+            json!({"settings": {"type": 1, "proto": flip}, "partial": true}),
+        ))
+        .await;
+        let after = next(&mut rx).await;
+        assert_eq!(
+            (after.developer_mode, after.premium_type),
+            (Some(true), Some(0))
+        );
+    }
 }
 
 // ---- Member-list subscription (op 37), through the mock gateway ----

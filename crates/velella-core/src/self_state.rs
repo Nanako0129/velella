@@ -289,3 +289,29 @@ impl State {
             .collect()
     }
 }
+
+/// The signed-in user's own state as a value a subscription can compare (menu plan F1, composer
+/// plan CG): `SessionHandle::subscribe(self_snapshot, ..)` delivers it on subscribe and whenever a
+/// state change alters it (USER_UPDATE premium_type, a settings update, GUILD_EMOJIS_UPDATE).
+/// `None` is Unknown, never a default.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SelfSnapshot {
+    pub premium_type: Option<u8>,
+    pub developer_mode: Option<bool>,
+    pub render_reactions: Option<bool>,
+    /// Guilds whose emoji list is known, in guild order.
+    pub guild_emojis: Vec<(u64, Vec<GuildEmoji>)>,
+}
+
+pub fn self_snapshot(state: &State) -> SelfSnapshot {
+    SelfSnapshot {
+        premium_type: state.self_state.premium_type,
+        developer_mode: state.developer_mode(),
+        render_reactions: state.render_reactions(),
+        guild_emojis: state
+            .guild_emojis()
+            .into_iter()
+            .map(|(guild, emojis)| (guild, emojis.to_vec()))
+            .collect(),
+    }
+}

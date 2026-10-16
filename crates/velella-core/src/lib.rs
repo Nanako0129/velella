@@ -78,7 +78,7 @@ pub use rest_actions::{
     thread_state, AckFlags, Actions, Emoji, PinnedMessage, PinsPage, ReactionLocation,
     ReactionType, SaveSource, SavedMessage, ThreadState, Tri,
 };
-pub use self_state::{GuildEmoji, OwnMember, SelfState, Timeout};
+pub use self_state::{self_snapshot, GuildEmoji, OwnMember, SelfSnapshot, SelfState, Timeout};
 pub use session::{
     IdentityEvent, IdentityNotice, RefreshedToken, Session, SessionEvent, SessionHandle,
     SessionOptions, Subscription,

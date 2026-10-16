@@ -1,6 +1,7 @@
 //! The open channel's permissions and the signed-in user's own state across FFI (menu plan F1).
 //! Both are computed in core from current state on every call; nothing is cached here.
-use crate::SessionHandle;
+use crate::{SessionHandle, SidebarSubscription};
+use std::sync::Arc;
 use velella_core as core;
 
 /// The user's permissions in one channel. `Private` is a DM or group DM: every permission test is
@@ -76,23 +77,29 @@ pub struct SelfState {
 
 impl SelfState {
     fn of(state: &core::State) -> Self {
+        core::self_snapshot(state).into()
+    }
+}
+
+impl From<core::SelfSnapshot> for SelfState {
+    fn from(s: core::SelfSnapshot) -> Self {
         Self {
-            premium_type: state.self_state.premium_type,
-            developer_mode: state.developer_mode(),
-            render_reactions: state.render_reactions(),
-            guild_emojis: state
-                .guild_emojis()
+            premium_type: s.premium_type,
+            developer_mode: s.developer_mode,
+            render_reactions: s.render_reactions,
+            guild_emojis: s
+                .guild_emojis
                 .into_iter()
                 .map(|(guild_id, emojis)| GuildEmojis {
                     guild_id,
                     emojis: emojis
-                        .iter()
+                        .into_iter()
                         .map(|e| GuildEmoji {
                             id: e.id,
-                            name: e.name.clone(),
+                            name: e.name,
                             animated: e.animated,
                             available: e.available,
-                            roles: e.roles.clone(),
+                            roles: e.roles,
                             managed: e.managed,
                         })
                         .collect(),
@@ -100,6 +107,12 @@ impl SelfState {
                 .collect(),
         }
     }
+}
+
+/// Self-state callbacks run on a `velella-rt` thread and must not block.
+#[uniffi::export(with_foreign)]
+pub trait SelfStateListener: Send + Sync {
+    fn on_self_state(&self, state: SelfState);
 }
 
 #[uniffi::export]
@@ -111,6 +124,19 @@ impl SessionHandle {
 
     pub fn self_state(&self) -> SelfState {
         SelfState::of(&self.0.snapshot())
+    }
+
+    /// The user's own state: the current snapshot at once, then again whenever a state change
+    /// alters it (USER_UPDATE, a settings update, emoji changes). Identical snapshots are not
+    /// repeated. Dropping the returned object stops the deliveries.
+    pub fn subscribe_self_state(
+        &self,
+        listener: Arc<dyn SelfStateListener>,
+    ) -> Arc<SidebarSubscription> {
+        let _context = crate::runtime().enter();
+        crate::sidebar(self.0.subscribe(core::self_snapshot, move |snapshot| {
+            listener.on_self_state(snapshot.into())
+        }))
     }
 }
 
