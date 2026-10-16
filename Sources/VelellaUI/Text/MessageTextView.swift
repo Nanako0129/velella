@@ -51,6 +51,12 @@ final class MessageTextView: NSView {
     var message = ""
     var participant = 0
     var partID: PartID { PartID(message: message, part: participant) }
+    /// The row's message menu (W1), from the row around this view; nil outside a row.
+    var openMenu: ((MessageMenuRequest) -> Void)?
+    /// The owning `MarkdownView`'s router: its body numbers this view's link indices.
+    var linkRouter: LinkRouter?
+    /// The press a menu was last opened for: AppKit can ask `menu(for:)` and then deliver it too.
+    private weak var menuEvent: NSEvent?
     /// Whether assistive technology sees this view. The header participant is behind SwiftUI text
     /// that says the same, so it is not an element (N2 Headers).
     var isAccessible = true
@@ -369,6 +375,8 @@ final class MessageTextView: NSView {
     /// past `DesignTokens.TextView.dragThreshold` (N1 Links). The window has already made this view
     /// first responder for the press, as `NSWindow` does for a view that accepts it.
     override func mouseDown(with event: NSEvent) {
+        // A Control-click is a right-click: it opens the menu and leaves the selection alone.
+        if event.modifierFlags.contains(.control) { _ = menu(for: event); return }
         let point = convert(event.locationInWindow, from: nil)
         press = (point, activation(at: point), event.clickCount == 1)
         dragged = false
@@ -413,8 +421,46 @@ final class MessageTextView: NSView {
 
     override func validRequestor(forSendType sendType: NSPasteboard.PasteboardType?, returnType: NSPasteboard.PasteboardType?) -> Any? { nil }
     override func quickLook(with event: NSEvent) {}
-    /// W1 adds the message menu here.
-    override func menu(for event: NSEvent) -> NSMenu? { nil }
+
+    // MARK: Message menu (W1)
+
+    override func rightMouseDown(with event: NSEvent) { _ = menu(for: event) }
+
+    /// Opens the row's message menu for the press; AppKit's own menu never shows (nil).
+    override func menu(for event: NSEvent) -> NSMenu? {
+        guard event !== menuEvent else { return nil }
+        menuEvent = event
+        presentMenu(at: convert(event.locationInWindow, from: nil))
+        return nil
+    }
+
+    /// VoiceOver's Show Menu: no pointer, so no link items; the menu opens at the view's corner.
+    override func accessibilityPerformShowMenu() -> Bool {
+        guard openMenu != nil else { return false }
+        presentMenu(at: nil)
+        return true
+    }
+
+    /// The row's menu for a press at `point` (view coordinates). Link items only when the point lies
+    /// inside a link run's segment frames (S-13), never over a covered run, which carries only its
+    /// spoiler index; Copy only while this view's selection covers something.
+    func presentMenu(at point: CGPoint?) {
+        guard let openMenu else { return }
+        let local = point ?? bounds.origin
+        let screen = window.map { $0.convertPoint(toScreen: convert(local, to: nil)) } ?? NSEvent.mouseLocation
+        let coordinator = selection, board = pasteboard
+        openMenu(MessageMenuRequest(
+            point: screen, window: window, link: point.flatMap(menuLink(at:)),
+            copySelection: coordinator.hasSelection ? { coordinator.copy(to: board) } : nil
+        ))
+    }
+
+    /// The link whose segment frames contain `point`: its index, the target as the owning router's
+    /// body has it now (captured), that router, and the body the router has when asked later.
+    func menuLink(at point: CGPoint) -> MessageMenuLink? {
+        guard case .link(let n) = activation(at: point), let router = linkRouter, router.body.links.indices.contains(n) else { return nil }
+        return (n, router.body.links[n], router, { [weak self] in MainActor.assumeIsolated { self?.linkRouter?.body } })
+    }
 
     // MARK: Accessibility (N0-10): only what is defined here is exposed.
 

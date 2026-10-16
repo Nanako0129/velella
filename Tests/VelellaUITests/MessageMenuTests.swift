@@ -335,8 +335,8 @@ private final class EventWindow: NSWindow {
         id: "300", authorName: "Ada", avatar: .initials("A"), timestamp: Date(timeIntervalSince1970: 0), text: "",
         images: [ImageAttachment(seed: 1, width: 400, height: 300)]
     )
-    let host = NSHostingView(rootView: MessageRow(message: message, startsGroup: true, afterDivider: true) { point, _ in
-        opened.append(point)
+    let host = NSHostingView(rootView: MessageRow(message: message, startsGroup: true, afterDivider: true) { request in
+        opened.append(request.point)
     }.frame(width: 600))
     let height = host.fittingSize.height
     let window = EventWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: height), styleMask: .borderless, backing: .buffered, defer: false)

@@ -86,8 +86,10 @@ private func hasCopyAccent(_ colours: [[UInt8]]) -> Bool {
     #expect(board.string(forType: .html) == nil, "the old contents are cleared")
     #expect(feedback.copied)
     // Other main-actor tests may hold the actor past the cooldown: wait for the reset, bounded.
+    // In a full `swift test` this test took 3.0-4.2 s before W1's suite was added, and with it
+    // failed 3 runs of 10 at 6.3-9.2 s against a 5 s bound (2026-10-17); the bound only stops a hang.
     let start = ContinuousClock.now
-    while feedback.copied, ContinuousClock.now - start < .seconds(5) {
+    while feedback.copied, ContinuousClock.now - start < .seconds(30) {
         try await Task.sleep(for: .milliseconds(20))
     }
     #expect(!feedback.copied)

@@ -6,6 +6,30 @@ private typealias Menu = DesignTokens.Menu
 // The message context menu (docs/plans/selection.md, C1): official Discord's layout
 // (docs/element-map.md, e0-menu-other.png) on a glass panel. Fresh code.
 
+/// The link under the pointer (W1 Link): its index in `router`'s body, the target captured at open,
+/// the router that owns the text (the nearest `MarkdownView`'s), and that view's current body.
+typealias MessageMenuLink = (index: Int, target: LinkTarget, router: LinkRouter, liveBody: () -> MessageBody?)
+
+/// What a right-click hands the row's menu (W1 Trigger): the screen point, the window, and what the
+/// text view under the pointer adds. The row trigger leaves `link` and `copySelection` nil.
+struct MessageMenuRequest {
+    var point: NSPoint
+    var window: NSWindow?
+    var link: MessageMenuLink?
+    var copySelection: (() -> Void)?
+}
+
+struct MessageMenuOpener: @unchecked Sendable { var open: ((MessageMenuRequest) -> Void)? }
+struct LinkRouterBox: @unchecked Sendable { var router: LinkRouter? }
+
+extension EnvironmentValues {
+    /// The row's menu (set by `MessageRow` over the whole row, embeds included): a text view opens
+    /// it for its own row, never for the selection's anchor.
+    @Entry var messageMenu = MessageMenuOpener()
+    /// The nearest `MarkdownView`'s router: its body numbers the link indices of the text below it.
+    @Entry var textLinks = LinkRouterBox()
+}
+
 /// What a menu acts on, captured when it opens (C1 Context): nothing here is read again when an
 /// item is chosen, except `link.liveBody`, which Open Link compares against.
 struct MessageMenuContext {
@@ -19,7 +43,7 @@ struct MessageMenuContext {
     /// nil for a direct message.
     let guildID: String?
     /// The link under the pointer and the router that owns it (W1 supplies it).
-    let link: (index: Int, target: LinkTarget, router: LinkRouter, liveBody: () -> MessageBody?)?
+    let link: MessageMenuLink?
     /// Copies the current selection (W1 supplies it).
     let copySelection: (() -> Void)?
 
@@ -27,7 +51,7 @@ struct MessageMenuContext {
     /// loaded for, never the current selection.
     init(
         message: MessageItem, conversation: ConversationIDs?,
-        link: (index: Int, target: LinkTarget, router: LinkRouter, liveBody: () -> MessageBody?)? = nil,
+        link: MessageMenuLink? = nil,
         copySelection: (() -> Void)? = nil
     ) {
         messageID = message.id
@@ -457,9 +481,10 @@ struct MessageMenuView: View {
 
 /// Laid over a message row (C1 Trigger): takes a right-click, or a Control-click, anywhere on
 /// the row and hands its screen point and window to `open`. Every other event passes through:
-/// for those `hitTest` answers nil, so the row's own views get them.
+/// for those `hitTest` answers nil, so the row's own views get them. So does a right-click on a
+/// message text view (W1 Trigger): the text view opens the menu itself, with its link and selection.
 struct MessageMenuTrigger: NSViewRepresentable {
-    let open: (NSPoint, NSWindow?) -> Void
+    let open: (MessageMenuRequest) -> Void
 
     func makeNSView(context: Context) -> TriggerView {
         let view = TriggerView()
@@ -472,15 +497,26 @@ struct MessageMenuTrigger: NSViewRepresentable {
     }
 
     final class TriggerView: NSView {
-        var open: (NSPoint, NSWindow?) -> Void = { _, _ in }
+        var open: (MessageMenuRequest) -> Void = { _ in }
+        /// Set while asking the window what lies under this overlay.
+        private var lookingThrough = false
 
         static func opensMenu(_ event: NSEvent) -> Bool {
             event.type == .rightMouseDown || (event.type == .leftMouseDown && event.modifierFlags.contains(.control))
         }
 
         override func hitTest(_ point: NSPoint) -> NSView? {
-            guard let event = window?.currentEvent, Self.opensMenu(event) else { return nil }
-            return super.hitTest(point)
+            guard !lookingThrough, let event = window?.currentEvent, Self.opensMenu(event), let hit = super.hitTest(point) else { return nil }
+            return textUnder(point) ? nil : hit
+        }
+
+        /// Whether a message text view is what the press would reach without this overlay.
+        private func textUnder(_ point: NSPoint) -> Bool {
+            guard let content = window?.contentView else { return false }
+            lookingThrough = true
+            defer { lookingThrough = false }
+            let inWindow = superview?.convert(point, to: nil) ?? point
+            return content.hitTest(content.superview?.convert(inWindow, from: nil) ?? inWindow) is MessageTextView
         }
 
         override func rightMouseDown(with event: NSEvent) { fire(event) }
@@ -494,7 +530,7 @@ struct MessageMenuTrigger: NSViewRepresentable {
 
         private func fire(_ event: NSEvent) {
             let point = window.map { $0.convertPoint(toScreen: event.locationInWindow) } ?? NSEvent.mouseLocation
-            open(point, window)
+            open(MessageMenuRequest(point: point, window: window))
         }
     }
 }

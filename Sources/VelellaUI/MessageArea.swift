@@ -35,7 +35,12 @@ struct MessageArea: View {
     /// makes the scroll view hold that row at its place when older rows are prepended.
     @State private var topID: String?
     /// The open message menu, if any (selection plan C1).
-    @State private var menu = MessageMenuPresenter()
+    @State private var ownMenu = MessageMenuPresenter()
+    /// Stands in for the column's own presenter (tests pass one that copies to their board and
+    /// never orders its panel in).
+    var menuPresenter: MessageMenuPresenter?
+    private var menu: MessageMenuPresenter { menuPresenter ?? ownMenu }
+    @Environment(\.textPasteboard) private var textPasteboard
     /// The selection across the column's messages (selection plan N2).
     @State private var selection = SelectionCoordinator()
     @Environment(\.discordLocale) private var discordLocale
@@ -59,13 +64,17 @@ struct MessageArea: View {
             }
     }
 
-    /// Opens the menu for `message` (C1 Trigger); link and selection come with W1.
-    private func openMenu(_ message: MessageItem, at point: NSPoint, in window: NSWindow?) {
-        let context = MessageMenuContext(message: message, conversation: conversation)
+    /// Opens the menu for `message`, the row under the pointer (C1 Trigger, W1 Trigger): the text
+    /// view there adds its link; Copy comes with a selection, the column's when the text view's own
+    /// coordinator has none (a press on padding, an embed).
+    private func openMenu(_ message: MessageItem, _ request: MessageMenuRequest) {
+        let column = selection, board = textPasteboard.board ?? .general
+        let copy = request.copySelection ?? (column.hasSelection ? { column.copy(to: board) } : nil)
+        let context = MessageMenuContext(message: message, conversation: conversation, link: request.link, copySelection: copy)
         // Core flattens the preview now, once, and only when Reply can show (C1 Reply).
         let preview = context.delivery == .sent ? replyPreview?(message.id) : nil
         menu.present(
-            context, body: message.body, conversation: conversation, replyPreview: preview, at: point, from: window
+            context, body: message.body, conversation: conversation, replyPreview: preview, at: request.point, from: request.window
         ) { [reply = $reply] in reply.wrappedValue = $0 }
     }
 
@@ -90,8 +99,8 @@ struct MessageArea: View {
                                     switch entry {
                                     case .divider(_, let date): DateDivider(date: date)
                                     case .row(let message, let startsGroup, let afterDivider):
-                                        MessageRow(message: message, startsGroup: startsGroup, afterDivider: afterDivider) { point, window in
-                                            openMenu(message, at: point, in: window)
+                                        MessageRow(message: message, startsGroup: startsGroup, afterDivider: afterDivider) { request in
+                                            openMenu(message, request)
                                         }
                                             .onAppear { if entry.id == entries.first?.id, older == .idle { onLoadOlder?() } }
                                     }
@@ -228,8 +237,8 @@ struct MessageRow: View {
     let message: MessageItem
     var startsGroup = true
     var afterDivider = false
-    /// A right-click anywhere on the row (C1 Trigger): its screen point and window.
-    var onContextMenu: ((NSPoint, NSWindow?) -> Void)?
+    /// A right-click anywhere on the row (C1 Trigger), with what a text view under it adds (W1).
+    var onContextMenu: ((MessageMenuRequest) -> Void)?
     @Environment(\.discordLocale) private var discordLocale
     @Environment(\.selectionColumn) private var column
     @State private var hovered = false
@@ -304,6 +313,8 @@ struct MessageRow: View {
             // Last in the text column: after the text, attachments and any failure line.
             ReactionsView(reactions: message.reactions)
         }
+        // Every text view of the row (body, header, embeds) opens this row's menu (W1 Trigger).
+        .environment(\.messageMenu, MessageMenuOpener(open: onContextMenu))
         .padding(.leading, M.contentInset)
         .padding(.trailing, M.trailingInset)
         .padding(.vertical, M.rowPaddingVertical)

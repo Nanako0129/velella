@@ -182,6 +182,9 @@ final class SelectionCoordinator {
         case .leftMouseDragged: drag(to: event.locationInWindow)
         case .leftMouseUp: finish()
         case .leftMouseDown:
+            // A Control-click opens the message menu, whose Copy acts on this selection (W1); a
+            // right- or other-button press never reaches here (the monitor's mask, and `default`).
+            guard !event.modifierFlags.contains(.control) else { return }
             // A press in this selection's own text places the next one (`begin`); anywhere else clears.
             guard let content = (event.window ?? views.values.compactMap { $0.view?.window }.first)?.contentView else { return }
             let hit = content.hitTest(content.superview?.convert(event.locationInWindow, from: nil) ?? event.locationInWindow)
