@@ -319,13 +319,7 @@ final class MessageTextView: NSView {
             // The selection colour skips covered runs, as the official client's does.
             let hidden = hiddenRects()
             context.saveGState()
-            if !hidden.isEmpty {
-                let path = CGMutablePath()
-                path.addRect(CGRect(x: -1e6, y: -1e6, width: 2e6, height: 2e6))
-                hidden.forEach { path.addRect($0) }
-                context.addPath(path)
-                context.clip(using: .evenOdd)
-            }
+            if !hidden.isEmpty { clipOutside(hidden, in: context) }
             context.setFillColor(selectionColor.cgColor)
             rects(for: selected, type: .selection).forEach { context.fill($0) }
             context.restoreGState()
@@ -420,6 +414,17 @@ final class MessageTextView: NSView {
 /// NSTextFinderClient or NSAccessibilityNavigableStaticText (N1 View, F-6).
 extension MessageTextView: @preconcurrency NSAccessibilityStaticText {}
 
+/// Clips `context` to everything outside `holes`. The holes are united first: TextKit gives a run
+/// that ends the text its last rect twice (measured by the N1 verifier on `a ||secret||`), and an
+/// even-odd path pairs such duplicates up and clips nothing.
+private func clipOutside(_ holes: [CGRect], in context: CGContext) {
+    let union = CGMutablePath()
+    holes.forEach { union.addRect($0) }
+    let plane = CGPath(rect: CGRect(x: -1e5, y: -1e5, width: 2e5, height: 2e5), transform: nil)
+    context.addPath(plane.subtracting(union, using: .winding))
+    context.clip()
+}
+
 // MARK: Fragments
 
 /// Hands out `TextFragment`s; one per layout manager, kept alive by its view.
@@ -475,19 +480,16 @@ final class TextFragment: NSTextLayoutFragment {
         context.saveGState()
         context.translateBy(x: 0, y: -lift)
         if (textLayoutManager?.delegate as? TextFragmentProvider)?.clipHidden ?? true, !hidden.isEmpty {
-            let path = CGMutablePath()
-            path.addRect(CGRect(x: -1e6, y: -1e6, width: 2e6, height: 2e6))
-            hidden.forEach { path.addRect($0) }
-            context.addPath(path)
-            context.clip(using: .evenOdd)
+            clipOutside(hidden, in: context)
         }
         super.draw(at: point, in: context)
         context.restoreGState()
+        // One path, one fill: a pixel under two of the rects is covered once, not darker.
+        let covers = CGMutablePath()
+        hidden.forEach { covers.addRoundedRect(in: $0, cornerWidth: MarkdownPalette.spoilerRadius, cornerHeight: MarkdownPalette.spoilerRadius) }
+        context.addPath(covers)
         context.setFillColor(NSColor(MarkdownPalette.spoilerCover).cgColor)
-        for rect in hidden {
-            context.addPath(CGPath(roundedRect: rect, cornerWidth: MarkdownPalette.spoilerRadius, cornerHeight: MarkdownPalette.spoilerRadius, transform: nil))
-            context.fillPath()
-        }
+        context.fillPath()
         drawMarker(at: point, in: context)
     }
 
