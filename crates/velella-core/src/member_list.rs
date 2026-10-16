@@ -500,6 +500,7 @@ impl State {
     }
 
     /// The op-37 selection for (`guild_id`, `channel_id`): none for an obfuscated channel (I-5).
+    /// Checked when the selection is made and again each time a connection re-sends it.
     pub(crate) fn member_list_target(&self, guild_id: u64, channel_id: u64) -> Option<(u64, u64)> {
         (!self.is_obfuscated(channel_id)).then_some((guild_id, channel_id))
     }

@@ -88,3 +88,17 @@ private func dmRail(_ state: ShellState) -> RailDM? {
     let busy = ServerButton(guild: guild("x", unread: true, mentions: 4), selected: true) {}
     #expect(busy.hasUnread && busy.mentionCount == 4 && busy.selected)
 }
+
+@Test func aBlockedConversationCannotStaySelected() {
+    var state = ShellState(rail: [.dm(.directMessages), .guild(guild("10"))], selectedRailID: "10")
+    state.selectedChannelID = "20"
+    #expect(!state.dropBlockedSelection { $0 == "21" })
+    #expect(state.selectedChannelID == "20")
+    #expect(state.dropBlockedSelection { $0 == "20" })
+    #expect(state.selectedChannelID == nil)
+    state.selectedRailID = RailDM.directMessages.id
+    state.selectedDMID = "5"
+    #expect(state.dropBlockedSelection { $0 == "5" })
+    #expect(state.selectedDMID == nil)
+    #expect(!state.dropBlockedSelection { _ in true }, "nothing open")
+}

@@ -509,6 +509,7 @@ async fn identity_extras_reach_the_headers_at_send_time() {
         "browser",
         "device",
         "system_locale",
+        "has_client_mods",
         "browser_user_agent",
         "browser_version",
         "os_version",
@@ -519,6 +520,8 @@ async fn identity_extras_reach_the_headers_at_send_time() {
         "release_channel",
         "client_build_number",
         "client_event_source",
+        "client_launch_id",
+        "launch_signature",
     ];
     assert_eq!(top_level_keys(&raw_props(&before)), base_keys);
     let mut with_extras = base_keys.to_vec();

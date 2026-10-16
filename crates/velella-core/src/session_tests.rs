@@ -99,7 +99,7 @@ impl Conn {
     async fn recv_non_beat(&mut self) -> Value {
         loop {
             let packet = self.recv().await;
-            if packet["op"] != 1 {
+            if packet["op"] != 40 {
                 return packet;
             }
         }
@@ -111,7 +111,7 @@ impl Conn {
             match self.next().await {
                 Some(FromClient::Close(code)) => return code,
                 Some(FromClient::Frame(Frame::Text(t)))
-                    if serde_json::from_str::<Value>(&t).is_ok_and(|v| v["op"] == 1) => {}
+                    if serde_json::from_str::<Value>(&t).is_ok_and(|v| v["op"] == 40) => {}
                 other => panic!("expected a close, got {other:?}"),
             }
         }
@@ -124,7 +124,7 @@ impl Conn {
             match tokio::time::timeout_at(deadline, self.end.from_client.recv()).await {
                 Err(_) => return true,
                 Ok(Some(FromClient::Frame(Frame::Text(t))))
-                    if serde_json::from_str::<Value>(&t).is_ok_and(|v| v["op"] == 1) => {}
+                    if serde_json::from_str::<Value>(&t).is_ok_and(|v| v["op"] == 40) => {}
                 Ok(_) => return false,
             }
         }
@@ -155,12 +155,30 @@ struct Rig {
     resume: Listener,
     handle: SessionHandle,
     events: mpsc::UnboundedReceiver<SessionEvent>,
+    identity: mpsc::UnboundedReceiver<crate::IdentityEvent>,
+    /// Every session and identity event's name, in the order the callbacks ran.
+    order: Arc<Mutex<Vec<String>>>,
 }
 
 impl Rig {
     /// A session on the in-memory transport: the gateway endpoints here, HTTP answered by the
     /// mock installed on this thread (if any).
     async fn start() -> Rig {
+        Rig::start_with(crate::SessionOptions::default()).await
+    }
+
+    async fn start_with(mut options: crate::SessionOptions) -> Rig {
+        Rig::start_token(MARKER, options_with_log(&mut options), options).await
+    }
+
+    async fn start_token(
+        token: &str,
+        (order, identity): (
+            Arc<Mutex<Vec<String>>>,
+            mpsc::UnboundedReceiver<crate::IdentityEvent>,
+        ),
+        options: crate::SessionOptions,
+    ) -> Rig {
         capture();
         let (initial_tx, initial) = mpsc::unbounded_channel();
         let (resume_tx, resume) = mpsc::unbounded_channel();
@@ -172,14 +190,29 @@ impl Rig {
             }),
         });
         let (tx, events) = mpsc::unbounded_channel();
-        let handle = Session::connect(Token::new(MARKER.into()).unwrap(), transport, move |e| {
-            let _ = tx.send(e);
-        });
+        let log = order.clone();
+        let handle = Session::connect_with(
+            Token::new(token.into()).unwrap(),
+            transport,
+            options,
+            move |e| {
+                log.lock().unwrap().push(
+                    format!("{e:?}")
+                        .split([' ', '{'])
+                        .next()
+                        .unwrap()
+                        .to_owned(),
+                );
+                let _ = tx.send(e);
+            },
+        );
         Rig {
             initial: Listener(tokio::sync::Mutex::new(initial)),
             resume: Listener(tokio::sync::Mutex::new(resume)),
             handle,
             events,
+            identity,
+            order,
         }
     }
 
@@ -201,6 +234,27 @@ impl Rig {
     }
 }
 
+/// Routes `options`' identity events into a channel and the shared order log.
+fn options_with_log(
+    options: &mut crate::SessionOptions,
+) -> (
+    Arc<Mutex<Vec<String>>>,
+    mpsc::UnboundedReceiver<crate::IdentityEvent>,
+) {
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let (tx, rx) = mpsc::unbounded_channel();
+    let log = order.clone();
+    options.identity_events = Some(Box::new(move |e| {
+        let name = match &e {
+            crate::IdentityEvent::TokenRefreshed { .. } => "TokenRefreshed",
+            crate::IdentityEvent::Notice { .. } => "Notice",
+        };
+        log.lock().unwrap().push(name.to_owned());
+        let _ = tx.send(e);
+    }));
+    (order, rx)
+}
+
 async fn no_connection(listener: &Listener) -> bool {
     timeout(Duration::from_millis(400), listener.accept())
         .await
@@ -215,7 +269,7 @@ async fn hello_identify_ready_yields_ready_event() {
     let identify = conn.recv().await;
     assert_eq!(identify["op"], 2);
     assert_eq!(identify["d"]["token"], MARKER);
-    assert_eq!(identify["d"]["capabilities"], 253);
+    assert_eq!(identify["d"]["capabilities"], 1_734_653);
     conn.send(ready(1, "wss://gateway-resume.discord.gg/"))
         .await;
     assert_eq!(
@@ -380,11 +434,11 @@ async fn acked_heartbeats_keep_the_connection_and_carry_the_sequence() {
     let mut last = Value::Null;
     for _ in 0..5 {
         last = conn.recv().await;
-        assert_eq!(last["op"], 1);
+        assert_eq!(last["op"], 40);
         conn.send(json!({"op": 11, "d": null})).await;
     }
     // (A first beat can race ahead of READY and carry null; by now the sequence is known.)
-    assert_eq!(last["d"], 1);
+    assert_eq!(last["d"]["seq"], 1);
     // Checked right after the last ACK (before the mock goes silent): nothing reconnected.
     assert!(!rig.initial.has_pending());
     assert!(!rig.resume.has_pending());
@@ -469,7 +523,7 @@ async fn disconnect_emits_closed_and_generations_increase() {
     conn.send(json!({"op": 1, "d": null})).await;
     // ACK the beat that op 1 provoked: an unacked beat would make a later jittered tick report
     // "heartbeat ACK missed" and Reconnect before the disconnect lands (seen under load).
-    while conn.recv().await["op"] != 1 {}
+    while conn.recv().await["op"] != 40 {}
     conn.send(json!({"op": 11})).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     rig.handle.disconnect();
@@ -1555,5 +1609,653 @@ mod messages_live {
             [(30, "hi <@1>")]
         );
         assert_eq!(mentions(&rig), Some(1));
+    }
+}
+
+/// Slice ID-b: the connection's identity (menu plan ID: IDENTIFY, QoS, Presence, Token refresh,
+/// Identity fetch, Local identity store, the ID-a leftovers).
+mod identity {
+    use super::*;
+    use crate::{
+        identify::{qos_token, Launch, LaunchConfig},
+        identity_store::FetchCache,
+        rest::test_support::{response, MockHttp},
+        settings_proto::tests::{settings, status_field},
+        transport::Method,
+        IdentityEvent, IdentityNotice, SessionOptions,
+    };
+    use base64::Engine as _;
+
+    const MAIN: u64 = 1;
+    const ALT: u64 = 2;
+    const RESUME_URL: &str = "wss://gateway-resume.discord.gg/";
+    const HTML: &str = include_str!("../tests/fixtures/identity/app.html");
+    const CHUNK: &str = include_str!("../tests/fixtures/identity/fast-connect.js");
+
+    fn launch(fetch: bool) -> Arc<Launch> {
+        Launch::new(LaunchConfig {
+            safari_version: Some("27.0.1".into()),
+            preferred_languages: vec!["zh-Hant-TW".into()],
+            store_dir: None,
+            fetch,
+        })
+    }
+
+    fn opts(launch: &Arc<Launch>, expected_user: Option<u64>) -> SessionOptions {
+        SessionOptions {
+            launch: launch.clone(),
+            expected_user,
+            identity_events: None,
+        }
+    }
+
+    fn ready_with(extra: Value) -> Value {
+        let mut r = ready(1, RESUME_URL);
+        for (k, v) in extra.as_object().unwrap() {
+            r["d"][k] = v.clone();
+        }
+        r
+    }
+
+    fn sorted_keys(v: &Value) -> Vec<String> {
+        v.as_object().unwrap().keys().cloned().collect()
+    }
+
+    async fn identify(conn: &mut Conn) -> Value {
+        let p = conn.recv_non_beat().await;
+        assert_eq!(p["op"], 2, "{p}");
+        p
+    }
+
+    impl Rig {
+        async fn ready_event(&mut self) {
+            loop {
+                match self.event().await {
+                    SessionEvent::Reconnecting { .. } => continue,
+                    SessionEvent::Ready { .. } => return,
+                    other => panic!("expected Ready, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    fn decoded_super_properties(rig: &Rig) -> Value {
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(rig.handle.rest().identity().super_properties())
+            .unwrap();
+        serde_json::from_slice(&raw).unwrap()
+    }
+
+    fn now() -> u64 {
+        crate::identify::now_ms()
+    }
+
+    /// The launch's first IDENTIFY is the fast-connect shape with its own launch id; the next
+    /// (after a connection that died before READY) the normal shape with COLD_START; after a
+    /// READY, NO_REASONS.
+    #[tokio::test]
+    async fn fast_then_normal_identify_shapes() {
+        let l = launch(false);
+        let mut rig = Rig::start_with(opts(&l, None)).await;
+        let mut c1 = Conn::accept(&rig.initial).await;
+        c1.hello(30_000).await;
+        let fast = identify(&mut c1).await;
+        assert_eq!(
+            sorted_keys(&fast["d"]),
+            ["capabilities", "client_state", "properties", "token"]
+        );
+        let props = &fast["d"]["properties"];
+        assert_eq!(props["is_fast_connect"], true);
+        assert!(props.get("launch_signature").is_none());
+        assert_ne!(props["client_launch_id"], l.launch_id());
+        assert_eq!(fast["d"]["capabilities"], 1_734_653);
+        assert_eq!(fast["d"]["client_state"], json!({"guild_versions": {}}));
+        c1.close(4009).await;
+        let mut c2 = Conn::accept(&rig.initial).await;
+        c2.hello(30_000).await;
+        let normal = identify(&mut c2).await;
+        assert_eq!(
+            sorted_keys(&normal["d"]),
+            [
+                "capabilities",
+                "client_state",
+                "compress",
+                "properties",
+                "qos_token",
+                "token"
+            ]
+        );
+        let props = &normal["d"]["properties"];
+        assert_eq!(props["is_fast_connect"], false);
+        assert_eq!(props["gateway_connect_reasons"], "COLD_START");
+        assert_eq!(props["client_app_state"], "focused");
+        assert_eq!(props["launch_signature"], Value::Null);
+        assert_eq!(props["client_launch_id"], l.launch_id());
+        assert_eq!(props["system_locale"], "zh-TW");
+        assert_eq!(normal["d"]["compress"], false);
+        // No stored QoS for this (unknown) account: only `client_provided`.
+        assert_eq!(normal["d"]["qos_token"], qos_token(false, None));
+        // The gateway upgrade carries this Mac's Accept-Language, never NET's constant.
+        assert_eq!(
+            c2.end.request.headers()[1],
+            (
+                "Accept-Language".to_owned(),
+                "zh-TW,zh-Hant;q=0.9".to_owned()
+            )
+        );
+        c2.send(ready(1, RESUME_URL)).await;
+        rig.ready_event().await;
+        c2.send(json!({"op": 9, "d": false})).await;
+        let mut c3 = Conn::accept(&rig.initial).await;
+        c3.hello(30_000).await;
+        let again = identify(&mut c3).await;
+        assert_eq!(
+            again["d"]["properties"]["gateway_connect_reasons"],
+            "NO_REASONS"
+        );
+    }
+
+    /// Op 40 with `qos` null until the first activity report, then the report; a gateway op 1 is
+    /// answered with op 40. Op 1 never goes out.
+    #[tokio::test]
+    async fn heartbeats_are_op_40_and_never_op_1() {
+        let mut rig = Rig::start().await;
+        let mut conn = rig.ready(30_000, RESUME_URL).await;
+        conn.send(json!({"op": 1, "d": null})).await;
+        loop {
+            let beat = conn.recv().await;
+            assert_eq!(beat["op"], 40, "{beat}");
+            if beat["d"]["seq"] == 1 {
+                assert_eq!(beat, json!({"op": 40, "d": {"seq": 1, "qos": null}}));
+                break;
+            }
+        }
+        conn.send(json!({"op": 11})).await;
+        rig.handle.set_app_focused(false);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        conn.send(json!({"op": 1, "d": null})).await;
+        // A jittered tick may have queued one more report-less beat before the focus change.
+        let beat = loop {
+            let beat = conn.recv().await;
+            assert_eq!(beat["op"], 40, "{beat}");
+            if !beat["d"]["qos"].is_null() {
+                break beat;
+            }
+        };
+        assert_eq!(
+            beat,
+            json!({"op": 40, "d": {"seq": 1, "qos": {"active": false, "ver": 31, "reasons": []}}})
+        );
+        conn.send(json!({"op": 11})).await;
+        // Unfocused: no heartbeat session, so no op 41 either.
+        assert!(conn.quiet().await);
+    }
+
+    /// Active at READY: a new heartbeat session, announced with op 41 (launch id of REST) and one
+    /// heartbeat, and carried in X-Super-Properties; stored for this account only.
+    #[tokio::test]
+    async fn op_41_announces_the_accounts_heartbeat_session() {
+        let l = launch(false);
+        let mut rig = Rig::start_with(opts(&l, None)).await;
+        rig.handle.set_app_focused(true);
+        let mut conn = rig.ready(30_000, RESUME_URL).await;
+        let op41 = conn.recv_non_beat().await;
+        assert_eq!(op41["op"], 41, "{op41}");
+        assert_eq!(
+            sorted_keys(&op41["d"]),
+            ["client_launch_id", "initialization_timestamp", "session_id"]
+        );
+        assert_eq!(op41["d"]["client_launch_id"], l.launch_id());
+        let sid = op41["d"]["session_id"].as_str().unwrap().to_owned();
+        assert_eq!(sid.len(), 36);
+        let beat = conn.recv().await;
+        assert_eq!(beat["op"], 40);
+        assert_eq!(
+            beat["d"]["qos"],
+            json!({"active": true, "ver": 31, "reasons": ["foregrounded"]})
+        );
+        let props = decoded_super_properties(&rig);
+        assert_eq!(props["client_heartbeat_session_id"], sid.as_str());
+        assert_eq!(props["client_app_state"], "focused");
+        let stored = l.store.heartbeat_session(MAIN, now()).unwrap();
+        assert_eq!(stored.uuid, sid);
+        assert_eq!(op41["d"]["initialization_timestamp"], stored.created_at_ms);
+        assert!(l.store.heartbeat_session(ALT, now()).is_none());
+
+        // The saved account's token on the same launch keeps the live session (announced again);
+        // a token from the login window (a token change) starts a new one.
+        let mut kept = Rig::start_with(opts(&l, Some(MAIN))).await;
+        kept.handle.set_app_focused(true);
+        let mut conn = kept.ready(30_000, RESUME_URL).await;
+        assert_eq!(conn.recv_non_beat().await["d"]["session_id"], sid.as_str());
+        let mut fresh = Rig::start_with(opts(&l, None)).await;
+        fresh.handle.set_app_focused(true);
+        let mut conn = fresh.ready(30_000, RESUME_URL).await;
+        assert_ne!(conn.recv_non_beat().await["d"]["session_id"], sid.as_str());
+    }
+
+    /// Presence: none while the settings are unknown; READY's settings give op 3 at once, and a
+    /// settings change another; an unknown status sends nothing and leaves IDENTIFY without it.
+    #[tokio::test]
+    async fn presence_follows_the_settings_and_is_omitted_while_unknown() {
+        let mut rig = Rig::start().await;
+        let mut conn = Conn::accept(&rig.initial).await;
+        conn.hello(30_000).await;
+        identify(&mut conn).await;
+        let mut loc = crate::proto::Message::new();
+        loc.push_wrapper_string(1, "ja");
+        let proto = settings(&[(11, status_field("dnd", None)), (12, loc)]);
+        conn.send(ready_with(json!({"user_settings_proto": proto})))
+            .await;
+        rig.ready_event().await;
+        assert_eq!(
+            conn.recv_non_beat().await,
+            json!({"op": 3, "d": {"status": "dnd", "since": 0, "activities": [], "afk": false}})
+        );
+        // The account's Discord locale becomes X-Discord-Locale.
+        assert_eq!(&*rig.handle.rest().identity().locale(), "ja");
+        let update = |s: &str, t: u64| {
+            json!({"op": 0, "t": "USER_SETTINGS_PROTO_UPDATE", "s": 2, "d": {
+                "settings": {"type": t, "proto": settings(&[(11, status_field(s, None))])},
+                "partial": true}})
+        };
+        conn.send(update("idle", 1)).await;
+        assert_eq!(conn.recv_non_beat().await["d"]["status"], "idle");
+        // Type 2 belongs to frecency (slice A): nothing changes, nothing is sent.
+        conn.send(update("online", 2)).await;
+        assert!(conn.quiet().await);
+        assert_eq!(
+            rig.handle
+                .snapshot()
+                .user_settings
+                .as_ref()
+                .unwrap()
+                .status
+                .as_deref(),
+            Some("idle")
+        );
+        // A status outside the closed set: unknown, so no op 3 and no IDENTIFY presence.
+        conn.send(update("offline", 1)).await;
+        assert!(conn.quiet().await);
+        conn.send(json!({"op": 9, "d": false})).await;
+        let mut again = Conn::accept(&rig.initial).await;
+        again.hello(30_000).await;
+        let normal = identify(&mut again).await;
+        assert!(normal["d"].get("presence").is_none(), "{normal}");
+
+        // A plain READY (no settings proto): no op 3 at all.
+        let mut plain = Rig::start().await;
+        let mut conn = plain.ready(30_000, RESUME_URL).await;
+        assert!(conn.quiet().await);
+    }
+
+    /// Main's stored installation id and QoS never go out for alt; they do for main.
+    #[tokio::test]
+    async fn per_account_values_are_never_sent_for_another_account() {
+        let l = launch(false);
+        l.store.adopt_installation_id(MAIN, "main.inst");
+        let qos = crate::identity_store::tests::qos_b64();
+        l.store.set_qos_derived(MAIN, &qos);
+        // Alt's saved token: the fast IDENTIFY and the normal one carry nothing of main's.
+        let mut alt = Rig::start_with(opts(&l, Some(ALT))).await;
+        let mut c = Conn::accept(&alt.initial).await;
+        c.hello(30_000).await;
+        let fast = identify(&mut c).await;
+        assert!(fast["d"]["properties"].get("installation_id").is_none());
+        c.close(4009).await;
+        let mut c = Conn::accept(&alt.initial).await;
+        c.hello(30_000).await;
+        let normal = identify(&mut c).await;
+        assert!(normal["d"]["properties"].get("installation_id").is_none());
+        assert_eq!(normal["d"]["qos_token"], qos_token(false, None));
+        // Alt's READY: its own installation id and QoS are adopted, main's stay.
+        c.send(ready_with(json!({
+            "user": {"id": "2", "username": "alt"},
+            "apex_experiments": {"assignments": {}, "installation": "alt.inst"},
+            "qos_token": qos,
+        })))
+        .await;
+        alt.ready_event().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            alt.handle.rest().identity().installation_id().as_deref(),
+            Some("alt.inst")
+        );
+        assert_eq!(l.store.installation_id(ALT).as_deref(), Some("alt.inst"));
+        assert_eq!(l.store.installation_id(MAIN).as_deref(), Some("main.inst"));
+        // Main's saved token: its values go out (the launch's fast IDENTIFY is already used).
+        let main = Rig::start_with(opts(&l, Some(MAIN))).await;
+        let mut c = Conn::accept(&main.initial).await;
+        c.hello(30_000).await;
+        let normal = identify(&mut c).await;
+        assert_eq!(normal["d"]["properties"]["installation_id"], "main.inst");
+        let derived = crate::proto::base64_decode(&qos).unwrap();
+        assert_eq!(normal["d"]["qos_token"], qos_token(false, Some(&derived)));
+    }
+
+    /// READY `auth_token`: validated, the slot replaced after READY, the app told after Ready with
+    /// a one-shot token; the next IDENTIFY and every REST request use it (I-1, T-8).
+    #[tokio::test]
+    async fn a_refreshed_token_goes_to_the_slot_and_the_app_after_ready() {
+        const FRESH: &str = "SYNTHETIC_REFRESHED_TOKEN_0123456789";
+        let mut rig = Rig::start_with(opts(&launch(false), Some(MAIN))).await;
+        let generation = rig.handle.generation();
+        let mut conn = Conn::accept(&rig.initial).await;
+        conn.hello(30_000).await;
+        identify(&mut conn).await;
+        conn.send(ready_with(json!({"auth_token": FRESH}))).await;
+        rig.ready_event().await;
+        let event = timeout(WAIT, rig.identity.recv()).await.unwrap().unwrap();
+        assert!(!format!("{event:?}").contains("SYNTHETIC"), "{event:?}");
+        let IdentityEvent::TokenRefreshed {
+            generation: g,
+            user_id,
+            token,
+        } = event
+        else {
+            panic!("expected TokenRefreshed");
+        };
+        assert_eq!((g, user_id), (generation, MAIN));
+        assert_eq!(token.take().as_deref(), Some(FRESH));
+        assert_eq!(token.take(), None, "one-shot");
+        assert_eq!(*rig.order.lock().unwrap(), ["Ready", "TokenRefreshed"]);
+        let url = url::Url::parse("https://discord.com/api/v9/users/@me").unwrap();
+        let request = rig
+            .handle
+            .rest()
+            .build_request(Method::Get, &url, None)
+            .unwrap();
+        assert_eq!(request.authorization().unwrap().reveal(), FRESH);
+        // Refresh, then op 9: the next IDENTIFY carries the new token.
+        conn.send(json!({"op": 9, "d": false})).await;
+        let mut again = Conn::accept(&rig.initial).await;
+        again.hello(30_000).await;
+        assert_eq!(identify(&mut again).await["d"]["token"], FRESH);
+    }
+
+    #[tokio::test]
+    async fn an_invalid_or_equal_auth_token_is_ignored() {
+        for bad in ["short", "Bot SYNTHETIC_TOKEN_MARKER_0123456789", MARKER] {
+            let mut rig = Rig::start_with(opts(&launch(false), Some(MAIN))).await;
+            let mut conn = Conn::accept(&rig.initial).await;
+            conn.hello(30_000).await;
+            identify(&mut conn).await;
+            conn.send(ready_with(json!({"auth_token": bad}))).await;
+            rig.ready_event().await;
+            assert!(conn.quiet().await);
+            assert!(rig.identity.try_recv().is_err(), "{bad}");
+            let url = url::Url::parse("https://discord.com/api/v9/users/@me").unwrap();
+            let request = rig
+                .handle
+                .rest()
+                .build_request(Method::Get, &url, None)
+                .unwrap();
+            assert_eq!(request.authorization().unwrap().reveal(), MARKER);
+        }
+    }
+
+    /// The fetch at launch: the captured page and chunk accepted (only the two URLs, no
+    /// Authorization, the values cached).
+    #[tokio::test]
+    async fn the_identity_fetch_feeds_the_first_identify() {
+        // The chunk the page names was not captured: the newest captured chunk's literal is
+        // substituted (see identity_fetch.rs tests).
+        let chunk = CHUNK.replace("\"634304\"", "\"640102\"");
+        let mock = MockHttp::start(vec![response(200, "", HTML), response(200, "", &chunk)]).await;
+        mock.install();
+        let l = launch(true);
+        let mut rig = Rig::start_with(opts(&l, None)).await;
+        let mut c = Conn::accept(&rig.initial).await;
+        c.hello(30_000).await;
+        let fast = identify(&mut c).await;
+        assert_eq!(fast["d"]["properties"]["client_build_number"], 640_102);
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].starts_with("GET /app HTTP/1.1\r\nhost: discord.com\r\n"));
+        assert!(requests[1].starts_with(
+            "GET /assets/fast-connect.f0cfe6eb7552ae67.js HTTP/1.1\r\nhost: discord.com\r\n"
+        ));
+        for r in &requests {
+            assert!(!r.to_ascii_lowercase().contains("authorization"), "{r}");
+        }
+        assert_eq!(
+            l.store.fetch_cache(now()).map(|c| (c.chunk_hash, c.build)),
+            Some(("f0cfe6eb7552ae67".to_owned(), 640_102))
+        );
+        assert!(rig.identity.try_recv().is_err(), "no notice on success");
+    }
+
+    /// A failure falls back to the cache with one notice per launch, and the launch fetches once.
+    #[tokio::test]
+    async fn a_failed_fetch_uses_the_cache_and_notices_once_per_launch() {
+        let mock = MockHttp::start(vec![response(404, "", "")]).await;
+        mock.install();
+        let l = launch(true);
+        l.store.set_fetch_cache(FetchCache {
+            chunk_hash: "0123456789abcdef".into(),
+            build: 650_000,
+            pair: (1_767_421, 1_734_653),
+            fetched_at_ms: now() - 25 * 3_600_000,
+        });
+        let mut rig = Rig::start_with(opts(&l, None)).await;
+        let mut c = Conn::accept(&rig.initial).await;
+        c.hello(30_000).await;
+        assert_eq!(
+            identify(&mut c).await["d"]["properties"]["client_build_number"],
+            650_000
+        );
+        let notice = timeout(WAIT, rig.identity.recv()).await.unwrap().unwrap();
+        assert!(matches!(
+            notice,
+            IdentityEvent::Notice {
+                notice: IdentityNotice::IdentityFetchFailed,
+                ..
+            }
+        ));
+        // A second session of the launch: the same values, no second fetch, no second notice.
+        let mut second = Rig::start_with(opts(&l, None)).await;
+        let mut c = Conn::accept(&second.initial).await;
+        c.hello(30_000).await;
+        assert_eq!(
+            identify(&mut c).await["d"]["properties"]["client_build_number"],
+            650_000
+        );
+        assert_eq!(mock.count(), 1);
+        assert!(second.identity.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn an_unsupported_pair_notices_and_keeps_the_supported_value() {
+        let chunk = CHUNK
+            .replace("\"634304\"", "\"640102\"")
+            .replace("t?1767421:1734653}", "t?1800189:1767421}");
+        let mock = MockHttp::start(vec![response(200, "", HTML), response(200, "", &chunk)]).await;
+        mock.install();
+        let mut rig = Rig::start_with(opts(&launch(true), None)).await;
+        let mut c = Conn::accept(&rig.initial).await;
+        c.hello(30_000).await;
+        assert_eq!(identify(&mut c).await["d"]["capabilities"], 1_734_653);
+        let notice = timeout(WAIT, rig.identity.recv()).await.unwrap().unwrap();
+        assert!(matches!(
+            notice,
+            IdentityEvent::Notice {
+                notice: IdentityNotice::UnsupportedCapabilities,
+                ..
+            }
+        ));
+    }
+
+    /// The first IDENTIFY waits for a hanging fetch at most its deadline, then goes out with the
+    /// built-in values and the notice (T-14).
+    #[tokio::test]
+    async fn the_first_identify_waits_at_most_the_fetch_deadline() {
+        let mock = MockHttp::start(vec![crate::rest::test_support::HANG.to_owned()]).await;
+        mock.install();
+        let started = tokio::time::Instant::now();
+        let mut rig = Rig::start_with(opts(&launch(true), None)).await;
+        let mut c = Conn::accept(&rig.initial).await;
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_millis(2_900) && waited < Duration::from_secs(6),
+            "{waited:?}"
+        );
+        c.hello(30_000).await;
+        assert_eq!(
+            identify(&mut c).await["d"]["properties"]["client_build_number"],
+            640_102
+        );
+        assert!(matches!(
+            timeout(WAIT, rig.identity.recv()).await.unwrap().unwrap(),
+            IdentityEvent::Notice {
+                notice: IdentityNotice::IdentityFetchFailed,
+                ..
+            }
+        ));
+    }
+
+    /// Leftover (a): an INITIAL_GUILD buffered on a connection that died before READY is dropped
+    /// by the next IDENTIFY, never merged into a later READY.
+    #[tokio::test]
+    async fn an_initial_guild_from_a_dead_connection_is_never_merged() {
+        let mut rig = Rig::start().await;
+        let mut c1 = Conn::accept(&rig.initial).await;
+        c1.hello(30_000).await;
+        identify(&mut c1).await;
+        c1.send(json!({"op": 0, "t": "INITIAL_GUILD", "s": 1, "d": {
+            "id": "10", "name": "early", "owner_id": "9", "roles": [], "channels": []}}))
+            .await;
+        while !rig
+            .handle
+            .applied()
+            .iter()
+            .any(|(e, _)| e == "INITIAL_GUILD")
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        c1.close(4009).await;
+        let mut c2 = Conn::accept(&rig.initial).await;
+        c2.hello(30_000).await;
+        identify(&mut c2).await;
+        c2.send(ready(1, RESUME_URL)).await;
+        rig.ready_event().await;
+        assert!(rig.handle.snapshot().guild(10).is_none());
+    }
+
+    /// Leftover (b): the stored op-37 selection is re-checked when re-sent after a reconnect; a
+    /// channel obfuscated meanwhile gets no subscription.
+    #[tokio::test]
+    async fn a_resent_member_subscription_skips_a_channel_obfuscated_meanwhile() {
+        let mut rig = Rig::start().await;
+        rig.handle.set_member_subscription(Some((10, 20)));
+        let mut c1 = Conn::accept(&rig.initial).await;
+        c1.hello(30_000).await;
+        identify(&mut c1).await;
+        c1.send(ready_with(
+            json!({"guilds": [{"id": "10", "name": "g", "owner_id": "9",
+            "roles": [], "channels": [{"id": "20", "type": 0, "name": "c"}]}]}),
+        ))
+        .await;
+        rig.ready_event().await;
+        assert_eq!(c1.recv_non_beat().await["op"], 37);
+        assert_eq!(c1.recv_non_beat().await["op"], 37);
+        assert!(!rig.handle.is_obfuscated(20));
+        c1.send(json!({"op": 0, "t": "CHANNEL_UPDATE", "s": 2, "d": {
+            "id": "20", "guild_id": "10", "type": 0, "name": "c", "flags": 131072}}))
+            .await;
+        while !rig.handle.is_obfuscated(20) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        c1.drop_abruptly();
+        let mut c2 = Conn::accept(&rig.resume).await;
+        c2.hello(30_000).await;
+        assert_eq!(c2.recv_non_beat().await["op"], 6);
+        c2.send(json!({"op": 0, "t": "RESUMED", "s": 3, "d": {}}))
+            .await;
+        assert!(c2.quiet().await, "op 37 for an obfuscated channel");
+    }
+}
+
+/// The Live row's names-only stderr lines: READY's, its first guild's and READY_SUPPLEMENTAL's
+/// key names and each unhandled dispatch name, once per launch; never a value, id or token.
+mod live_log {
+    use super::*;
+    use crate::identify::{Launch, LaunchConfig};
+
+    #[tokio::test]
+    async fn key_names_and_unhandled_dispatches_are_logged_once_without_values() {
+        const SECRET: &str = "SYNTHETIC_REFRESHED_TOKEN_0123456789";
+        let launch = Launch::new(LaunchConfig::default());
+        let mut rig = Rig::start_with(crate::SessionOptions {
+            launch: launch.clone(),
+            expected_user: None,
+            identity_events: None,
+        })
+        .await;
+        let mut conn = Conn::accept(&rig.initial).await;
+        conn.hello(30_000).await;
+        assert_eq!(conn.recv_non_beat().await["op"], 2);
+        let mut ready = ready(1, "wss://gateway-resume.discord.gg/");
+        ready["d"]["user"]["id"] = json!("123456789012345678");
+        ready["d"]["auth_token"] = json!(SECRET);
+        ready["d"]["987654321"] = json!("map-keyed-by-id");
+        ready["d"]["guilds"] = json!([{"id": "555666777888", "data_mode": "full",
+            "properties": {"name": "SecretGuildName", "owner_id": "444"}, "channels": []}]);
+        conn.send(ready).await;
+        assert!(matches!(rig.event().await, SessionEvent::Ready { .. }));
+        conn.send(json!({"op": 0, "t": "READY_SUPPLEMENTAL", "s": 2, "d": {
+            "guilds": [], "merged_presences": {"friends": [{"user_id": "321"}]}}}))
+            .await;
+        for (s, t) in [
+            (3, "SOME_NEW_EVENT"),
+            (4, "SOME_NEW_EVENT"),
+            (5, "MESSAGE_CREATE"),
+            (6, "TYPING_START"),
+            (7, "GUILD_CREATE"),
+            (8, "lower;case"),
+        ] {
+            conn.send(json!({"op": 0, "t": t, "s": s, "d": {"secret": SECRET}}))
+                .await;
+        }
+        // A second READY on the launch writes nothing more.
+        conn.send(json!({"op": 9, "d": false})).await;
+        let mut again = Conn::accept(&rig.initial).await;
+        again.hello(30_000).await;
+        assert_eq!(again.recv_non_beat().await["op"], 2);
+        again
+            .send(json!({"op": 0, "t": "READY", "s": 1, "d": {
+            "user": {"id": "1", "username": "x"}, "other_key": 1, "guilds": []}}))
+            .await;
+        loop {
+            if let SessionEvent::Ready { .. } = rig.event().await {
+                break;
+            }
+        }
+        let lines = launch.diagnostics.lock().unwrap().clone();
+        assert_eq!(
+            lines,
+            [
+                "READY_KEYS <other>,auth_token,guilds,private_channels,resume_gateway_url,session_id,user,user_settings",
+                "READY_GUILD_KEYS channels,data_mode,id,properties; properties: name,owner_id",
+                "READY_SUPPLEMENTAL_KEYS guilds,merged_presences",
+                "UNHANDLED_DISPATCH SOME_NEW_EVENT",
+                "UNHANDLED_DISPATCH <other>",
+            ]
+        );
+        let all = lines.join("\n");
+        for value in [
+            SECRET,
+            "123456789012345678",
+            "987654321",
+            "555666777888",
+            "SecretGuildName",
+            "444",
+            "321",
+            "sess-1",
+            "synthetic",
+            "map-keyed-by-id",
+            "lower",
+        ] {
+            assert!(!all.contains(value), "{value} in {all}");
+        }
     }
 }

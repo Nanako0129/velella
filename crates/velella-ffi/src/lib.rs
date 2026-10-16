@@ -1,9 +1,12 @@
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::runtime::{Builder, Runtime};
 use tokio::task::JoinHandle;
-use velella_core::{Session, SessionEvent, Token};
+use velella_core::{
+    IdentityEvent, Launch, LaunchConfig, Session, SessionEvent, SessionOptions, Token,
+};
 
 mod decorations;
 pub use decorations::{SidebarOccupant, SidebarStatus, SidebarThread};
@@ -86,10 +89,96 @@ pub fn start_ticks(listener: Arc<dyn TickListener>, interval: Duration) -> Arc<S
     Arc::new(Subscription(task))
 }
 
-/// The S2 user-agent constant, so the login webview presents the same browser as IDENTIFY.
+/// The launch's identity (menu plan ID), built on first use from `configure_identity`'s values
+/// (the app configures before anything reads it), else from the built-in ones.
+fn launch() -> Arc<Launch> {
+    static LAUNCH: OnceLock<Arc<Launch>> = OnceLock::new();
+    LAUNCH
+        .get_or_init(|| {
+            Launch::new(LAUNCH_CONFIG.get().cloned().unwrap_or(LaunchConfig {
+                fetch: true,
+                ..Default::default()
+            }))
+        })
+        .clone()
+}
+
+static LAUNCH_CONFIG: OnceLock<LaunchConfig> = OnceLock::new();
+
+/// Called once at launch, before the login window or any session (later calls are ignored):
+/// this Mac's Safari version (`CFBundleShortVersionString` of /Applications/Safari.app, validated
+/// in core), the system's preferred languages in order, and velella's Application Support
+/// directory for the identity store (nil keeps it in memory, as in demo mode).
+#[uniffi::export]
+pub fn configure_identity(
+    safari_version: Option<String>,
+    preferred_languages: Vec<String>,
+    store_dir: Option<String>,
+) {
+    let _ = LAUNCH_CONFIG.set(LaunchConfig {
+        safari_version,
+        preferred_languages,
+        store_dir: store_dir.map(PathBuf::from),
+        fetch: true,
+    });
+}
+
+/// The launch's user agent (this Mac's Safari), so the login webview presents the same browser
+/// as REST and the gateway.
 #[uniffi::export]
 pub fn user_agent() -> String {
-    velella_core::USER_AGENT.to_owned()
+    launch().user_agent().to_owned()
+}
+
+/// Sign-out of `user_id`: its heartbeat session is forgotten (a new sign-in starts a new one).
+#[uniffi::export]
+pub fn forget_account_session(user_id: u64) {
+    launch().forget_heartbeat_session(user_id);
+}
+
+/// Identity notices, each at most once per launch; the app shows fixed text for them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum IdentityNotice {
+    /// Discord's web client sends a capabilities value velella does not support yet.
+    UnsupportedCapabilities,
+    /// The identity fetch failed; cached or built-in values are in use.
+    IdentityFetchFailed,
+}
+
+impl From<velella_core::IdentityNotice> for IdentityNotice {
+    fn from(n: velella_core::IdentityNotice) -> Self {
+        match n {
+            velella_core::IdentityNotice::UnsupportedCapabilities => Self::UnsupportedCapabilities,
+            velella_core::IdentityNotice::IdentityFetchFailed => Self::IdentityFetchFailed,
+        }
+    }
+}
+
+/// A refreshed token, readable once (`take`). Never formatted on either side of the FFI.
+#[derive(uniffi::Object)]
+pub struct RefreshedToken(velella_core::RefreshedToken);
+
+#[uniffi::export]
+impl RefreshedToken {
+    /// The token the first time, nil after.
+    pub fn take(&self) -> Option<String> {
+        self.0.take()
+    }
+}
+
+impl fmt::Debug for RefreshedToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("RefreshedToken([REDACTED])")
+    }
+}
+
+/// Identity callbacks (a separate trait: `SessionListener` is unchanged). They run on a
+/// `velella-rt` thread and must not block. `on_token_refreshed` always follows the generation's
+/// `on_ready`.
+#[uniffi::export(with_foreign)]
+pub trait IdentityListener: Send + Sync {
+    fn on_token_refreshed(&self, generation: u64, user_id: u64, token: Arc<RefreshedToken>);
+    fn on_notice(&self, generation: u64, notice: IdentityNotice);
 }
 
 /// Session lifecycle callbacks. They run on a `velella-rt` thread and must not block.
@@ -118,6 +207,21 @@ impl SessionHandle {
 
     pub fn generation(&self) -> u64 {
         self.0.generation()
+    }
+
+    /// velella became (or stopped being) the frontmost app.
+    pub fn set_app_focused(&self, focused: bool) {
+        self.0.set_app_focused(focused);
+    }
+
+    /// The user clicked, scrolled, typed or switched channel.
+    pub fn note_user_activity(&self) {
+        self.0.note_user_activity();
+    }
+
+    /// An obfuscated channel or DM: not navigable (I-5).
+    pub fn is_obfuscated(&self, channel_id: u64) -> bool {
+        self.0.is_obfuscated(channel_id)
     }
 
     /// Rail entries (guilds and folders in display order): the current snapshot at once, then
@@ -327,10 +431,56 @@ pub fn connect(
     transport: Arc<dyn Transport>,
     listener: Arc<dyn SessionListener>,
 ) -> Result<Arc<SessionHandle>, ConnectError> {
+    start(token, None, transport, listener, None)
+}
+
+/// `connect` with the account the token was saved for (nil for a token just captured by the
+/// login window; per-account identity values go out before READY only for this account) and the
+/// identity callbacks.
+#[uniffi::export]
+pub fn connect_account(
+    token: String,
+    saved_account: Option<u64>,
+    transport: Arc<dyn Transport>,
+    listener: Arc<dyn SessionListener>,
+    identity_listener: Arc<dyn IdentityListener>,
+) -> Result<Arc<SessionHandle>, ConnectError> {
+    start(
+        token,
+        saved_account,
+        transport,
+        listener,
+        Some(identity_listener),
+    )
+}
+
+fn start(
+    token: String,
+    saved_account: Option<u64>,
+    transport: Arc<dyn Transport>,
+    listener: Arc<dyn SessionListener>,
+    identity_listener: Option<Arc<dyn IdentityListener>>,
+) -> Result<Arc<SessionHandle>, ConnectError> {
     let token = Token::new(token).map_err(|_| ConnectError::InvalidToken)?;
     let transport = Arc::new(transport::ForeignTransport(transport));
     let _context = runtime().enter();
-    let handle = Session::connect(token, transport, move |event| match event {
+    let options = SessionOptions {
+        launch: launch(),
+        expected_user: saved_account,
+        identity_events: identity_listener.map(|l| {
+            Box::new(move |event| match event {
+                IdentityEvent::TokenRefreshed {
+                    generation,
+                    user_id,
+                    token,
+                } => l.on_token_refreshed(generation, user_id, Arc::new(RefreshedToken(token))),
+                IdentityEvent::Notice { generation, notice } => {
+                    l.on_notice(generation, notice.into())
+                }
+            }) as Box<dyn Fn(IdentityEvent) + Send + Sync>
+        }),
+    };
+    let handle = Session::connect_with(token, transport, options, move |event| match event {
         SessionEvent::Ready {
             generation,
             user_id,

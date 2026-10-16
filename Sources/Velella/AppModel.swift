@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Observation
 import Security
@@ -19,6 +20,14 @@ final class AppModel {
     @ObservationIgnored private var handle: SessionHandle?
     @ObservationIgnored private var generation: UInt64?
     @ObservationIgnored private var pending: (generation: UInt64, token: String)?
+    /// Account of the saved sign-in (`Keychain.Saved.account`, or the one just written); nil when
+    /// nothing is saved. A refreshed token is written only for this account.
+    @ObservationIgnored private var storedAccount: String?
+    /// The READY account of the current session (its heartbeat session is forgotten at Sign Out).
+    @ObservationIgnored private var sessionUser: UInt64?
+    /// Focus and input observers (the web IdleStore's inputs), installed once.
+    @ObservationIgnored private var observers: [Any] = []
+    @ObservationIgnored private var lastActivityNote = Date.distantPast
 
     // Sidebar subscriptions. Dropping a SidebarSubscription stops its deliveries on the Rust side.
     @ObservationIgnored private var guildsSub: SidebarSubscription?
@@ -40,8 +49,53 @@ final class AppModel {
 
     init(demo: Bool) {
         isDemo = demo
+        Self.configureLaunchIdentity(demo: demo)
         shell = demo ? .demo : .signedOut
-        if !demo { restore() }
+        if !demo {
+            observeActivity()
+            restore()
+        }
+    }
+
+    /// Before anything reads the user agent (the login window) or connects (menu plan ID): this
+    /// Mac's Safari version, the system languages, and the identity store's directory (none in
+    /// demo mode, which never connects and touches no file).
+    private static func configureLaunchIdentity(demo: Bool) {
+        let safari = Bundle(path: "/Applications/Safari.app")?
+            .object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+        let store = demo ? nil : FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
+            .appendingPathComponent(Keychain.service, isDirectory: true).path
+        configureIdentity(safariVersion: safari, preferredLanguages: Locale.preferredLanguages, storeDir: store)
+    }
+
+    /// Frontmost or not, and clicks, scrolls and key presses in velella's windows (throttled to one
+    /// report per 0.5 s, as the web client throttles them).
+    private func observeActivity() {
+        let center = NotificationCenter.default
+        for (name, focused) in [
+            (NSApplication.didBecomeActiveNotification, true), (NSApplication.didResignActiveNotification, false),
+        ] {
+            observers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.handle?.setAppFocused(focused: focused) }
+            })
+        }
+        if let monitor = NSEvent.addLocalMonitorForEvents(
+            matching: [.leftMouseUp, .rightMouseUp, .otherMouseUp, .scrollWheel, .keyDown],
+            handler: { [weak self] event in
+                MainActor.assumeIsolated { self?.noteActivity() }
+                return event
+            }
+        ) {
+            observers.append(monitor)
+        }
+    }
+
+    private func noteActivity() {
+        let now = Date()
+        guard now.timeIntervalSince(lastActivityNote) >= 0.5 else { return }
+        lastActivityNote = now
+        handle?.noteUserActivity()
     }
 
     var canSignOut: Bool { !isDemo && shell.isSignedIn }
@@ -58,6 +112,8 @@ final class AppModel {
         handle = nil
         generation = nil
         pending = nil
+        if let sessionUser { forgetAccountSession(userId: sessionUser) }
+        sessionUser = nil
         dropSubscriptions()
         shell = .signedOut
         notice = nil
@@ -71,6 +127,7 @@ final class AppModel {
         // A read error never deletes (the decision for `.loaded` is always `.none`).
         execute(keychainAction(.loaded(status: status), currentGeneration: generation, freshCapture: false))
         if let saved {
+            storedAccount = saved.account.isEmpty ? nil : saved.account
             start(token: saved.token, fresh: false)
         } else if status != errSecItemNotFound {
             notice = "Couldn't read your saved sign-in (error \(status)). Sign in again."
@@ -81,13 +138,18 @@ final class AppModel {
         handle?.disconnect()
         dropSubscriptions()
         do {
-            let handle = try VelellaFFI.connect(
-                token: token, transport: URLSessionTransport.shared, listener: Listener(model: self)
+            let listener = Listener(model: self)
+            // A token from the Keychain names its account; a fresh capture's account is unknown
+            // until READY, so no per-account identity value goes out for it before then.
+            let handle = try VelellaFFI.connectAccount(
+                token: token, savedAccount: fresh ? nil : storedAccount.flatMap { UInt64($0) },
+                transport: URLSessionTransport.shared, listener: listener, identityListener: listener
             )
             self.handle = handle
             generation = handle.generation()
             pending = fresh ? (handle.generation(), token) : nil
             notice = nil
+            handle.setAppFocused(focused: NSApplication.shared.isActive)
         } catch {
             endSession()
             notice = "That sign-in couldn't be used. Try signing in again."
@@ -105,10 +167,29 @@ final class AppModel {
                 displayName: username, username: username, avatar: .initials(String(username.prefix(1)).uppercased())
             )
             subscribeSidebar(generation: gen)
+            sessionUser = userID
             let token = pending?.token
             pending = nil
             if action == .write, let token {
                 execute(.write, token: token, account: String(userID))
+            }
+        case .tokenRefreshed(let gen, let userID, let refreshed):
+            // Taken here, once; never stored anywhere but the Keychain item or `pending`.
+            guard let token = refreshed.take() else { return }
+            let action = tokenRefreshAction(
+                generation: gen, userID: String(userID), currentGeneration: generation,
+                pendingGeneration: pending?.generation, storedAccount: storedAccount
+            )
+            if let status = applyTokenRefresh(action, token: token, pending: &pending, keychain: Keychain.Updater()) {
+                notice = "Couldn't save the sign-in Discord refreshed (error \(status)). If velella asks you to sign in next time, sign in again."
+            }
+        case .identityNotice(let gen, let kind):
+            guard gen == generation else { return }
+            notice = switch kind {
+            case .unsupportedCapabilities:
+                "Discord's web client changed how it identifies itself. velella keeps using the last version it supports; an update of velella is needed."
+            case .identityFetchFailed:
+                "Couldn't check Discord's current web client version. velella is using the values it saved earlier."
             }
         case .authFailed(let gen):
             let action = keychainAction(.authFailed(generation: gen), currentGeneration: generation, freshCapture: false)
@@ -134,6 +215,7 @@ final class AppModel {
         handle = nil
         generation = nil
         pending = nil
+        sessionUser = nil
         dropSubscriptions()
         shell = .signedOut
     }
@@ -194,6 +276,10 @@ final class AppModel {
     /// Runs after every change of the selected channel, DM or rail entry (the window calls it, after
     /// `syncSelection()` for a rail change). `shell.openTarget` is the conversation now open.
     func selectionChanged() {
+        // An obfuscated channel or DM ("No Access") is not navigable (I-5): the selection is
+        // dropped, which calls this again with nothing open.
+        if let handle, shell.dropBlockedSelection({ UInt64($0).map(handle.isObfuscated) ?? false }) { return }
+        noteActivity() // a channel switch is input for the idle rule
         members.retarget(handle: handle, generation: generation) // L
         // M: the message history follows `shell.openTarget` here.
         openMessages(shell.openTarget.flatMap { UInt64($0) })
@@ -426,11 +512,14 @@ final class AppModel {
         if let selected = shell.selectedChannelID, !listed.contains(where: { $0.id == selected }) {
             shell.selectedChannelID = nil
         }
+        // A channel obfuscated while open stops being navigable.
+        if let handle { shell.dropBlockedSelection { UInt64($0).map(handle.isObfuscated) ?? false } }
     }
 
     fileprivate func apply(dms: [SidebarDm], friendsPending: UInt32, generation gen: UInt64) {
         guard gen == generation else { return }
         shell.applyDMs(dms.map(Self.dmEntry), friendsPending: Int(friendsPending))
+        if let handle { shell.dropBlockedSelection { UInt64($0).map(handle.isObfuscated) ?? false } }
     }
 
     private static func avatar(url: String?, name: String) -> Avatar {
@@ -495,12 +584,14 @@ final class AppModel {
         case .write:
             guard let token, let account else { return }
             let status = Keychain.save(token: token, account: account)
+            storedAccount = status == errSecSuccess ? account : nil
             if keychainAction(.saved(status: status), currentGeneration: generation, freshCapture: true) == .sessionOnly {
                 // The session keeps running; nothing is written anywhere else.
                 notice = "Signed in for this session only: couldn't save your sign-in (error \(status))."
             }
         case .delete:
             let status = Keychain.delete()
+            if status == errSecSuccess { storedAccount = nil }
             if status != errSecSuccess { notice = "Couldn't remove your saved sign-in (error \(status))." }
         case .sessionOnly, .none:
             break // .sessionOnly is acted on above, where the save status is known.
@@ -508,8 +599,16 @@ final class AppModel {
     }
 }
 
-/// Receives session callbacks on a `velella-rt` thread and hands them to the main queue in order.
-private final class Listener: SessionListener {
+/// The refreshed token's object never prints its value, whichever way it is described.
+extension RefreshedToken: CustomStringConvertible, CustomDebugStringConvertible, CustomReflectable {
+    public var description: String { "RefreshedToken([REDACTED])" }
+    public var debugDescription: String { description }
+    public var customMirror: Mirror { Mirror(self, children: [:]) }
+}
+
+/// Receives session and identity callbacks on a `velella-rt` thread and hands them to the main
+/// queue in order (core emits a refresh after its generation's READY).
+private final class Listener: SessionListener, IdentityListener {
     enum Event {
         case ready(UInt64, UInt64, String)
         case resumed(UInt64)
@@ -517,6 +616,8 @@ private final class Listener: SessionListener {
         case authFailed(UInt64)
         case closed(UInt64)
         case restUnauthorized(UInt64)
+        case tokenRefreshed(UInt64, UInt64, RefreshedToken)
+        case identityNotice(UInt64, IdentityNotice)
 
         /// Event name only: no username, id or token reaches stderr.
         var name: String {
@@ -527,6 +628,8 @@ private final class Listener: SessionListener {
             case .authFailed: "AUTH_FAILED"
             case .closed: "CLOSED"
             case .restUnauthorized: "REST_UNAUTHORIZED"
+            case .tokenRefreshed: "TOKEN_REFRESHED"
+            case .identityNotice: "IDENTITY_NOTICE"
             }
         }
     }
@@ -544,6 +647,10 @@ private final class Listener: SessionListener {
     func onAuthFailed(generation: UInt64) { send(.authFailed(generation)) }
     func onClosed(generation: UInt64) { send(.closed(generation)) }
     func onRestUnauthorized(generation: UInt64) { send(.restUnauthorized(generation)) }
+    func onTokenRefreshed(generation: UInt64, userId: UInt64, token: RefreshedToken) {
+        send(.tokenRefreshed(generation, userId, token))
+    }
+    func onNotice(generation: UInt64, notice: IdentityNotice) { send(.identityNotice(generation, notice)) }
 }
 
 /// Sidebar callbacks arrive on `velella-rt` threads; each goes to the main queue in order and is

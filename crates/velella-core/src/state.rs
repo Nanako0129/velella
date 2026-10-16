@@ -551,7 +551,15 @@ impl State {
 
     /// Applies one dispatch; returns whether state changed (and bumps `revision`). Unknown events
     /// and unreadable payloads change nothing.
+    #[cfg(test)]
     pub(crate) fn apply(&mut self, event: &str, d: &Value) -> bool {
+        self.apply_known(event, d).0
+    }
+
+    /// `apply`, and whether `event` has a handler here at all (the live check logs the names
+    /// nothing handles).
+    pub(crate) fn apply_known(&mut self, event: &str, d: &Value) -> (bool, bool) {
+        let mut known = true;
         let changed = match event {
             "READY" => self.ready(d),
             "READY_SUPPLEMENTAL" => self.ready_supplemental(d),
@@ -587,12 +595,15 @@ impl State {
             "STATE_UPDATE" => self.state_update(d),
             "VOICE_STATE_UPDATE_BATCH" => self.voice_batch(d),
             "PASSIVE_UPDATE_V2" => self.passive_update_v2(d),
-            _ => false,
+            _ => {
+                known = false;
+                false
+            }
         };
         if changed {
             self.revision += 1;
         }
-        changed
+        (changed, known)
     }
 
     fn ready(&mut self, d: &Value) -> bool {
@@ -710,8 +721,10 @@ impl State {
         let Some(s) = d.get("settings") else {
             return false;
         };
-        if s.get("type").and_then(Value::as_u64) != Some(1) {
-            return false;
+        match s.get("type").and_then(Value::as_u64) {
+            Some(1) => {}
+            Some(2) => return self.frecency_settings_update(d),
+            _ => return false,
         }
         let Some(b64) = s.get("proto").and_then(Value::as_str) else {
             return false;
@@ -740,6 +753,19 @@ impl State {
         self.guild_positions = next.guild_positions.clone();
         self.user_settings = Some(next);
         true
+    }
+
+    /// Hook for USER_SETTINGS_PROTO_UPDATE type 2 (`FrecencyUserSettings`): consumed by slice A
+    /// (frecency read and write, D3), which replaces this body. Until then the update is ignored
+    /// and leaves folders, status and every type-1 value unchanged.
+    fn frecency_settings_update(&mut self, _d: &Value) -> bool {
+        false
+    }
+
+    /// A new IDENTIFY starts a new gateway session: an INITIAL_GUILD buffered on a connection that
+    /// died before its READY belongs to no READY and is dropped, never merged later.
+    pub(crate) fn identify_started(&mut self) {
+        self.initial_guild = None;
     }
 
     /// CHANNEL_SYNC: skipped when `integrity_check` is set; otherwise each channel merges into

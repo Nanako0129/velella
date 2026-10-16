@@ -119,13 +119,12 @@ async fn history_get_uses_the_typed_path_and_the_token_only_in_authorization() {
         .decode(header("x-super-properties").unwrap())
         .unwrap();
     let props: Value = serde_json::from_slice(&props).unwrap();
-    let token = token();
-    let identify: Value = serde_json::from_str(&identify::encode(&identify::identify(
-        &token,
-        &identify::Identity::current(),
-    )))
-    .unwrap();
-    assert_eq!(props, identify["d"]["properties"]);
+    // The session identity's super-properties (slice ID: IDENTIFY adds its own keys to these).
+    let expected = base64::engine::general_purpose::STANDARD
+        .decode(identify::super_properties())
+        .unwrap();
+    let expected: Value = serde_json::from_slice(&expected).unwrap();
+    assert_eq!(props, expected);
 }
 
 #[tokio::test]

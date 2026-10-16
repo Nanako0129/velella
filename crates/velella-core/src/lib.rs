@@ -8,6 +8,8 @@ mod gateway;
 mod guild_settings;
 pub mod highlight;
 mod identify;
+mod identity_fetch;
+mod identity_store;
 mod local_presence;
 pub mod markdown;
 mod media;
@@ -48,7 +50,7 @@ mod sidebar_state_tests;
 #[cfg(test)]
 mod sidebar_tests;
 
-pub use identify::USER_AGENT;
+pub use identify::{Launch, LaunchConfig, USER_AGENT};
 pub use member_list::{member_sections, MemberListEntry, MemberListSection, MemberListStatus};
 pub use messages::{
     EmojiImage, LoadState, MentionKind, MessageImage, MessageReply, MessageRow,
@@ -56,7 +58,10 @@ pub use messages::{
 };
 pub use presence::PresenceStatus;
 pub use reactions::Reaction;
-pub use session::{Session, SessionEvent, SessionHandle, Subscription};
+pub use session::{
+    IdentityEvent, IdentityNotice, RefreshedToken, Session, SessionEvent, SessionHandle,
+    SessionOptions, Subscription,
+};
 pub use sidebar::{
     channel_categories, dm_list, guild_entries, SidebarCategory, SidebarChannel, SidebarDm,
     SidebarEntry, SidebarGuild, SidebarOccupant, SidebarThread,

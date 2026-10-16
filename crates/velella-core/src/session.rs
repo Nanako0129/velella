@@ -11,7 +11,9 @@
 use crate::{
     compression::{DecodeError, Decoder, MAX_GATEWAY_WIRE},
     gateway::{backoff, close_action, jitter_ms, member_frames, validated_resume_url, CloseAction},
-    identify::{self, Identity, GATEWAY_URL},
+    identify::{self, normal_capabilities, now_ms, AppState, Identity, Launch, Shape, GATEWAY_URL},
+    identity_store::{HeartbeatSession, HEARTBEAT_SESSION_TTL_MS},
+    local_presence::{local_presence, EmojiLookup, LocalPresence},
     messages::MessageStore,
     rest::{Rest, TokenSlot},
     state::{MemberSub, State},
@@ -21,6 +23,7 @@ use crate::{
 use serde::Deserialize;
 use serde_json::Value;
 use std::{
+    collections::VecDeque,
     fmt,
     future::Future,
     sync::{
@@ -72,6 +75,93 @@ pub enum SessionEvent {
     },
 }
 
+/// What a session tells the app about its identity, on a callback separate from `SessionEvent`
+/// (menu plan ID, Token refresh and Notices rows).
+#[derive(Debug)]
+pub enum IdentityEvent {
+    /// READY carried a valid `auth_token` different from the current one: the session's token
+    /// slot already holds it (REST and the next IDENTIFY use it). Always after the generation's
+    /// `SessionEvent::Ready`. The app writes it to the saved sign-in only for this generation and
+    /// this account.
+    TokenRefreshed {
+        generation: u64,
+        user_id: u64,
+        token: RefreshedToken,
+    },
+    Notice {
+        generation: u64,
+        notice: IdentityNotice,
+    },
+}
+
+/// At most once per launch each.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IdentityNotice {
+    /// The official client sends a capabilities value velella does not support yet (D12).
+    UnsupportedCapabilities,
+    /// The identity fetch failed; cached or built-in values are in use (T-14).
+    IdentityFetchFailed,
+}
+
+/// A refreshed token handed to the app once: `take` gives it the first time and `None` after.
+/// Never formatted (redacting `Debug`); zeroized when dropped untaken.
+pub struct RefreshedToken(Mutex<Option<Zeroizing<String>>>);
+
+impl RefreshedToken {
+    fn new(token: &Token) -> RefreshedToken {
+        RefreshedToken(Mutex::new(Some(Zeroizing::new(token.expose().to_owned()))))
+    }
+
+    pub fn take(&self) -> Option<String> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .map(|mut z| std::mem::take(&mut *z))
+    }
+}
+
+impl fmt::Debug for RefreshedToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("RefreshedToken([REDACTED])")
+    }
+}
+
+/// How a session is identified beyond its token.
+pub struct SessionOptions {
+    /// The launch's identity values (one per process in the app).
+    pub launch: Arc<Launch>,
+    /// The account the token was saved for (a token read from the Keychain); `None` for a token
+    /// captured by the login window. Per-account values (installation id, QoS, heartbeat session)
+    /// are sent before READY only for this account, and never for any other.
+    pub expected_user: Option<u64>,
+    pub identity_events: Option<Box<dyn Fn(IdentityEvent) + Send + Sync>>,
+}
+
+impl Default for SessionOptions {
+    fn default() -> Self {
+        SessionOptions {
+            launch: Launch::offline(),
+            expected_user: None,
+            identity_events: None,
+        }
+    }
+}
+
+/// What the app reports about the user (menu plan ID, Presence and QoS rows): whether velella is
+/// frontmost (`None` until the first report) and the last input the web IdleStore would count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Activity {
+    focused: Option<bool>,
+    last_input_ms: u64,
+}
+
+/// Op 3 limit: at most 5 per rolling 20 s (W:4675107).
+const PRESENCE_BURST: usize = 5;
+const PRESENCE_WINDOW: Duration = Duration::from_secs(20);
+/// The web IdleStore polls every 30 s; presence (idle, custom-status expiry) is re-checked then.
+const PRESENCE_POLL: Duration = Duration::from_secs(30);
+
 /// Process-wide, monotonic per connect.
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 
@@ -89,6 +179,7 @@ struct Shared {
     member_sub: watch::Sender<Option<(u64, u64)>>,
     /// Last `MemberSub::epoch` handed out; only changed under the state lock.
     member_epoch: AtomicU64,
+    activity: watch::Sender<Activity>,
     #[cfg(test)]
     applied: Mutex<Vec<(String, Option<MemberSub>)>>,
 }
@@ -98,14 +189,24 @@ impl Shared {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
+    /// A new IDENTIFY: what belonged to the previous gateway session's handshake is dropped.
+    fn identify_started(&self) {
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.initial_guild.is_some() {
+            Arc::make_mut(&mut guard).identify_started();
+        }
+    }
+
     /// Copy-on-write: readers holding a snapshot are never mutated underneath.
     // ponytail: clones the whole State when a reader holds a snapshot; fine at sidebar sizes,
     // switch to per-guild Arcs if profiling says otherwise.
     fn apply(&self, event: &str, d: &Value) -> bool {
         let user_id;
+        let known;
         let changed = {
             let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            let changed = Arc::make_mut(&mut guard).apply(event, d);
+            let changed;
+            (changed, known) = Arc::make_mut(&mut guard).apply_known(event, d);
             if changed {
                 self.revision.send_replace(guard.revision);
             }
@@ -127,7 +228,76 @@ impl Shared {
                 store.typing_start(d, &self.snapshot());
             }
         }
+        let handled = known || MessageStore::observes(event) || event == "TYPING_START";
+        diagnose(self.rest.identity().launch(), event, d, handled);
         changed
+    }
+}
+
+/// A key fit for the live-check log: an identifier. Anything else (an id used as a map key, a
+/// value-like string) is written as `<other>`, so no id or value can reach the line.
+fn key_name(key: &str) -> &str {
+    let mut bytes = key.bytes();
+    let first_ok = bytes
+        .next()
+        .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_');
+    if first_ok && key.len() <= 64 && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        key
+    } else {
+        "<other>"
+    }
+}
+
+/// The sorted top-level key names of an object (nothing for anything else); never a value.
+fn key_list(v: &Value) -> String {
+    let mut names: Vec<&str> = v
+        .as_object()
+        .map(|o| o.keys().map(|k| key_name(k)).collect())
+        .unwrap_or_default();
+    names.sort_unstable();
+    names.dedup();
+    names.join(",")
+}
+
+/// The Live row's names-only lines (menu plan ID): READY's and its first guild's key names,
+/// READY_SUPPLEMENTAL's, and every dispatch name nothing handles — each once per launch.
+fn diagnose(launch: &Launch, event: &str, d: &Value, handled: bool) {
+    match event {
+        "READY" => {
+            launch.diagnose_once("READY_KEYS", || format!("READY_KEYS {}", key_list(d)));
+            if let Some(guild) = d
+                .get("guilds")
+                .and_then(Value::as_array)
+                .and_then(|g| g.first())
+                .filter(|g| g.is_object())
+            {
+                launch.diagnose_once("READY_GUILD_KEYS", || {
+                    let mut line = format!("READY_GUILD_KEYS {}", key_list(guild));
+                    if let Some(p) = guild.get("properties").filter(|p| p.is_object()) {
+                        line.push_str(&format!("; properties: {}", key_list(p)));
+                    }
+                    line
+                });
+            }
+        }
+        "READY_SUPPLEMENTAL" => launch.diagnose_once("READY_SUPPLEMENTAL_KEYS", || {
+            format!("READY_SUPPLEMENTAL_KEYS {}", key_list(d))
+        }),
+        _ if !handled => {
+            let name = if !event.is_empty()
+                && event.len() <= 64
+                && event
+                    .bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+            {
+                event
+            } else {
+                "<other>"
+            };
+            let line = format!("UNHANDLED_DISPATCH {name}");
+            launch.diagnose_once(&line.clone(), || line);
+        }
+        _ => {}
     }
 }
 
@@ -185,6 +355,36 @@ impl SessionHandle {
         shared.revision.send_replace(state.revision);
         // Still under the lock, so two racing calls leave the watch and `State` agreeing.
         shared.member_sub.send_replace(selection);
+    }
+
+    /// Whether velella is the frontmost app (`client_app_state`, the QoS heartbeat, the heartbeat
+    /// session). Focus changes also count as input for the idle rule, as WINDOW_FOCUS and
+    /// APP_STATE_UPDATE do in the web IdleStore.
+    pub fn set_app_focused(&self, focused: bool) {
+        self.shared
+            .rest
+            .identity()
+            .set_client_app_state(if focused {
+                AppState::Focused
+            } else {
+                AppState::Unfocused
+            });
+        self.shared.activity.send_replace(Activity {
+            focused: Some(focused),
+            last_input_ms: now_ms(),
+        });
+    }
+
+    /// The user clicked, scrolled, typed or switched channel (the web IdleStore's inputs).
+    pub fn note_user_activity(&self) {
+        self.shared
+            .activity
+            .send_modify(|a| a.last_input_ms = now_ms());
+    }
+
+    /// Whether this channel or DM is obfuscated: not navigable, no member list, no actions (I-5).
+    pub fn is_obfuscated(&self, channel_id: u64) -> bool {
+        self.shared.snapshot().is_obfuscated(channel_id)
     }
 
     /// The session's REST client: a clone sharing its 401 latch and global-429 deadline.
@@ -279,11 +479,21 @@ impl Session {
         transport: Arc<dyn Transport>,
         events: impl Fn(SessionEvent) + Send + Sync + 'static,
     ) -> SessionHandle {
+        Session::connect_with(token, transport, SessionOptions::default(), events)
+    }
+
+    /// `connect` with the launch's identity, the saved account and the identity callback.
+    pub fn connect_with(
+        token: Token,
+        transport: Arc<dyn Transport>,
+        options: SessionOptions,
+        events: impl Fn(SessionEvent) + Send + Sync + 'static,
+    ) -> SessionHandle {
         let generation = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
         // One token slot for REST and the gateway task.
         let token = TokenSlot::new(Arc::new(token));
         // One identity per session: REST headers and IDENTIFY read the same snapshot.
-        let identity = Arc::new(Identity::current());
+        let identity = Arc::new(Identity::new(options.launch.clone()));
         let (notice, rest_notice) = mpsc::unbounded_channel();
         let shared = Arc::new(Shared {
             state: Mutex::new(Arc::new(State::default())),
@@ -299,6 +509,11 @@ impl Session {
             messages: OnceLock::new(),
             member_sub: watch::channel(None).0,
             member_epoch: AtomicU64::new(0),
+            activity: watch::channel(Activity {
+                focused: None,
+                last_input_ms: now_ms(),
+            })
+            .0,
             #[cfg(test)]
             applied: Mutex::default(),
         });
@@ -310,6 +525,7 @@ impl Session {
             generation,
             events: Box::new(events),
             member_rx: shared.member_sub.subscribe(),
+            activity_rx: shared.activity.subscribe(),
             shared: shared.clone(),
             stop: stop.clone(),
             rest_notice,
@@ -317,6 +533,16 @@ impl Session {
             session_id: None,
             resume_url: None,
             seq: None,
+            identity_events: options.identity_events,
+            account: options.expected_user,
+            fresh_token: options.expected_user.is_none(),
+            identity_fixed: false,
+            heartbeat_session: None,
+            awaiting_ack: false,
+            ready_extras: None,
+            presence_sent: None,
+            presence_slots: VecDeque::new(),
+            presence_retry: None,
         };
         let ended = shared.clone();
         tokio::spawn(async move {
@@ -377,6 +603,44 @@ struct Task {
     /// Already validated and normalized.
     resume_url: Option<String>,
     seq: Option<u64>,
+    identity_events: Option<Box<dyn Fn(IdentityEvent) + Send + Sync>>,
+    activity_rx: watch::Receiver<Activity>,
+    /// The token's account: the saved one until this session's READY says.
+    account: Option<u64>,
+    /// The token came from the login window (a token change): the account's heartbeat session
+    /// is cleared at the first READY.
+    fresh_token: bool,
+    /// The identity base was fixed with the launch's resolved values (first IDENTIFY only).
+    identity_fixed: bool,
+    heartbeat_session: Option<HeartbeatSession>,
+    awaiting_ack: bool,
+    /// READY's identity fields, read before `State` consumes the payload.
+    ready_extras: Option<ReadyExtras>,
+    /// Last op 3 of this connection (none yet: READY always sends one).
+    presence_sent: Option<LocalPresence>,
+    presence_slots: VecDeque<Instant>,
+    /// A rate-limited op 3 waits until this slot frees (`true`: forced, RESUMED).
+    presence_retry: Option<(Instant, bool)>,
+}
+
+/// READY's fields for the identity (I§1, experiments.md §5): read raw, validated where used.
+struct ReadyExtras {
+    auth_token: Option<String>,
+    installation: Option<String>,
+    qos_token: Option<String>,
+}
+
+impl ReadyExtras {
+    fn of(d: &Value) -> ReadyExtras {
+        let s = |v: Option<&Value>| v.and_then(Value::as_str).map(str::to_owned);
+        ReadyExtras {
+            auth_token: s(d.get("auth_token")),
+            installation: s(d
+                .get("apex_experiments")
+                .and_then(|a| a.get("installation"))),
+            qos_token: s(d.get("qos_token")),
+        }
+    }
 }
 
 const MIN_HEARTBEAT_MS: u64 = 50;
@@ -420,6 +684,28 @@ impl Task {
                 && self.seq.is_some();
             if !resuming {
                 self.clear_session();
+            }
+            // The session's first IDENTIFY waits for the launch's identity values (at most the
+            // fetch deadline); reconnects and resumes reuse the session's fixed snapshot (T-14).
+            if !resuming && !self.identity_fixed {
+                self.identity_fixed = true;
+                let launch = self.identity.launch().clone();
+                let Some(resolved) = self
+                    .unless_stopped(launch.resolve(self.transport.clone()))
+                    .await
+                else {
+                    return self.emit(SessionEvent::Closed {
+                        generation: self.generation,
+                    });
+                };
+                self.identity
+                    .fix(resolved.build, normal_capabilities(resolved.pair));
+                if resolved.fetch_failed && launch.notice_once(false) {
+                    self.notice(IdentityNotice::IdentityFetchFailed);
+                }
+                if resolved.unsupported && launch.notice_once(true) {
+                    self.notice(IdentityNotice::UnsupportedCapabilities);
+                }
             }
             let url = self
                 .resume_url
@@ -511,13 +797,242 @@ impl Task {
         });
     }
 
-    /// Sends the op-37 frames that bring this connection to the newest selection.
+    fn identity_event(&self, event: IdentityEvent) {
+        if let Some(events) = &self.identity_events {
+            events(event);
+        }
+    }
+
+    fn notice(&self, notice: IdentityNotice) {
+        self.identity_event(IdentityEvent::Notice {
+            generation: self.generation,
+            notice,
+        });
+    }
+
+    /// The fast-connect IDENTIFY for the launch's first, the normal one after (I-9). Per-account
+    /// values only for the token's known account.
+    fn identify_frame(&self, token: &Token) -> Zeroizing<String> {
+        let launch = self.identity.launch();
+        let store = &launch.store;
+        let installation = self.account.and_then(|u| store.installation_id(u));
+        if launch.take_fast_connect() {
+            return identify::identify(
+                token,
+                &self.identity,
+                Shape::Fast {
+                    installation_id: installation.as_deref(),
+                },
+            );
+        }
+        let presence = self.presence_now();
+        let focused = self.activity_rx.borrow().focused == Some(true);
+        let derived = self.account.and_then(|u| store.qos_derived(u));
+        let qos = identify::qos_token(focused, derived.as_deref());
+        identify::identify(
+            token,
+            &self.identity,
+            Shape::Normal {
+                installation_id: installation.as_deref(),
+                reasons: launch.connect_reasons(),
+                presence: presence.as_ref(),
+                qos_token: Some(&qos),
+            },
+        )
+    }
+
+    /// `{status, since, activities, afk}` from the current settings; `None` (nothing sent) while
+    /// the settings or any part of it is unknown (I-3).
+    fn presence_now(&self) -> Option<LocalPresence> {
+        let state = self.shared.snapshot();
+        let settings = state.user_settings.as_ref()?;
+        let last_input = self.activity_rx.borrow().last_input_ms;
+        // ponytail: guild emoji data is F1's; until it lands a custom-emoji custom status leaves
+        // the presence unknown (unsent) rather than guessed.
+        local_presence(settings, now_ms(), last_input, |_| EmojiLookup::Unknown)
+    }
+
+    /// Op 3 when the local presence differs from the last one sent on this connection (or when
+    /// `force`d after RESUMED), at most 5 per rolling 20 s; a limited one waits for its slot.
+    async fn sync_presence(&mut self, socket: &dyn WebSocket, force: bool) -> bool {
+        let Some(presence) = self.presence_now() else {
+            return true;
+        };
+        if !force && self.presence_sent.as_ref() == Some(&presence) {
+            return true;
+        }
+        let now = Instant::now();
+        while self
+            .presence_slots
+            .front()
+            .is_some_and(|t| now.duration_since(*t) >= PRESENCE_WINDOW)
+        {
+            self.presence_slots.pop_front();
+        }
+        if self.presence_slots.len() >= PRESENCE_BURST {
+            let force = force || self.presence_retry.is_some_and(|r| r.1);
+            self.presence_retry = Some((self.presence_slots[0] + PRESENCE_WINDOW, force));
+            return true;
+        }
+        self.presence_slots.push_back(now);
+        tracing::trace!(
+            generation = self.generation,
+            op = 3,
+            "gateway send presence"
+        );
+        let frame = identify::presence_update(&presence);
+        self.presence_sent = Some(presence);
+        send(socket, Zeroizing::new(frame)).await
+    }
+
+    /// The account's heartbeat session (I§2): kept while used, a new one when velella is active
+    /// and none is live (30 minutes after its last use it is gone). A new session, or `announce`
+    /// with one live (READY), sends op 41 and one heartbeat.
+    async fn sync_heartbeat_session(&mut self, socket: &dyn WebSocket, announce: bool) -> bool {
+        let Some(user) = self.account else {
+            return true;
+        };
+        let now = now_ms();
+        let active = self.activity_rx.borrow().focused == Some(true);
+        let live = self
+            .heartbeat_session
+            .take()
+            .filter(|s| now < s.last_used_ms.saturating_add(HEARTBEAT_SESSION_TTL_MS));
+        let (next, created) = match (live, active) {
+            (Some(mut s), true) => {
+                s.last_used_ms = now;
+                (Some(s), false)
+            }
+            (live, false) => (live, false),
+            (None, true) => (
+                Some(HeartbeatSession {
+                    uuid: identify::uuid_v4(),
+                    created_at_ms: now,
+                    last_used_ms: now,
+                }),
+                true,
+            ),
+        };
+        let store = &self.identity.launch().store;
+        store.set_heartbeat_session(user, next.clone());
+        match &next {
+            Some(s) => {
+                self.identity
+                    .set_client_heartbeat_session_id(s.uuid.clone());
+            }
+            None => self.identity.clear_client_heartbeat_session_id(),
+        }
+        self.heartbeat_session = next;
+        let Some(s) = self
+            .heartbeat_session
+            .as_ref()
+            .filter(|_| created || announce)
+        else {
+            return true;
+        };
+        tracing::trace!(
+            generation = self.generation,
+            op = 41,
+            "gateway send session id"
+        );
+        let frame = identify::time_spent_session(
+            s.created_at_ms,
+            &s.uuid,
+            self.identity.launch().launch_id(),
+        );
+        if !send(socket, Zeroizing::new(frame)).await {
+            return false;
+        }
+        self.awaiting_ack = true;
+        self.heartbeat(socket).await
+    }
+
+    /// READY's identity work, after `SessionEvent::Ready`: the account's stored values, the token
+    /// refresh, the heartbeat session and the first op 3.
+    async fn after_ready(&mut self, socket: &dyn WebSocket) -> bool {
+        let extras = self.ready_extras.take();
+        let state = self.shared.snapshot();
+        let Some(user) = state.user_id else {
+            return true;
+        };
+        let launch = self.identity.launch().clone();
+        launch.ready_seen();
+        let store = &launch.store;
+        // Another account than the launch's last READY, or a token from the login window: the
+        // token changed, so the account's heartbeat session starts over.
+        let previous = launch
+            .last_account
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replace(user);
+        if self.fresh_token || previous.is_some_and(|p| p != user) {
+            store.set_heartbeat_session(user, None);
+        }
+        self.fresh_token = false;
+        self.account = Some(user);
+        let (auth_token, installation, qos) = match extras {
+            Some(e) => (e.auth_token, e.installation, e.qos_token),
+            None => (None, None, None),
+        };
+        if let Some(i) = installation.as_deref().filter(|i| !i.is_empty()) {
+            store.adopt_installation_id(user, i);
+        }
+        if let Some(id) = store.installation_id(user) {
+            self.identity.set_installation_id(id);
+        }
+        if let Some(q) = qos.as_deref() {
+            store.set_qos_derived(user, q);
+        }
+        self.identity.set_account_locale(
+            state
+                .user_settings
+                .as_ref()
+                .and_then(|s| s.locale.as_deref()),
+        );
+        self.refresh_token(user, auth_token);
+        self.heartbeat_session = store.heartbeat_session(user, now_ms());
+        self.sync_heartbeat_session(socket, true).await && self.sync_presence(socket, true).await
+    }
+
+    /// READY `auth_token` (T-8, I-2): validated with `Token::new`; invalid or equal to the current
+    /// token → ignored. Otherwise the slot (REST and the next IDENTIFY) takes it — this socket's
+    /// RESUME keeps the token it identified with — and the app is told after `Ready`.
+    fn refresh_token(&mut self, user: u64, raw: Option<String>) {
+        let Some(raw) = raw else {
+            return;
+        };
+        let current = self.token.current();
+        let fresh = match Token::new(raw) {
+            Ok(t) if t.expose() != current.expose() => Arc::new(t),
+            _ => {
+                tracing::debug!("READY auth_token ignored");
+                return;
+            }
+        };
+        self.shared.rest.replace_token(fresh.clone());
+        self.identity
+            .launch()
+            .store
+            .set_heartbeat_session(user, None);
+        self.identity.clear_client_heartbeat_session_id();
+        self.identity_event(IdentityEvent::TokenRefreshed {
+            generation: self.generation,
+            user_id: user,
+            token: RefreshedToken::new(&fresh),
+        });
+    }
+
+    /// Sends the op-37 frames that bring this connection to the newest selection. The selection is
+    /// re-checked against the current state each time, so a stored selection re-sent after a
+    /// reconnect never subscribes a channel that became obfuscated meanwhile (I-5).
     async fn sync_members(
         &mut self,
         socket: &dyn WebSocket,
         sent: &mut Option<(u64, u64)>,
     ) -> bool {
-        let want = *self.member_rx.borrow_and_update();
+        let selected = *self.member_rx.borrow_and_update();
+        let state = self.shared.snapshot();
+        let want = selected.and_then(|(g, c)| state.member_list_target(g, c));
         for frame in member_frames(*sent, want) {
             tracing::trace!(
                 generation = self.generation,
@@ -569,9 +1084,10 @@ impl Task {
                     op = 2,
                     "gateway send IDENTIFY"
                 );
+                self.shared.identify_started();
                 // The slot's token now; a RESUME of the session this starts reuses it.
                 let token = self.token.current();
-                let handshake = identify::encode(&identify::identify(&token, &self.identity));
+                let handshake = self.identify_frame(&token);
                 self.session_token = Some(token);
                 handshake
             }
@@ -587,22 +1103,30 @@ impl Task {
             interval,
         );
         timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        let mut awaiting_ack = false;
+        self.awaiting_ack = false;
+        self.presence_sent = None;
+        self.presence_retry = None;
+        let mut poll = interval_at(Instant::now() + PRESENCE_POLL, PRESENCE_POLL);
+        poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let ready_deadline = Instant::now() + Duration::from_secs(30);
         // What this connection has subscribed; a new connection starts with nothing, so READY or
         // RESUMED re-sends the current selection.
         let mut members_sent = None;
         loop {
+            let retry_at = self.presence_retry.map_or_else(Instant::now, |r| r.0);
             tokio::select! {
                 biased;
                 () = self.stop.notified() => return End::Disconnect,
                 _ = timer.tick() => {
-                    if awaiting_ack {
+                    if self.awaiting_ack {
                         tracing::debug!("heartbeat ACK missed");
                         return End::Retry;
                     }
-                    awaiting_ack = true;
+                    self.awaiting_ack = true;
                     if !self.heartbeat(socket).await {
+                        return End::Retry;
+                    }
+                    if *established && !self.sync_heartbeat_session(socket, false).await {
                         return End::Retry;
                     }
                 }
@@ -610,6 +1134,28 @@ impl Task {
                 Some(()) = self.rest_notice.recv() => self.rest_unauthorized(),
                 Ok(()) = self.member_rx.changed() => {
                     if *established && !self.sync_members(socket, &mut members_sent).await {
+                        return End::Retry;
+                    }
+                }
+                Ok(()) = self.activity_rx.changed() => {
+                    // A session is created as soon as velella becomes active; kept ones are
+                    // refreshed on heartbeats.
+                    if *established
+                        && !((self.heartbeat_session.is_some()
+                            || self.sync_heartbeat_session(socket, false).await)
+                            && self.sync_presence(socket, false).await)
+                    {
+                        return End::Retry;
+                    }
+                }
+                _ = poll.tick() => {
+                    if *established && !self.sync_presence(socket, false).await {
+                        return End::Retry;
+                    }
+                }
+                () = tokio::time::sleep_until(retry_at), if self.presence_retry.is_some() => {
+                    let force = self.presence_retry.take().is_some_and(|r| r.1);
+                    if !self.sync_presence(socket, force).await {
                         return End::Retry;
                     }
                 }
@@ -622,18 +1168,37 @@ impl Task {
                     match packet.op {
                         0 => {
                             let was_established = *established;
+                            let name = packet.t.clone().unwrap_or_default();
+                            if name == "READY" {
+                                self.ready_extras = Some(ReadyExtras::of(&packet.d));
+                            }
                             if let Some(end) = self.dispatch(packet, established) {
                                 return end;
                             }
-                            if !was_established
-                                && *established
-                                && !self.sync_members(socket, &mut members_sent).await
-                            {
-                                return End::Retry;
+                            if !was_established && *established {
+                                let identity_ok = if name == "READY" {
+                                    self.after_ready(socket).await
+                                } else {
+                                    // RESUMED: the official client re-sends its presence.
+                                    self.sync_presence(socket, true).await
+                                };
+                                if !identity_ok || !self.sync_members(socket, &mut members_sent).await {
+                                    return End::Retry;
+                                }
+                            }
+                            if name == "USER_SETTINGS_PROTO_UPDATE" && *established {
+                                let state = self.shared.snapshot();
+                                self.identity.set_account_locale(
+                                    state.user_settings.as_ref().and_then(|s| s.locale.as_deref()),
+                                );
+                                if !self.sync_presence(socket, false).await {
+                                    return End::Retry;
+                                }
                             }
                         }
+                        // The gateway asks for a beat: answered with op 40 like every beat.
                         1 => {
-                            awaiting_ack = true;
+                            self.awaiting_ack = true;
                             if !self.heartbeat(socket).await {
                                 return End::Retry;
                             }
@@ -643,7 +1208,7 @@ impl Task {
                             self.clear_session();
                             return End::InvalidSession;
                         }
-                        11 => awaiting_ack = false,
+                        11 => self.awaiting_ack = false,
                         _ => {}
                     }
                 }
@@ -651,16 +1216,15 @@ impl Task {
         }
     }
 
+    /// Op 40 `QOS_HEARTBEAT`; op 1 is never sent (I§1).
     async fn heartbeat(&self, socket: &dyn WebSocket) -> bool {
         tracing::trace!(
             generation = self.generation,
-            op = 1,
+            op = 40,
             "gateway send heartbeat"
         );
-        let beat = match self.seq {
-            Some(seq) => format!(r#"{{"op":1,"d":{seq}}}"#),
-            None => r#"{"op":1,"d":null}"#.to_owned(),
-        };
+        let focused = self.activity_rx.borrow().focused;
+        let beat = identify::heartbeat(self.seq, focused);
         send(socket, Zeroizing::new(beat)).await
     }
 
