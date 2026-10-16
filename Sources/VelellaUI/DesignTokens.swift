@@ -341,6 +341,21 @@ enum DesignTokens {
         static let dividerLabelPaddingH: CGFloat = 4
     }
 
+    /// The message text view (docs/plans/selection.md, N1).
+    enum TextView {
+        /// Text views per `MarkdownView` instance; past it the rest of the instance's text renders in
+        /// one more view (N1 Limits, F-4).
+        static let viewLimit = 64
+        /// A press that moves farther than this is a drag: it selects and activates nothing (N1 Links).
+        /// AppKit's own drag hysteresis is about this size; not measured.
+        static let dragThreshold: CGFloat = 3
+        /// Inline code: `.markup__75297 code.inline` has a 1px border and radius 4 (T1). The border
+        /// colour was not read from the CSS: the separator colour, provisional.
+        static let inlineCodeBorderWidth: CGFloat = 1
+        static let inlineCodeRadius: CGFloat = 4
+        static let inlineCodeBorder = NSColor.separatorColor
+    }
+
     enum Palette {
         /// Unread indicator and bold-name colour: the strongest label colour of the appearance.
         static let unread = Color.primary

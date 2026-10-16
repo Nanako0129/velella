@@ -206,6 +206,33 @@ struct InlineImage: Equatable {
     var baselineOffset: CGFloat
 }
 
+/// The font a run is drawn in by the message text view (`MessageTextContent`): set on every run
+/// next to its SwiftUI font, so the view never has to reverse-map a SwiftUI `Font`.
+struct TextFont: Hashable, Sendable {
+    var size: CGFloat
+    var weight: Font.Weight
+    var mono: Bool
+    var italic: Bool
+}
+
+struct TextFontAttribute: AttributedStringKey {
+    typealias Value = TextFont
+    static let name = "velella.font"
+}
+
+/// What a copy emits for a whole substituted run (S-14): the text before `MarkdownText.isolated`
+/// wrapped it, so velella's own isolates never reach the pasteboard. `id` keeps two neighbouring
+/// runs of the same text apart (the n-th segment of the paragraph).
+struct RawText: Hashable, Sendable {
+    var text: String
+    var id: Int
+}
+
+struct RawTextAttribute: AttributedStringKey {
+    typealias Value = RawText
+    static let name = "velella.raw"
+}
+
 /// The containers around a run. Text runs take bold, italic, underline and strike from it; a
 /// block inside containers gets it too (K3 applies it to the block's text).
 struct InlineStyle: Hashable {
@@ -280,13 +307,13 @@ struct MarkdownText {
         case .spoiler(let id, let c): nested(c) { $0.spoilers.append(id) }
         case .link(let id, _, _, let label, _): nested(label) { $0.link = id }
         case .code(let text): out.append(run(text, style, code: true))
-        case .userMention(let id): out.append(mention(.user, id, style))
-        case .roleMention(let id): out.append(mention(.role, id, style))
-        case .channelMention(let id): out.append(mention(.channel, id, style))
+        case .userMention(let id): out.append(mention(.user, id, style, n: out.count))
+        case .roleMention(let id): out.append(mention(.role, id, style, n: out.count))
+        case .channelMention(let id): out.append(mention(.channel, id, style, n: out.count))
         case .everyone: out.append(run("@everyone", style, fill: MarkdownPalette.mentionFill))
         case .here: out.append(run("@here", style, fill: MarkdownPalette.mentionFill))
         case .customEmoji(let id, let name, let animated):
-            var segment = run(Self.isolated(":\(name):"), style)
+            var segment = run(Self.isolated(":\(name):"), style, raw: RawText(text: ":\(name):", id: out.count))
             if !segment.covered, let url = body.emojiURL(id, animated: animated) {
                 let font = NSFont.systemFont(ofSize: size)
                 segment.image = InlineImage(url: url, height: (font.ascender - font.descender).rounded(.down), baselineOffset: font.descender)
@@ -300,7 +327,8 @@ struct MarkdownText {
                 segment.refreshEvery = shown.refreshEvery
             }
             out.append(segment)
-        case .slashCommand(let name, _): out.append(run(Self.isolated("/\(name)"), style, fill: MarkdownPalette.mentionFill))
+        case .slashCommand(let name, _):
+            out.append(run(Self.isolated("/\(name)"), style, fill: MarkdownPalette.mentionFill, raw: RawText(text: "/\(name)", id: out.count)))
         case .guildNavigation(_, let target): out.append(run(Self.label(target), style, fill: MarkdownPalette.mentionFill))
         case .lineBreak: out.append(run("\n", style))
         // `InlinePart.split` lifts blocks out before mapping; a direct caller still gets the text.
@@ -308,7 +336,7 @@ struct MarkdownText {
         }
     }
 
-    private func mention(_ kind: MentionKind, _ id: UInt64, _ style: InlineStyle) -> Segment {
+    private func mention(_ kind: MentionKind, _ id: UInt64, _ style: InlineStyle, n: Int) -> Segment {
         let resolved = body.mention(kind, id)
         let text = switch kind {
         case .user: "@" + (resolved?.name ?? "unknown-user")
@@ -316,21 +344,24 @@ struct MarkdownText {
         case .channel: "#" + (resolved?.name ?? "unknown")
         }
         guard let color = resolved?.color, color != 0 else {
-            return run(Self.isolated(text), style, fill: MarkdownPalette.mentionFill)
+            return run(Self.isolated(text), style, fill: MarkdownPalette.mentionFill, raw: RawText(text: text, id: n))
         }
         let role = Color(RGB(rgb: color))
-        return run(Self.isolated(text), style, fill: role.opacity(MarkdownPalette.roleFillOpacity), color: role)
+        return run(Self.isolated(text), style, fill: role.opacity(MarkdownPalette.roleFillOpacity), color: role, raw: RawText(text: text, id: n))
     }
 
     /// One run with the containers' attributes. Inside a hidden spoiler the run carries only the
     /// spoiler's reveal link (no inner link, fill, tip or image) and is marked covered.
-    private func run(_ string: String, _ style: InlineStyle, code: Bool = false, fill: Color? = nil, color: Color? = nil) -> Segment {
+    private func run(_ string: String, _ style: InlineStyle, code: Bool = false, fill: Color? = nil, color: Color? = nil, raw: RawText? = nil) -> Segment {
         var text = AttributedString(string)
+        let drawn = TextFont(size: code ? size * Self.codeScale : size, weight: style.bold ? .semibold : weight, mono: code, italic: style.italic)
         var font: Font = code
-            ? .system(size: size * Self.codeScale, weight: style.bold ? .semibold : weight, design: .monospaced)
-            : .system(size: size, weight: style.bold ? .semibold : weight)
+            ? .system(size: drawn.size, weight: drawn.weight, design: .monospaced)
+            : .system(size: drawn.size, weight: drawn.weight)
         if style.italic { font = font.italic() }
         text.swiftUI.font = font
+        text[TextFontAttribute.self] = drawn
+        if let raw { text[RawTextAttribute.self] = raw }
         if style.underline { text.swiftUI.underlineStyle = .single }
         if style.strike { text.swiftUI.strikethroughStyle = .single }
         if let hidden = style.hiddenSpoiler(revealed: revealed) {

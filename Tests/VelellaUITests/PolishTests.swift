@@ -62,11 +62,10 @@ private let br = MarkdownInline.lineBreak
     #expect(InlinePart.paragraph([br]) == [])
 }
 
+/// The height of a hosted render at 1x (selection plan N1: message text is an AppKit view).
 @MainActor private func height(_ blocks: [MarkdownBlock]) throws -> Int {
     let view = BlockList(blocks: blocks, text: MarkdownText(body: MessageBody(blocks: blocks)))
-    let renderer = ImageRenderer(content: view.frame(width: 240, alignment: .topLeading))
-    renderer.scale = 1
-    return try #require(renderer.cgImage).height
+    return try #require(TextHarness.render(view.frame(width: 240, alignment: .topLeading), width: 240, scale: 1)).height
 }
 
 @MainActor @Test func aQuoteOfOneLineWithATrailingBreakIsOneLineHigh() throws {

@@ -18,19 +18,10 @@ private let pythonCode = "x = 1\n\n# c"
 
 private func lineTexts(_ model: CodeBlockModel) -> [String] { model.lines.map { $0.map(\.text).joined() } }
 
-/// Distinct (r, g, b, a) pixels of an offscreen render.
-@MainActor private func pixels<V: View>(_ view: V, width: CGFloat = 240) -> (height: Int, colours: [[UInt8]])? {
-    let renderer = ImageRenderer(content: view.frame(width: width).environment(\.colorScheme, .light))
-    renderer.scale = 1
-    guard let image = renderer.cgImage, image.bitsPerPixel == 32, let data = image.dataProvider?.data as Data? else { return nil }
-    var out: [[UInt8]] = []
-    for y in 0..<image.height {
-        for x in 0..<image.width {
-            let o = y * image.bytesPerRow + x * 4
-            out.append(Array(data[o..<o + 4]))
-        }
-    }
-    return (image.height, out)
+/// Every (r, g, b, a) pixel of a hosted render (selection plan N1: the code is an AppKit view).
+@MainActor private func hostedPixels<V: View>(_ view: V, width: CGFloat = 240) -> (height: Int, colours: [[UInt8]])? {
+    guard let render = TextHarness.render(view, width: width, scale: 1) else { return nil }
+    return (render.height, (0..<render.height).flatMap { y in (0..<render.width).map { render.at($0, y) } })
 }
 
 /// The Copy button's accent (#007BC8): strongly blue, unlike anything else in a plain block.
@@ -51,7 +42,7 @@ private func hasCopyAccent(_ colours: [[UInt8]]) -> Bool {
 
 @MainActor @Test func theHeaderAddsARowAndColoursArriveWithoutMovingTheBlock() throws {
     func height(header: String?, highlight: CodeHighlight?) throws -> Int {
-        try #require(pixels(CodeBlockView(code: pythonCode, header: header, highlight: highlight, size: 14,
+        try #require(hostedPixels(CodeBlockView(code: pythonCode, header: header, highlight: highlight, size: 14,
                                           style: InlineStyle(), revealed: []))).height
     }
     let plain = try height(header: nil, highlight: nil)
@@ -69,8 +60,8 @@ private func hasCopyAccent(_ colours: [[UInt8]]) -> Bool {
 }
 
 @MainActor @Test func longLinesWrapInsideTheColumn() throws {
-    let one = try #require(pixels(CodeBlockView(code: "x", header: nil, highlight: nil, size: 14, style: InlineStyle(), revealed: []), width: 200))
-    let long = try #require(pixels(CodeBlockView(code: String(repeating: "word ", count: 40), header: nil, highlight: nil, size: 14, style: InlineStyle(), revealed: []), width: 200))
+    let one = try #require(hostedPixels(CodeBlockView(code: "x", header: nil, highlight: nil, size: 14, style: InlineStyle(), revealed: []), width: 200))
+    let long = try #require(hostedPixels(CodeBlockView(code: String(repeating: "word ", count: 40), header: nil, highlight: nil, size: 14, style: InlineStyle(), revealed: []), width: 200))
     #expect(long.height > one.height + 3 * Int(S.lineHeight))
 }
 
@@ -107,7 +98,7 @@ private func hasCopyAccent(_ colours: [[UInt8]]) -> Bool {
 
 @MainActor @Test func copyShowsOnHoverAndIsAbsentWhileCovered() throws {
     func render(spoilers: [Int], revealed: Set<Int>, hovering: Bool) -> [[UInt8]]? {
-        pixels(CodeBlockView(code: "x = 1\ny = 2", header: nil, highlight: nil, size: 14, style: InlineStyle(spoilers: spoilers),
+        hostedPixels(CodeBlockView(code: "x = 1\ny = 2", header: nil, highlight: nil, size: 14, style: InlineStyle(spoilers: spoilers),
                              revealed: revealed, hovering: hovering))?.colours
     }
     #expect(try hasCopyAccent(#require(render(spoilers: [], revealed: [], hovering: true))))

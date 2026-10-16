@@ -3,37 +3,56 @@ import SwiftUI
 
 private typealias T = DesignTokens
 
-/// A message body (docs/plans/markdown.md, K2). Every `.link` in it is `velella-link:<n>` or
-/// `velella-spoiler:<n>`, and this view's `openURL` handler is the only way from one to anything:
-/// it reveals spoilers (per row) and opens links through `LinkRouter`. Blocks render through
-/// `BlockView` (K3).
+/// A message body (docs/plans/markdown.md, K2). Its text views carry link and spoiler indices, and
+/// this view's `openURL` handler is the only way from one (as `velella-link:<n>` or
+/// `velella-spoiler:<n>`) to anything: it reveals spoilers (per row) and opens links through
+/// `LinkRouter`. Blocks render through `BlockList` (K3); a selection spans this instance's text
+/// views (docs/plans/selection.md, N1), of which there are at most `TextLeaves.limit` plus one.
 struct MarkdownView: View {
     let content: MessageBody
     /// Opens a vetted http(s) link outside the app; tests inject a recorder.
     var opener: (URL) -> Void = { _ = NSWorkspace.shared.open($0) }
-    @State private var revealed: Set<Int> = []
+    /// The opened spoilers and the blocks they were opened in: an edit renumbers the spoilers, so a
+    /// set made for other blocks counts as empty from the first render of the new ones (F-8).
+    @State private var reveal = Reveal()
     @State private var confirmation: LinkConfirmation?
+    @State private var selection = SelectionCoordinator()
+
+    struct Reveal {
+        var blocks: [MarkdownBlock] = []
+        var spoilers: Set<Int> = []
+    }
+
+    private var revealed: Set<Int> { reveal.blocks == content.blocks ? reveal.spoilers : [] }
 
     var body: some View {
-        BlockList(blocks: content.blocks, text: MarkdownText(body: content, revealed: revealed))
-            .equatable()
-            .environment(\.openURL, OpenURLAction { router.handle($0) })
-            .confirmationDialog(
-                "Open this link in your browser?",
-                isPresented: Binding(get: { confirmation != nil }, set: { if !$0 { confirmation = nil } }),
-                presenting: confirmation
-            ) { request in
-                Button("Open Link") { request.accept() }
-                Button("Cancel", role: .cancel) {}
-            } message: { request in
-                Text(verbatim: request.message)
+        let text = MarkdownText(body: content, revealed: revealed)
+        VStack(alignment: .leading, spacing: 0) {
+            BlockList(blocks: content.blocks, text: text)
+                .equatable()
+            if TextLeaves.count(content.blocks) > TextLeaves.limit {
+                TextRemainder(blocks: content.blocks, text: text)
             }
-            // An edit renumbers the spoilers: nothing stays open under a new number.
-            .onChange(of: content.blocks) { revealed = [] }
+        }
+        .environment(\.textCoordinator, CoordinatorBox(coordinator: selection))
+        .environment(\.openURL, OpenURLAction { router.handle($0) })
+        .confirmationDialog(
+            "Open this link in your browser?",
+            isPresented: Binding(get: { confirmation != nil }, set: { if !$0 { confirmation = nil } }),
+            presenting: confirmation
+        ) { request in
+            Button("Open Link") { request.accept() }
+            Button("Cancel", role: .cancel) {}
+        } message: { request in
+            Text(verbatim: request.message)
+        }
     }
 
     private var router: LinkRouter {
-        LinkRouter(body: content, reveal: { revealed.insert($0) }, confirm: { confirmation = $0 }, open: opener)
+        LinkRouter(body: content, reveal: { n in
+            if reveal.blocks != content.blocks { reveal = Reveal(blocks: content.blocks) }
+            reveal.spoilers.insert(n)
+        }, confirm: { confirmation = $0 }, open: opener)
     }
 }
 
@@ -262,18 +281,23 @@ extension MarkdownText: Equatable {
 
 // MARK: Block views
 
-/// Blocks stacked in order. `listDepth` counts the lists around them (bullet glyph by level).
+/// Blocks stacked in order. `listDepth` counts the lists around them (bullet glyph by level);
+/// `firstLeaf` numbers their first text view, and blocks starting at or past the view limit are
+/// left to the remainder (`TextRemainder`).
 struct BlockList: View, Equatable {
     let blocks: [MarkdownBlock]
     var style = InlineStyle()
     let text: MarkdownText
     var listDepth = 0
+    var firstLeaf = 0
 
     var body: some View {
-        let models = blocks.map { BlockModel($0, base: text, listDepth: listDepth) }
+        let starts = TextLeaves.starts(blocks, from: firstLeaf)
+        let shown = starts.prefix { $0 < TextLeaves.limit }.count
+        let models = blocks.prefix(shown).map { BlockModel($0, base: text, listDepth: listDepth) }
         VStack(alignment: .leading, spacing: 0) {
-            ForEach(Array(blocks.enumerated()), id: \.offset) { index, block in
-                BlockView(block: block, style: style, text: text, listDepth: listDepth)
+            ForEach(Array(blocks.prefix(shown).enumerated()), id: \.offset) { index, block in
+                BlockView(block: block, style: style, text: text, listDepth: listDepth, leaf: starts[index])
                     .padding(.top, index == 0 ? BlockModel.firstTop(block) : BlockModel.gap(after: models[index - 1], before: models[index]))
             }
         }
@@ -288,21 +312,20 @@ struct BlockView: View, Equatable {
     var style = InlineStyle()
     let text: MarkdownText
     var listDepth = 0
+    /// The block's first text view in its `MarkdownView`'s document order.
+    var leaf = 0
 
     var body: some View {
         switch BlockModel(block, base: text, listDepth: listDepth) {
         case .text(let inlines, let size, let weight, let secondary, _, _):
             let sized = { var t = text; t.size = size; t.weight = weight; return t }()
-            // Every line is a whole line box (22 at 16): n lines are n boxes tall.
-            let box = AttributedString.LineHeight.exact(points: MarkdownText.lineHeight(size: size))
-            if secondary {
-                InlineFlow(inlines: inlines, style: style, text: sized).foregroundStyle(.secondary).lineHeight(box)
-            } else {
-                InlineFlow(inlines: inlines, style: style, text: sized).lineHeight(box)
-            }
+            // Every line is a whole line box (22 at 16): the text view sets it from `size`.
+            InlineFlow(inlines: inlines, style: style, text: sized, leaf: leaf)
+                .transformEnvironment(\.textSecondary) { if secondary { $0 = true } }
         case .quote(let blocks):
-            BlockList(blocks: blocks, style: style, text: text, listDepth: listDepth)
+            BlockList(blocks: blocks, style: style, text: text, listDepth: listDepth, firstLeaf: leaf)
                 .foregroundStyle(.secondary)
+                .environment(\.textSecondary, true)
                 .padding(.leading, MarkdownBlockStyle.quoteBarWidth + MarkdownBlockStyle.quoteBarGap)
                 .padding(.trailing, MarkdownBlockStyle.quoteEndPadding)
                 .overlay(alignment: .leading) {
@@ -313,29 +336,27 @@ struct BlockView: View, Equatable {
         case .list(let markers, let items):
             // The marker hangs in the indent, right-aligned beside the item's first line.
             let indent = BlockModel.listIndent(markers: markers, size: text.size)
+            let starts = items.reduce(into: [leaf]) { $0.append($0.last! + TextLeaves.count($1)) }
             VStack(alignment: .leading, spacing: MarkdownBlockStyle.itemGap) {
-                ForEach(Array(items.enumerated()), id: \.offset) { index, item in
+                ForEach(Array(items.enumerated()).filter { starts[$0.offset] < TextLeaves.limit }, id: \.offset) { index, item in
                     HStack(alignment: .firstTextBaseline, spacing: MarkdownBlockStyle.markerGap) {
                         Text(verbatim: markers[index])
                             .font(.system(size: text.size, weight: text.weight).monospacedDigit())
                             .frame(width: indent - MarkdownBlockStyle.markerGap, alignment: .trailing)
-                        BlockList(blocks: item, style: style, text: text, listDepth: listDepth + 1)
+                        BlockList(blocks: item, style: style, text: text, listDepth: listDepth + 1, firstLeaf: starts[index])
                     }
                 }
             }
         case .code(let code, let header, let highlight, let size):
-            CodeBlockView(code: code, header: header, highlight: highlight, size: size, style: style, revealed: text.revealed)
+            CodeBlockView(code: code, header: header, highlight: highlight, size: size, style: style, revealed: text.revealed, leaf: leaf)
         case .plainCode(let code, let size):
-            // A line that fits is drawn in place; a wider block scrolls sideways, never wraps.
-            let lines = Text(verbatim: code)
-                .font(.system(size: size, design: .monospaced))
-                .fixedSize(horizontal: true, vertical: true)
-                .padding(.horizontal, MarkdownBlockStyle.codePaddingH)
-                .padding(.vertical, MarkdownBlockStyle.codePaddingV)
-            ViewThatFits(in: .horizontal) {
-                lines.frame(maxWidth: .infinity, alignment: .leading)
-                ScrollView(.horizontal) { lines }
+            // Unwrapped: a line that fits is drawn in place, a wider block scrolls sideways. One text
+            // view only (a `ViewThatFits` would make two of the same participant).
+            ScrollView(.horizontal) {
+                MessageTextBlock(leaves: [.plain(code: code, size: size, hidden: nil)], participant: leaf)
             }
+            .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
+            .frame(maxWidth: .infinity, alignment: .leading)
             .background(MarkdownBlockStyle.codeFill)
             .clipShape(RoundedRectangle(cornerRadius: MarkdownBlockStyle.codeRadius))
             .overlay {
@@ -420,14 +441,17 @@ struct CodeBlockModel: Equatable {
     /// C1 controls and the bidi controls (ALM, LRM, RLM, LRE-RLO, LRI-PDI) drawn as `\u{XXXX}`, as
     /// `LinkConfirmation.escaped` writes them. ZWJ and every other character stay as they are.
     static func escaped(_ s: String) -> String {
-        s.unicodeScalars.map { scalar in
-            switch scalar.value {
-            case 0x00...0x08, 0x0B...0x1F, 0x7F...0x9F, 0x061C, 0x200E, 0x200F, 0x202A...0x202E, 0x2066...0x2069:
-                String(format: "\\u{%04X}", scalar.value)
-            default: String(scalar)
-            }
-        }.joined()
+        s.unicodeScalars.map { isEscaped($0) ? escape($0) : String($0) }.joined()
     }
+
+    static func isEscaped(_ scalar: Unicode.Scalar) -> Bool {
+        switch scalar.value {
+        case 0x00...0x08, 0x0B...0x1F, 0x7F...0x9F, 0x061C, 0x200E, 0x200F, 0x202A...0x202E, 0x2066...0x2069: true
+        default: false
+        }
+    }
+
+    static func escape(_ scalar: Unicode.Scalar) -> String { String(format: "\\u{%04X}", scalar.value) }
 }
 
 /// "Copied!" after a copy, for `CodeBlockStyle.copyCooldown`; a newer copy restarts it.
@@ -450,71 +474,43 @@ final class CopyFeedback {
     }
 }
 
-/// A code block in Vencord's look (plan K6). Under a hidden spoiler it has no Copy control; the
+/// A code block in Vencord's look (plan K6): its header, line numbers and rows in one message text
+/// view (`MessageTextContent.codeBlock`). Under a hidden spoiler it has no Copy control; the
 /// spoiler's cover (`SpoilerCover`) hides the rest.
 struct CodeBlockView: View {
     let code: String
-    let model: CodeBlockModel
+    let header: String?
+    let highlight: CodeHighlight?
     let size: CGFloat
     let covered: Bool
     let pasteboard: NSPasteboard
+    let leaf: Int
     @State private var hovering: Bool
     @State private var feedback = CopyFeedback()
 
     private typealias S = CodeBlockStyle
 
     /// `style` is the containers around the block (only its spoilers count); `hovering` is for
-    /// offscreen renders of the hover state.
+    /// offscreen renders of the hover state; `leaf` is the text view's place in its body.
     init(code: String, header: String?, highlight: CodeHighlight?, size: CGFloat, style: InlineStyle, revealed: Set<Int>,
-         pasteboard: NSPasteboard = .general, hovering: Bool = false) {
+         pasteboard: NSPasteboard = .general, hovering: Bool = false, leaf: Int = 0) {
         self.code = code
-        model = CodeBlockModel(code: code, header: header, highlight: highlight)
+        self.header = header
+        self.highlight = highlight
         self.size = size
         covered = style.hiddenSpoiler(revealed: revealed) != nil
         self.pasteboard = pasteboard
+        self.leaf = leaf
         _hovering = State(initialValue: hovering)
     }
 
     var body: some View {
-        let font = Font.system(size: size, design: .monospaced)
-        VStack(alignment: .leading, spacing: 0) {
-            if let name = model.name {
-                HStack(spacing: S.headerIconGap) {
-                    Image(systemName: S.headerSymbol)
-                    Text(verbatim: name)
-                }
-                .font(.system(size: size, weight: .bold))
-                .padding(.horizontal, S.headerPaddingH)
-                .padding(.bottom, S.headerBottom)
+        MessageTextBlock(leaves: [.code(code: code, header: header, highlight: highlight, size: size, hidden: nil)], participant: leaf)
+            .alignmentGuide(.firstTextBaseline) { [size, header] _ in MainActor.assumeIsolated { TextMetrics.firstBaseline(codeSize: size, header: header != nil) } }
+            .overlay(alignment: .bottomTrailing) {
+                if hovering && !covered { copyButton }
             }
-            // Rows rather than a `Grid`: a Grid sizes a wrapping cell for another width and clips
-            // its last line. The number column is as wide as the longest number (monospaced digits).
-            let numberWidth = (Self.digitWidth(size: size) * CGFloat(model.numbers.last?.count ?? 1)).rounded(.up)
-            ForEach(Array(zip(model.numbers, model.lines).enumerated()), id: \.offset) { _, row in
-                HStack(alignment: .firstTextBaseline, spacing: 0) {
-                    Text(verbatim: row.0)
-                        .font(font)
-                        .frame(width: numberWidth, alignment: .leading)
-                        .padding(.leading, S.numberLeading)
-                        .padding(.trailing, S.numberTrailing)
-                    Text(Self.attributed(row.1, size: size))
-                        .fixedSize(horizontal: false, vertical: true)
-                        .padding(.leading, S.codeLeading)
-                        .frame(maxWidth: .infinity, minHeight: S.rowHeight, alignment: .topLeading)
-                }
-            }
-        }
-        .lineHeight(.exact(points: S.lineHeight))
-        .foregroundStyle(Color(RGB(rgb: S.plain)))
-        .padding(size * S.paddingEm)
-        .padding(.top, model.name == nil ? max(0, S.plainTopPadding - size * S.paddingEm) : 0)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color(S.background))
-        .clipShape(RoundedRectangle(cornerRadius: S.radius))
-        .overlay(alignment: .bottomTrailing) {
-            if hovering && !covered { copyButton }
-        }
-        .onHover { hovering = $0 }
+            .onHover { hovering = $0 }
     }
 
     private var copyButton: some View {
@@ -534,17 +530,33 @@ struct CodeBlockView: View {
         ("0" as NSString).size(withAttributes: [.font: NSFont.monospacedSystemFont(ofSize: size, weight: .regular)]).width
     }
 
-    /// One line's runs, escaped for display, in their colours and styles.
+    /// One line's runs, escaped for display, in their colours and styles. Each escape is a run of
+    /// its own carrying its raw scalar, which is what a copy emits (S-15).
     static func attributed(_ line: [CodeSpan], size: CGFloat) -> AttributedString {
         var out = AttributedString()
+        var escapes = 0
         for span in line {
-            var run = AttributedString(CodeBlockModel.escaped(span.text))
             var font = Font.system(size: size, weight: span.bold ? .bold : .regular, design: .monospaced)
             if span.italic { font = font.italic() }
-            run.swiftUI.font = font
-            run.swiftUI.foregroundColor = Color(RGB(rgb: span.rgb))
-            if span.underline { run.swiftUI.underlineStyle = .single }
-            out += run
+            func piece(_ text: String, raw: String?) {
+                var run = AttributedString(text)
+                run.swiftUI.font = font
+                run[TextFontAttribute.self] = TextFont(size: size, weight: span.bold ? .bold : .regular, mono: true, italic: span.italic)
+                run.swiftUI.foregroundColor = Color(RGB(rgb: span.rgb))
+                if span.underline { run.swiftUI.underlineStyle = .single }
+                if let raw {
+                    run[RawTextAttribute.self] = RawText(text: raw, id: escapes)
+                    escapes += 1
+                }
+                out += run
+            }
+            var plain = String.UnicodeScalarView()
+            for scalar in span.text.unicodeScalars {
+                guard CodeBlockModel.isEscaped(scalar) else { plain.append(scalar); continue }
+                if !plain.isEmpty { piece(String(plain), raw: nil); plain = String.UnicodeScalarView() }
+                piece(CodeBlockModel.escape(scalar), raw: String(scalar))
+            }
+            if !plain.isEmpty { piece(String(plain), raw: nil) }
         }
         return out
     }

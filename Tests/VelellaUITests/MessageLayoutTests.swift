@@ -116,6 +116,15 @@ private struct Ink {
     private let alpha: [UInt8]
     static let scale = 2
 
+    /// A hosted render (selection plan N1: message text is an AppKit view, which `ImageRenderer`
+    /// does not draw), light, transparent where nothing draws.
+    @MainActor init?<V: View>(hosted view: V, width: CGFloat) {
+        guard let render = TextHarness.render(view, width: width, scale: CGFloat(Ink.scale)) else { return nil }
+        self.width = render.width
+        self.height = render.height
+        alpha = (0..<render.height).flatMap { y in (0..<render.width).map { x in render.at(x, y)[3] } }
+    }
+
     @MainActor init?<V: View>(_ view: V, width: CGFloat) {
         let renderer = ImageRenderer(content: view.frame(width: width, alignment: .leading).environment(\.colorScheme, .light))
         renderer.scale = CGFloat(Ink.scale)
@@ -167,7 +176,7 @@ private func threeLines(startsGroup: Bool, edited: Bool = false) -> MessageRow {
 }
 
 @MainActor @Test func aGroupStartPutsTheAvatarAtSixteenAndTheTextAtSeventyTwo() throws {
-    let render = try #require(Ink(threeLines(startsGroup: true), width: 400))
+    let render = try #require(Ink(hosted: threeLines(startsGroup: true), width: 400))
     // The avatar is the only ink left of the text column: its left edge is at x 16, its top 2 pt
     // below the row's content top (2 pt padding + 2 pt).
     let avatarX = try #require(render.firstColumn(in: 0..<60, rows: 0..<60))
@@ -182,7 +191,7 @@ private func threeLines(startsGroup: Bool, edited: Bool = false) -> MessageRow {
 }
 
 @MainActor @Test func bodyLinesAreTwentyTwoPointsApartAndTheRowIsWholeLineBoxes() throws {
-    let render = try #require(Ink(threeLines(startsGroup: true), width: 400))
+    let render = try #require(Ink(hosted: threeLines(startsGroup: true), width: 400))
     // Header band, then three body bands.
     let bands = render.bandStarts(in: 72..<300)
     #expect(bands.count == 4, "bands: \(bands)")
@@ -194,7 +203,7 @@ private func threeLines(startsGroup: Bool, edited: Bool = false) -> MessageRow {
 }
 
 @MainActor @Test func aFollowUpRowHasNeitherAvatarNorHeaderButKeepsTheTextColumn() throws {
-    let render = try #require(Ink(threeLines(startsGroup: false), width: 400))
+    let render = try #require(Ink(hosted: threeLines(startsGroup: false), width: 400))
     #expect(render.firstColumn(in: 0..<72, rows: 0..<render.height / 2) == nil, "ink left of the text column")
     let textX = try #require(render.firstColumn(in: 60..<200, rows: 0..<render.height / 2))
     #expect((72...74).contains(textX))
@@ -206,7 +215,7 @@ private func threeLines(startsGroup: Bool, edited: Bool = false) -> MessageRow {
 @MainActor @Test func blockTextHasWholeLineBoxesAtEverySize() throws {
     func height(_ block: MarkdownBlock) -> Double? {
         let body = MessageBody(blocks: [block])
-        return Ink(BlockList(blocks: body.blocks, text: MarkdownText(body: body)), width: 300).map { Double($0.height) / Double(Ink.scale) }
+        return Ink(hosted: BlockList(blocks: body.blocks, text: MarkdownText(body: body)), width: 300).map { Double($0.height) / Double(Ink.scale) }
     }
     let lines: [MarkdownInline] = [.text("H"), .lineBreak, .text("H"), .lineBreak, .text("H")]
     // Three lines are three boxes: 22 at 16, 33 / 27.5 / 22 for h1 / h2 / h3, 19.25 for subtext; a
