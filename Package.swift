@@ -15,8 +15,18 @@ let package = Package(
             path: "Sources/VelellaFFI"
         ),
         // SwiftUI shell; plain view-state values and fixtures, deliberately NO VelellaFFI dependency.
-        .target(name: "VelellaUI", path: "Sources/VelellaUI"),
-        .testTarget(name: "VelellaUITests", dependencies: ["VelellaUI"], path: "Tests/VelellaUITests"),
+        // Resources: the emoji catalog and the Twemoji SVGs (scripts/emoji_catalog.py generates both).
+        .target(
+            name: "VelellaUI",
+            path: "Sources/VelellaUI",
+            resources: [.copy("Resources/Emoji"), .copy("Resources/Twemoji")]
+        ),
+        .testTarget(
+            name: "VelellaUITests",
+            dependencies: ["VelellaUI"],
+            path: "Tests/VelellaUITests",
+            resources: [.copy("Fixtures/EmojiReference")]
+        ),
         // Login webview, capture checks and the Keychain decision; also NO VelellaFFI dependency.
         .target(name: "VelellaLogin", path: "Sources/VelellaLogin"),
         .testTarget(name: "VelellaLoginTests", dependencies: ["VelellaLogin"], path: "Tests/VelellaLoginTests"),
