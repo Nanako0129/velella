@@ -684,7 +684,7 @@ impl State {
         if let Some(a) = d.get("apex_experiments").filter(|a| a.is_object()) {
             self.apex_experiments.push(a.clone());
         }
-        self.self_state.ready(d, me.id);
+        self.self_state.ready(d);
         true
     }
 
@@ -717,6 +717,7 @@ impl State {
             guild.member_roles = Some(roles);
         }
         self.guilds.push(guild);
+        self.self_state.ready_guild(raw, merged, me);
         self.guild_extras(raw, gid, false);
     }
 

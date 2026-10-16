@@ -23,6 +23,8 @@ pub struct Thread {
     pub archived_known: bool,
     /// `thread_metadata.locked`; `None` when the metadata or the key was absent (F1).
     pub locked: Option<bool>,
+    /// Channel type: 10 announcement thread, 11 public, 12 private (F1).
+    pub kind: u8,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -50,6 +52,7 @@ fn parse(v: &Value, default_guild: Option<u64>) -> Option<Thread> {
             .is_some_and(Value::is_object),
         archived_known: metadata_bool(v, "archived").is_some(),
         locked: metadata_bool(v, "locked"),
+        kind: u8::try_from(v.get("type")?.as_u64()?).ok()?,
     })
 }
 

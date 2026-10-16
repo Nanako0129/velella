@@ -78,6 +78,26 @@ permission_bits! {
 /// What a timed-out member keeps (`v`, W:9605221; applied at W:9606150 when `communicationDisabledUntil`
 /// is later than now, W:4994848, and the member is not an administrator).
 const TIMEOUT_KEEPS: u64 = VIEW_CHANNEL | READ_MESSAGE_HISTORY;
+/// What a pending member (membership screening not passed) keeps: the lurker mask `y`
+/// (W:9605221, applied at W:9606189 `w` after the overwrites, administrators included).
+const PENDING_KEEPS: u64 = VIEW_CHANNEL | READ_MESSAGE_HISTORY;
+/// What an AutoMod-quarantined member keeps (`b`, W:9605221; W:9605796 `U`, not for administrators).
+const QUARANTINE_KEEPS: u64 = VIEW_CHANNEL | READ_MESSAGE_HISTORY | CHANGE_NICKNAME;
+/// Removed from a user without MFA in a guild that requires it (`C.Lti`, the union of `eh` at
+/// W:11587777; applied by `P`, W:9605590, to every result for the user, owner included, when the
+/// guild's `mfaLevel` is ELEVATED and the user's `mfaEnabled` is falsy, W:8758734).
+const MODERATOR_PERMISSIONS: u64 = KICK_MEMBERS
+    | BAN_MEMBERS
+    | ADMINISTRATOR
+    | MANAGE_CHANNELS
+    | MANAGE_GUILD
+    | MANAGE_ROLES
+    | MANAGE_MESSAGES
+    | MANAGE_THREADS
+    | MODERATE_MEMBERS;
+/// Channel type of a private thread, and of a stage voice channel.
+const PRIVATE_THREAD: u8 = 12;
+const GUILD_STAGE_VOICE: u8 = 13;
 
 /// The signed-in user's permissions in one channel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -101,17 +121,55 @@ impl ChannelPermissions {
     }
 }
 
-/// The guild-wide part: owner, roles, ADMINISTRATOR, overwrites, then the timeout mask.
-/// `timed_out` is read only when it can matter (not owner, not administrator).
+/// What the masks that follow the overwrites need to know about the user; `None` is unknown and
+/// is consulted only when the mask could change the result.
+#[derive(Clone, Copy)]
+struct Masks {
+    timed_out: Option<bool>,
+    pending: Option<bool>,
+    quarantined: Option<bool>,
+    /// MFA is required by the guild and the user has none.
+    strip_moderator: Option<bool>,
+}
+
+/// No mask applies. Every mask keeps VIEW_CHANNEL, so `can_view_channel` needs none.
+const NO_MASKS: Masks = Masks {
+    timed_out: Some(false),
+    pending: Some(false),
+    quarantined: Some(false),
+    strip_moderator: Some(false),
+};
+
+/// The guild-wide part, in the official order (W:9606189 `w`, W:9605796 `U`, `P`): owner, roles,
+/// ADMINISTRATOR, overwrites, then for non-administrators the quarantine and timeout masks, then
+/// the pending-member mask (not for the owner), then the elevated-MFA strip (for everyone).
 fn guild_bits(
     user_id: u64,
     guild: &Guild,
     overwrites: Option<&[Overwrite]>,
-    timed_out: Option<bool>,
+    masks: Masks,
 ) -> Option<u64> {
-    if guild.owner_id == Some(user_id) {
-        return Some(ALL_PERMISSIONS);
+    let owner = guild.owner_id == Some(user_id);
+    let mut bits = if owner {
+        ALL_PERMISSIONS
+    } else {
+        base_and_overwrites(user_id, guild, overwrites, masks)?
+    };
+    if !owner && masks.pending? {
+        bits &= PENDING_KEEPS;
     }
+    if masks.strip_moderator? {
+        bits &= !MODERATOR_PERMISSIONS;
+    }
+    Some(bits)
+}
+
+fn base_and_overwrites(
+    user_id: u64,
+    guild: &Guild,
+    overwrites: Option<&[Overwrite]>,
+    masks: Masks,
+) -> Option<u64> {
     if guild.unavailable {
         return None;
     }
@@ -148,8 +206,13 @@ fn guild_bits(
     if let Some(o) = own {
         bits = (bits & !o.deny) | o.allow;
     }
-    if bits & ADMINISTRATOR == 0 && timed_out? {
-        bits &= TIMEOUT_KEEPS;
+    if bits & ADMINISTRATOR == 0 {
+        if masks.quarantined? {
+            bits &= QUARANTINE_KEEPS;
+        }
+        if masks.timed_out? {
+            bits &= TIMEOUT_KEEPS;
+        }
     }
     Some(bits)
 }
@@ -159,12 +222,12 @@ pub(crate) fn can_view_channel(user_id: u64, guild: &Guild, channel: &Channel) -
     if channel.is_obfuscated() {
         return Some(false);
     }
-    // A timeout keeps VIEW_CHANNEL, so it never changes this answer: not consulted.
+    // No mask removes VIEW_CHANNEL (the elevated-MFA one takes only moderator bits): none consulted.
     guild_bits(
         user_id,
         guild,
         channel.permission_overwrites.as_deref(),
-        Some(false),
+        NO_MASKS,
     )
     .map(|bits| bits & VIEW_CHANNEL != 0)
 }
@@ -179,12 +242,18 @@ fn guild_channel_bits(
     if channel.is_obfuscated() {
         return Some(0);
     }
-    guild_bits(
-        user,
-        guild,
-        channel.permission_overwrites.as_deref(),
-        state.self_state.timed_out(guild.id, now_ms),
-    )
+    let own = state.self_state.members.get(&guild.id);
+    let masks = Masks {
+        timed_out: own.and_then(|m| m.timed_out(now_ms)),
+        // A pending member in a public stage channel keeps more (`computeLurkerPermissionsAllowList`,
+        // W:8694356), which needs the stage instance: unknown.
+        pending: own
+            .map(|m| m.pending)
+            .filter(|pending| !(*pending && channel.kind == GUILD_STAGE_VOICE)),
+        quarantined: own.map(|m| m.quarantined()),
+        strip_moderator: state.self_state.strips_moderator(guild.id),
+    };
+    guild_bits(user, guild, channel.permission_overwrites.as_deref(), masks)
 }
 
 fn find_channel(guild: &Guild, id: u64) -> Option<&Channel> {
@@ -209,8 +278,9 @@ pub fn channel_permissions(state: &State, channel_id: u64) -> ChannelPermissions
 /// The store applies no further implicit rule: a missing VIEW_CHANNEL does not clear the other
 /// bits, and a missing SEND_MESSAGES does not clear MENTION_EVERYONE, SEND_TTS_MESSAGES,
 /// ATTACH_FILES or EMBED_LINKS (its callers combine them, e.g. `can(ATTACH_FILES) &&
-/// can(SEND_MESSAGES)`). Not modelled, for lack of the data in state: the private and media
-/// thread rules, the guild's elevated-MFA stripping, and the pending and quarantined member masks.
+/// can(SEND_MESSAGES)`). Also applied: the quarantined and pending member masks and the
+/// elevated-MFA strip (see `guild_bits`) and the private-thread rule. Not modelled: guest
+/// accounts and role preview, which velella does not have.
 pub fn channel_permissions_at(state: &State, channel_id: u64, now_ms: i64) -> ChannelPermissions {
     use ChannelPermissions::{Bits, Private, Unknown};
     if state.private_channels.iter().any(|c| c.id == channel_id) {
@@ -238,6 +308,11 @@ pub fn channel_permissions_at(state: &State, channel_id: u64, now_ms: i64) -> Ch
     let Some(parent_bits) = guild_channel_bits(state, user, guild, parent, now_ms) else {
         return Unknown;
     };
+    // A private thread the user has not joined shows nothing to anyone who cannot manage threads
+    // (W:9607730 `x`). MEDIA_THREAD is a client-made type (W:3618260, a local preview): never sent.
+    if thread.kind == PRIVATE_THREAD && !thread.joined && parent_bits & MANAGE_THREADS == 0 {
+        return Bits(0);
+    }
     let sends = parent_bits & SEND_MESSAGES_IN_THREADS != 0;
     // `locked` matters only to a member who cannot manage threads.
     let locked = if sends && parent_bits & MANAGE_THREADS == 0 {

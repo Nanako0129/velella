@@ -33,19 +33,42 @@ fn role(id: u64, permissions: u64) -> Value {
 /// A READY with one guild (owner `owner`, text channel 300 with `overwrites`) in which the user
 /// holds `my_roles` and `member` extras (for example a timeout), carried by `merged_members`.
 fn world(owner: u64, roles: &[Value], my_roles: &[u64], member: Value, overwrites: Value) -> State {
+    world_in(
+        owner,
+        roles,
+        my_roles,
+        member,
+        overwrites,
+        json!({"mfa_level": 0}),
+    )
+}
+
+/// `world` with extra fields on the guild object (for example `mfa_level`).
+fn world_in(
+    owner: u64,
+    roles: &[Value],
+    my_roles: &[u64],
+    member: Value,
+    overwrites: Value,
+    guild_extra: Value,
+) -> State {
     let mut mine = json!({"user_id": ME.to_string(), "roles": my_roles.iter().map(u64::to_string).collect::<Vec<_>>()});
     for (k, v) in member.as_object().into_iter().flatten() {
         mine[k] = v.clone();
+    }
+    let mut guild = json!({
+        "id": GUILD.to_string(), "name": "g", "owner_id": owner.to_string(), "roles": roles,
+        "channels": [{"id": CHANNEL.to_string(), "type": 0, "permission_overwrites": overwrites}],
+    });
+    for (k, v) in guild_extra.as_object().into_iter().flatten() {
+        guild[k] = v.clone();
     }
     let mut s = State::default();
     assert!(s.apply(
         "READY",
         &json!({
             "user": {"id": ME.to_string(), "username": "me", "premium_type": 2},
-            "guilds": [{
-                "id": GUILD.to_string(), "name": "g", "owner_id": owner.to_string(), "roles": roles,
-                "channels": [{"id": CHANNEL.to_string(), "type": 0, "permission_overwrites": overwrites}],
-            }],
+            "guilds": [guild],
             "merged_members": [[mine]],
             "private_channels": [{"id": "500", "type": 1, "recipient_ids": []}],
         })
@@ -108,6 +131,13 @@ fn the_owner_holds_everything_even_without_role_data() {
         "READY",
         &json!({"user": {"id": "1", "username": "me"}, "guilds": [
         {"id": "100", "owner_id": "1", "channels": [{"id": "300", "type": 0}]}]}),
+    );
+    // The elevated-MFA strip reaches the owner too, so even the owner needs the guild's level
+    // (or MFA on the account) to be known.
+    assert_eq!(perms(&s, CHANNEL), ChannelPermissions::Unknown);
+    s.apply(
+        "GUILD_CREATE",
+        &json!({"id": "100", "owner_id": "1", "mfa_level": 0, "channels": [{"id": "300", "type": 0}]}),
     );
     assert_eq!(
         perms(&s, CHANNEL),
@@ -286,7 +316,7 @@ fn a_timeout_leaves_only_view_and_history() {
     );
     // A member who never came with a member object has no timeout record at all.
     let mut s = timed(Value::Null);
-    s.self_state.member_timeouts.clear();
+    s.self_state.members.clear();
     assert_eq!(perms(&s, CHANNEL), ChannelPermissions::Unknown);
     // The expiry is compared with the moment asked about.
     let s = timed(json!("2027-01-15T08:00:01Z"));
@@ -384,7 +414,7 @@ fn ready_without_member(roles: Value) -> State {
         "READY",
         &json!({
             "user": {"id": "1", "username": "me"},
-            "guilds": [{"id": "100", "owner_id": "999", "roles": roles, "channels": [{"id": "300", "type": 0, "permission_overwrites": []}]}],
+            "guilds": [{"id": "100", "owner_id": "999", "mfa_level": 0, "roles": roles, "channels": [{"id": "300", "type": 0, "permission_overwrites": []}]}],
         })
     ));
     s
@@ -421,7 +451,7 @@ fn a_timeout_carried_in_merged_members_strips_the_permissions() {
         json!([]),
     );
     assert_eq!(
-        s.self_state.member_timeouts[&GUILD],
+        s.self_state.members[&GUILD].timeout,
         Timeout::Until(4_070_908_800_000)
     );
     assert_eq!(perms(&s, CHANNEL).can(SEND_MESSAGES), Some(false));
@@ -464,7 +494,7 @@ fn guild_member_update_and_guild_create_change_the_timeout() {
     );
     s.apply(
         "GUILD_CREATE",
-        &json!({"id": "100", "owner_id": "999", "roles": roles, "members": [
+        &json!({"id": "100", "owner_id": "999", "mfa_level": 0, "roles": roles, "members": [
             {"user": {"id": "1"}, "roles": [], "communication_disabled_until": FUTURE}],
             "channels": [{"id": "300", "type": 0, "permission_overwrites": []}]}),
     );
@@ -699,4 +729,350 @@ fn the_thread_state_comes_from_the_thread_and_the_permissions() {
     );
     s.guilds[0].member_roles = None;
     assert_eq!(thread_state(&s, THREAD).manage_threads, Tri::Unknown);
+}
+
+// ---- The official masks beyond the timeout (W:9605796 `U`, W:9606189 `w`, W:9605590 `P`) ----
+
+/// The union `Lti` of the official moderator list `eh` (W:11587777), written out from it.
+fn moderator_mask() -> u64 {
+    bits(&[
+        KICK_MEMBERS,
+        BAN_MEMBERS,
+        ADMINISTRATOR,
+        MANAGE_CHANNELS,
+        MANAGE_GUILD,
+        MANAGE_ROLES,
+        MANAGE_MESSAGES,
+        MANAGE_THREADS,
+        MODERATE_MEMBERS,
+    ])
+}
+
+fn set_mfa(s: &mut State, enabled: bool) {
+    assert!(s.apply("USER_UPDATE", &json!({"id": "1", "mfa_enabled": enabled})));
+}
+
+#[test]
+fn a_guild_requiring_mfa_strips_moderator_bits_from_a_user_without_it() {
+    let member_bits = bits(&[
+        VIEW_CHANNEL,
+        SEND_MESSAGES,
+        MANAGE_MESSAGES,
+        MANAGE_THREADS,
+        PIN_MESSAGES,
+    ]);
+    let elevated = json!({"mfa_level": 1});
+    let build = |owner: u64, role_bits: u64| {
+        world_in(
+            owner,
+            &[role(GUILD, role_bits)],
+            &[],
+            json!({}),
+            json!([]),
+            elevated.clone(),
+        )
+    };
+    // Without MFA: MANAGE_MESSAGES and MANAGE_THREADS go, PIN_MESSAGES (not in the list) stays.
+    let mut s = build(OWNER, member_bits);
+    set_mfa(&mut s, false);
+    assert_eq!(
+        perms(&s, CHANNEL),
+        ChannelPermissions::Bits(bits(&[VIEW_CHANNEL, SEND_MESSAGES, PIN_MESSAGES]))
+    );
+    // With MFA nothing is stripped.
+    set_mfa(&mut s, true);
+    assert_eq!(perms(&s, CHANNEL), ChannelPermissions::Bits(member_bits));
+    // The owner and an administrator lose the moderator list too, and keep the rest.
+    let mut owner = build(ME, 0);
+    set_mfa(&mut owner, false);
+    assert_eq!(
+        perms(&owner, CHANNEL),
+        ChannelPermissions::Bits(ALL_PERMISSIONS & !moderator_mask())
+    );
+    let mut admin = build(OWNER, ADMINISTRATOR);
+    set_mfa(&mut admin, false);
+    assert_eq!(
+        perms(&admin, CHANNEL),
+        ChannelPermissions::Bits(ALL_PERMISSIONS & !moderator_mask())
+    );
+    // A guild that does not require MFA strips nothing.
+    let mut s = world_in(
+        OWNER,
+        &[role(GUILD, member_bits)],
+        &[],
+        json!({}),
+        json!([]),
+        json!({"mfa_level": 0}),
+    );
+    set_mfa(&mut s, false);
+    assert_eq!(perms(&s, CHANNEL), ChannelPermissions::Bits(member_bits));
+}
+
+#[test]
+fn the_mfa_strip_is_unknown_when_its_inputs_are_missing() {
+    let member_bits = bits(&[VIEW_CHANNEL, MANAGE_MESSAGES]);
+    // The guild never said its level (and the user has no MFA on record): Unknown.
+    let s = world_in(
+        OWNER,
+        &[role(GUILD, member_bits)],
+        &[],
+        json!({}),
+        json!([]),
+        json!({}),
+    );
+    assert_eq!(perms(&s, CHANNEL), ChannelPermissions::Unknown);
+    // A user known to have MFA needs no level.
+    let mut s = s;
+    set_mfa(&mut s, true);
+    assert_eq!(perms(&s, CHANNEL), ChannelPermissions::Bits(member_bits));
+    // An elevated guild and a user whose MFA state never arrived: Unknown.
+    let s = world_in(
+        OWNER,
+        &[role(GUILD, member_bits)],
+        &[],
+        json!({}),
+        json!([]),
+        json!({"mfa_level": 1}),
+    );
+    assert_eq!(s.self_state.mfa_enabled, None);
+    assert_eq!(perms(&s, CHANNEL), ChannelPermissions::Unknown);
+    // READY's user and a GUILD_CREATE with the level under `properties` feed both inputs.
+    let mut s = State::default();
+    s.apply(
+        "READY",
+        &json!({"user": {"id": "1", "username": "me", "mfa_enabled": false}, "guilds": []}),
+    );
+    s.apply(
+        "GUILD_CREATE",
+        &json!({"id": "100", "properties": {"owner_id": "999", "mfa_level": 1}, "roles": [role(GUILD, member_bits)],
+            "members": [{"user": {"id": "1"}, "roles": []}],
+            "channels": [{"id": "300", "type": 0, "permission_overwrites": []}]}),
+    );
+    assert_eq!(perms(&s, CHANNEL), ChannelPermissions::Bits(VIEW_CHANNEL));
+}
+
+#[test]
+fn a_pending_member_keeps_only_view_and_history_even_as_an_administrator() {
+    let all_but_admin = ALL_PERMISSIONS & !ADMINISTRATOR;
+    let pending = json!({"pending": true});
+    let keeps = bits(&[VIEW_CHANNEL, READ_MESSAGE_HISTORY]);
+    let s = world(
+        OWNER,
+        &[role(GUILD, all_but_admin)],
+        &[],
+        pending.clone(),
+        json!([]),
+    );
+    assert_eq!(perms(&s, CHANNEL), ChannelPermissions::Bits(keeps));
+    // A role may give less than the mask: the mask only takes away.
+    let s = world(
+        OWNER,
+        &[role(GUILD, bits(&[VIEW_CHANNEL, SEND_MESSAGES]))],
+        &[],
+        pending.clone(),
+        json!([]),
+    );
+    assert_eq!(perms(&s, CHANNEL), ChannelPermissions::Bits(VIEW_CHANNEL));
+    // The official `w` applies it after the administrator shortcut: administrators too.
+    let s = world(
+        OWNER,
+        &[role(GUILD, ADMINISTRATOR)],
+        &[],
+        pending.clone(),
+        json!([]),
+    );
+    assert_eq!(perms(&s, CHANNEL), ChannelPermissions::Bits(keeps));
+    // The owner never reaches `w` (W:9606751 returns first).
+    let s = world(ME, &[role(GUILD, 0)], &[], pending.clone(), json!([]));
+    assert_eq!(
+        perms(&s, CHANNEL),
+        ChannelPermissions::Bits(ALL_PERMISSIONS)
+    );
+    // A public stage channel gives a pending member more (`computeLurkerPermissionsAllowList`,
+    // which needs the stage instance): not known here.
+    let mut s = world(
+        OWNER,
+        &[role(GUILD, all_but_admin)],
+        &[],
+        pending,
+        json!([]),
+    );
+    s.guilds[0].channels[0].kind = 13;
+    assert_eq!(perms(&s, CHANNEL), ChannelPermissions::Unknown);
+    // Screening passed (a GUILD_MEMBER_UPDATE of the user): everything is back.
+    let mut s = world(
+        OWNER,
+        &[role(GUILD, all_but_admin)],
+        &[],
+        json!({"pending": true}),
+        json!([]),
+    );
+    assert!(s.apply(
+        "GUILD_MEMBER_UPDATE",
+        &json!({"guild_id": "100", "user": {"id": "1"}, "roles": [], "pending": false})
+    ));
+    assert_eq!(perms(&s, CHANNEL), ChannelPermissions::Bits(all_but_admin));
+}
+
+#[test]
+fn a_quarantined_member_keeps_view_history_and_nickname_unless_administrator() {
+    let all_but_admin = ALL_PERMISSIONS & !ADMINISTRATOR;
+    let keeps = bits(&[VIEW_CHANNEL, READ_MESSAGE_HISTORY, CHANGE_NICKNAME]);
+    // Each of the three AutoMod quarantine flags (module 340837): 128, 256, 1024.
+    for flags in [128, 256, 1024, 256 | 2] {
+        let s = world(
+            OWNER,
+            &[role(GUILD, all_but_admin)],
+            &[],
+            json!({"flags": flags}),
+            json!([]),
+        );
+        assert_eq!(
+            perms(&s, CHANNEL),
+            ChannelPermissions::Bits(keeps),
+            "flags {flags}"
+        );
+    }
+    // Other member flags (512 is DM_SETTINGS_UPSELL_ACKNOWLEDGED, 1 DID_REJOIN) do nothing.
+    for flags in [0, 1, 512] {
+        let s = world(
+            OWNER,
+            &[role(GUILD, all_but_admin)],
+            &[],
+            json!({"flags": flags}),
+            json!([]),
+        );
+        assert_eq!(
+            perms(&s, CHANNEL),
+            ChannelPermissions::Bits(all_but_admin),
+            "flags {flags}"
+        );
+    }
+    // An administrator, and the owner, are not touched (W:9605796: `!l`; W:9606751 owner first).
+    let s = world(
+        OWNER,
+        &[role(GUILD, ADMINISTRATOR)],
+        &[],
+        json!({"flags": 256}),
+        json!([]),
+    );
+    assert_eq!(
+        perms(&s, CHANNEL),
+        ChannelPermissions::Bits(ALL_PERMISSIONS)
+    );
+    // A GUILD_MEMBER_UPDATE of the user lifts it.
+    let mut s = world(
+        OWNER,
+        &[role(GUILD, all_but_admin)],
+        &[],
+        json!({"flags": 256}),
+        json!([]),
+    );
+    s.apply(
+        "GUILD_MEMBER_UPDATE",
+        &json!({"guild_id": "100", "user": {"id": "1"}, "roles": [], "flags": 0}),
+    );
+    assert_eq!(perms(&s, CHANNEL), ChannelPermissions::Bits(all_but_admin));
+}
+
+fn private_thread(joined: bool) -> Value {
+    let mut t = json!({"id": THREAD.to_string(), "guild_id": GUILD.to_string(), "parent_id": CHANNEL.to_string(),
+        "type": 12, "thread_metadata": {"archived": false, "locked": false}});
+    if joined {
+        t["member"] = json!({"user_id": "1"});
+    }
+    t
+}
+
+#[test]
+fn a_private_thread_shows_nothing_to_a_member_who_has_not_joined_it() {
+    let base = bits(&[VIEW_CHANNEL, SEND_MESSAGES_IN_THREADS, ADD_REACTIONS]);
+    let mut s = simple(&[role(GUILD, base)], &[], json!([]));
+    s.apply("THREAD_CREATE", &private_thread(false));
+    assert_eq!(s.threads.get(THREAD).unwrap().kind, 12);
+    assert_eq!(perms(&s, THREAD), ChannelPermissions::Bits(0));
+    // Joined: the normal thread rule.
+    let mut s = simple(&[role(GUILD, base)], &[], json!([]));
+    s.apply("THREAD_CREATE", &private_thread(true));
+    assert_eq!(
+        perms(&s, THREAD),
+        ChannelPermissions::Bits(base | SEND_MESSAGES)
+    );
+    // MANAGE_THREADS sees it without joining.
+    let mut s = simple(&[role(GUILD, base | MANAGE_THREADS)], &[], json!([]));
+    s.apply("THREAD_CREATE", &private_thread(false));
+    assert_eq!(
+        perms(&s, THREAD),
+        ChannelPermissions::Bits(base | MANAGE_THREADS | SEND_MESSAGES)
+    );
+    // A public thread under the same parent is not affected by joining.
+    let mut s = simple(&[role(GUILD, base)], &[], json!([]));
+    s.apply(
+        "THREAD_CREATE",
+        &thread_json(CHANNEL, json!({"archived": false, "locked": false})),
+    );
+    assert_eq!(s.threads.get(THREAD).unwrap().kind, 11);
+    assert_eq!(
+        perms(&s, THREAD),
+        ChannelPermissions::Bits(base | SEND_MESSAGES)
+    );
+}
+
+#[test]
+fn an_initial_guild_feeds_self_state_like_a_ready_guild() {
+    // The real fast-connect sequence: INITIAL_GUILD first, then a READY that does not list it.
+    let mut s = State::default();
+    let roles = [
+        role(
+            GUILD,
+            bits(&[VIEW_CHANNEL, SEND_MESSAGES, READ_MESSAGE_HISTORY]),
+        ),
+        role(200, 0),
+    ];
+    assert!(!s.apply(
+        "INITIAL_GUILD",
+        &json!({"id": "100", "owner_id": "999", "mfa_level": 0, "roles": roles,
+            "members": [{"user": {"id": "1"}, "roles": ["200"], "communication_disabled_until": FUTURE}],
+            "emojis": [emoji(10, "a")],
+            "channels": [{"id": "300", "type": 0, "permission_overwrites": []}]})
+    ));
+    assert!(s.apply(
+        "READY",
+        &json!({"user": {"id": "1", "username": "me", "premium_type": 2}, "guilds": [{"id": "101", "unavailable": true}]})
+    ));
+    // Roles, the timeout and the emojis all arrived with the initial guild.
+    assert_eq!(s.guild(100).unwrap().member_roles, Some(vec![200]));
+    assert_eq!(
+        perms(&s, CHANNEL),
+        ChannelPermissions::Bits(bits(&[VIEW_CHANNEL, READ_MESSAGE_HISTORY]))
+    );
+    assert_eq!(emojis_of(&s, 100), Some(vec![known(10, "a")]));
+    // The same sequence with the timeout cleared by a later READY_SUPPLEMENTAL for that guild.
+    assert!(s.apply(
+        "READY_SUPPLEMENTAL",
+        &json!({"guilds": [{"id": "100", "voice_states": []}], "merged_members": [[{"user_id": "1", "roles": ["200"]}]]})
+    ));
+    assert_eq!(
+        perms(&s, CHANNEL),
+        ChannelPermissions::Bits(bits(&[VIEW_CHANNEL, SEND_MESSAGES, READ_MESSAGE_HISTORY]))
+    );
+    // READY's own copy of a guild wins over a buffered one of the same id, for self state too.
+    let mut s = State::default();
+    s.apply(
+        "INITIAL_GUILD",
+        &json!({"id": "100", "owner_id": "999", "mfa_level": 0, "roles": roles,
+            "members": [{"user": {"id": "1"}, "roles": [], "communication_disabled_until": FUTURE}],
+            "channels": [{"id": "300", "type": 0, "permission_overwrites": []}]}),
+    );
+    s.apply(
+        "READY",
+        &json!({"user": {"id": "1", "username": "me"},
+            "guilds": [{"id": "100", "owner_id": "999", "mfa_level": 0, "roles": roles,
+                "channels": [{"id": "300", "type": 0, "permission_overwrites": []}]}],
+            "merged_members": [[{"user_id": "1", "roles": []}]]}),
+    );
+    assert_eq!(
+        perms(&s, CHANNEL),
+        ChannelPermissions::Bits(bits(&[VIEW_CHANNEL, SEND_MESSAGES, READ_MESSAGE_HISTORY]))
+    );
 }

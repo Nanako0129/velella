@@ -161,8 +161,9 @@ mod tests {
             channels: vec![channel(20, 0, 0), channel(30, 0, SEND)],
         });
         s.self_state
-            .member_timeouts
-            .insert(10, velella_core::Timeout::Clear);
+            .members
+            .insert(10, velella_core::OwnMember::default());
+        s.self_state.mfa_levels.insert(10, 0);
         s
     }
 
