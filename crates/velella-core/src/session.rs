@@ -3,17 +3,21 @@
 //! modeled on Serein's gateway loop (refs/serein/crates/discord-gateway/src/lib.rs, MIT OR
 //! Apache-2.0) but written for velella's much smaller surface.
 //!
+//! The socket is the session's `Transport` WebSocket (plan NET); every protection above it (URL
+//! check, inflation caps, heartbeats, resume, close codes) stays here, and the task closes each
+//! connection explicitly on every exit path (T-4).
+//!
 //! Logging policy: tracing records op codes and event names only, never payloads or the token.
 use crate::{
     compression::{DecodeError, Decoder, MAX_GATEWAY_WIRE},
     gateway::{backoff, close_action, jitter_ms, member_frames, validated_resume_url, CloseAction},
-    identify::{self, GATEWAY_URL},
+    identify::{self, Identity, GATEWAY_URL},
     messages::MessageStore,
-    rest::Rest,
+    rest::{Rest, TokenSlot},
     state::{MemberSub, State},
     token::Token,
+    transport::{Frame, Received, Transport, WebSocket, WebSocketRequest},
 };
-use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use serde::Deserialize;
 use serde_json::Value;
 use std::{
@@ -29,10 +33,13 @@ use tokio::{
     sync::{mpsc, watch, Notify},
     time::{interval_at, sleep, timeout, Instant, MissedTickBehavior},
 };
-use tokio_tungstenite::{
-    connect_async_with_config,
-    tungstenite::{protocol::WebSocketConfig, Error as WsError, Message},
-};
+use zeroize::Zeroizing;
+
+/// Close codes core sends. 1000 ends the session for good (Discord invalidates it); any other
+/// code keeps it resumable, so every reconnect closes with 4000.
+const CLOSE_FINAL: u16 = 1000;
+const CLOSE_RECONNECT: u16 = 4000;
+const DIAL_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Lifecycle notifications, each tagged with the connect generation that produced it.
 /// `AuthFailed` (token rejected, no retry) and `Closed` (`disconnect()` or a terminal close
@@ -265,19 +272,30 @@ pub struct Session;
 
 impl Session {
     /// Starts a gateway session on the current tokio runtime and returns immediately; must be called
-    /// inside a runtime context. `events` runs on the session task, so it must not block.
+    /// inside a runtime context. `events` runs on the session task, so it must not block. All of
+    /// the session's traffic (gateway and REST) goes through `transport`.
     pub fn connect(
         token: Token,
+        transport: Arc<dyn Transport>,
         events: impl Fn(SessionEvent) + Send + Sync + 'static,
     ) -> SessionHandle {
         let generation = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
-        let token = Arc::new(token);
+        // One token slot for REST and the gateway task.
+        let token = TokenSlot::new(Arc::new(token));
+        // One identity per session: REST headers and IDENTIFY read the same snapshot.
+        let identity = Arc::new(Identity::current());
         let (notice, rest_notice) = mpsc::unbounded_channel();
         let shared = Arc::new(Shared {
             state: Mutex::new(Arc::new(State::default())),
             revision: watch::channel(0).0,
             ended: watch::channel(false).0,
-            rest: Rest::new(token.clone(), generation, notice),
+            rest: Rest::new(
+                token.clone(),
+                generation,
+                notice,
+                transport.clone(),
+                identity.clone(),
+            ),
             messages: OnceLock::new(),
             member_sub: watch::channel(None).0,
             member_epoch: AtomicU64::new(0),
@@ -287,17 +305,18 @@ impl Session {
         let stop = Arc::new(Notify::new());
         let task = Task {
             token,
+            transport,
+            identity,
             generation,
             events: Box::new(events),
             member_rx: shared.member_sub.subscribe(),
             shared: shared.clone(),
             stop: stop.clone(),
             rest_notice,
+            session_token: None,
             session_id: None,
             resume_url: None,
             seq: None,
-            #[cfg(test)]
-            test_endpoints: test_support::TEST_ENDPOINTS.with(|e| e.borrow().clone()),
         };
         let ended = shared.clone();
         tokio::spawn(async move {
@@ -324,7 +343,7 @@ struct Packet {
 }
 
 enum Gone {
-    Close(Option<u16>),
+    Close(u16),
     Lost,
     Capacity,
 }
@@ -340,8 +359,10 @@ enum End {
 }
 
 struct Task {
-    /// Shared with the session's `Rest`; zeroized when the last holder drops it.
-    token: Arc<Token>,
+    /// The slot shared with the session's `Rest`: every IDENTIFY reads its current token.
+    token: Arc<TokenSlot>,
+    transport: Arc<dyn Transport>,
+    identity: Arc<Identity>,
     generation: u64,
     events: Box<dyn Fn(SessionEvent) + Send + Sync>,
     shared: Arc<Shared>,
@@ -349,13 +370,13 @@ struct Task {
     /// The REST 401 notice. Dropped with the task, so a 401 after the end reaches nobody.
     rest_notice: mpsc::UnboundedReceiver<()>,
     member_rx: watch::Receiver<Option<(u64, u64)>>,
+    /// The token the current gateway session identified with; a RESUME of that session sends
+    /// this one, even after the slot was replaced. Zeroized when the last holder drops it.
+    session_token: Option<Arc<Token>>,
     session_id: Option<String>,
     /// Already validated and normalized.
     resume_url: Option<String>,
     seq: Option<u64>,
-    /// (initial endpoint, resume endpoint) replacing only the dial target.
-    #[cfg(test)]
-    test_endpoints: Option<(String, String)>,
 }
 
 const MIN_HEARTBEAT_MS: u64 = 50;
@@ -367,29 +388,36 @@ impl Task {
     }
 
     fn clear_session(&mut self) {
+        self.session_token = None;
         self.session_id = None;
         self.resume_url = None;
         self.seq = None;
     }
 
-    /// Compiled out of shipped builds: tests replace the dial target after URL validation.
-    fn dial_target(&self, url: &str) -> String {
-        #[cfg(test)]
-        if let Some((initial, resume)) = &self.test_endpoints {
-            return if url == GATEWAY_URL {
-                initial.clone()
-            } else {
-                resume.clone()
-            };
-        }
-        url.to_owned()
+    /// The upgrade request: the URL (fixed or validated), the session's User-Agent and
+    /// Accept-Language (never the platform's defaults, which URLSession would otherwise add, the
+    /// latter from the system locale), and the inflation cap as the message-size limit.
+    fn dial_request(&self, url: String) -> Option<WebSocketRequest> {
+        let headers = vec![
+            (
+                "User-Agent".to_owned(),
+                self.identity.user_agent().to_owned(),
+            ),
+            (
+                "Accept-Language".to_owned(),
+                self.identity.accept_language().to_owned(),
+            ),
+        ];
+        WebSocketRequest::new(url, headers, MAX_GATEWAY_WIRE, DIAL_TIMEOUT).ok()
     }
 
     async fn run(mut self) {
         let mut failures = 0u32;
         loop {
-            let resuming =
-                self.session_id.is_some() && self.resume_url.is_some() && self.seq.is_some();
+            let resuming = self.session_token.is_some()
+                && self.session_id.is_some()
+                && self.resume_url.is_some()
+                && self.seq.is_some();
             if !resuming {
                 self.clear_session();
             }
@@ -398,26 +426,31 @@ impl Task {
                 .clone()
                 .filter(|_| resuming)
                 .unwrap_or_else(|| GATEWAY_URL.to_owned());
-            let target = self.dial_target(&url);
-            let config = WebSocketConfig::default()
-                .max_message_size(Some(MAX_GATEWAY_WIRE))
-                .max_frame_size(Some(MAX_GATEWAY_WIRE));
-            let dial = timeout(
-                Duration::from_secs(15),
-                connect_async_with_config(target, Some(config), false),
-            );
-            let Some(dialed) = self.unless_stopped(dial).await else {
-                return self.emit(SessionEvent::Closed {
-                    generation: self.generation,
-                });
+            let transport = self.transport.clone();
+            let dialed = match self.dial_request(url) {
+                Some(request) => {
+                    let dial = timeout(DIAL_TIMEOUT, transport.websocket(request));
+                    let Some(dialed) = self.unless_stopped(dial).await else {
+                        return self.emit(SessionEvent::Closed {
+                            generation: self.generation,
+                        });
+                    };
+                    dialed.ok().and_then(Result::ok)
+                }
+                None => None,
             };
             let mut established = false;
             let end = match dialed {
-                Ok(Ok((mut socket, _))) => {
-                    self.connection(&mut socket, resuming, &mut established)
-                        .await
+                Some(socket) => {
+                    let end = self.connection(&*socket, resuming, &mut established).await;
+                    // Every exit closes explicitly; a reconnect keeps the session resumable.
+                    socket.close(match end {
+                        End::Retry | End::InvalidSession => CLOSE_RECONNECT,
+                        End::Auth | End::Stop | End::Disconnect => CLOSE_FINAL,
+                    });
+                    end
                 }
-                _ => End::Retry,
+                None => End::Retry,
             };
             match end {
                 End::Disconnect => {
@@ -479,9 +512,9 @@ impl Task {
     }
 
     /// Sends the op-37 frames that bring this connection to the newest selection.
-    async fn sync_members<S: Sink<Message, Error = WsError> + Unpin>(
+    async fn sync_members(
         &mut self,
-        socket: &mut S,
+        socket: &dyn WebSocket,
         sent: &mut Option<(u64, u64)>,
     ) -> bool {
         let want = *self.member_rx.borrow_and_update();
@@ -491,7 +524,7 @@ impl Task {
                 op = 37,
                 "gateway send member subscription"
             );
-            if !send(socket, &frame).await {
+            if !send(socket, Zeroizing::new(frame)).await {
                 return false;
             }
         }
@@ -499,10 +532,13 @@ impl Task {
         true
     }
 
-    async fn connection<S>(&mut self, socket: &mut S, resuming: bool, established: &mut bool) -> End
-    where
-        S: Stream<Item = Result<Message, WsError>> + Sink<Message, Error = WsError> + Unpin,
-    {
+    /// Runs one connection until it ends; the caller closes the socket.
+    async fn connection(
+        &mut self,
+        socket: &dyn WebSocket,
+        resuming: bool,
+        established: &mut bool,
+    ) -> End {
         let mut decoder = Decoder::default();
         let hello = tokio::select! {
             biased;
@@ -522,10 +558,10 @@ impl Task {
         if !(MIN_HEARTBEAT_MS..=MAX_HEARTBEAT_MS).contains(&interval_ms) {
             return End::Retry;
         }
-        let handshake = match (resuming, &self.session_id, self.seq) {
-            (true, Some(session_id), Some(seq)) => {
+        let handshake = match (resuming, &self.session_token, &self.session_id, self.seq) {
+            (true, Some(token), Some(session_id), Some(seq)) => {
                 tracing::trace!(generation = self.generation, op = 6, "gateway send RESUME");
-                identify::encode(&identify::resume(&self.token, session_id, seq))
+                identify::encode(&identify::resume(token, session_id, seq))
             }
             _ => {
                 tracing::trace!(
@@ -533,13 +569,16 @@ impl Task {
                     op = 2,
                     "gateway send IDENTIFY"
                 );
-                identify::encode(&identify::identify(&self.token))
+                // The slot's token now; a RESUME of the session this starts reuses it.
+                let token = self.token.current();
+                let handshake = identify::encode(&identify::identify(&token, &self.identity));
+                self.session_token = Some(token);
+                handshake
             }
         };
-        if !send(socket, &handshake).await {
+        if !send(socket, handshake).await {
             return End::Retry;
         }
-        drop(handshake);
 
         let interval = Duration::from_millis(interval_ms);
         // The first beat is jittered so many clients do not beat in lockstep.
@@ -556,10 +595,7 @@ impl Task {
         loop {
             tokio::select! {
                 biased;
-                () = self.stop.notified() => {
-                    let _ = timeout(Duration::from_secs(1), socket.close()).await;
-                    return End::Disconnect;
-                }
+                () = self.stop.notified() => return End::Disconnect,
                 _ = timer.tick() => {
                     if awaiting_ack {
                         tracing::debug!("heartbeat ACK missed");
@@ -615,7 +651,7 @@ impl Task {
         }
     }
 
-    async fn heartbeat<S: Sink<Message, Error = WsError> + Unpin>(&self, socket: &mut S) -> bool {
+    async fn heartbeat(&self, socket: &dyn WebSocket) -> bool {
         tracing::trace!(
             generation = self.generation,
             op = 1,
@@ -625,7 +661,7 @@ impl Task {
             Some(seq) => format!(r#"{{"op":1,"d":{seq}}}"#),
             None => r#"{"op":1,"d":null}"#.to_owned(),
         };
-        send(socket, &beat).await
+        send(socket, Zeroizing::new(beat)).await
     }
 
     /// Handles an op 0 packet; `Some` ends the connection.
@@ -685,8 +721,8 @@ impl Task {
     fn gone(&mut self, gone: Gone) -> End {
         match gone {
             Gone::Capacity => End::Stop,
-            Gone::Lost | Gone::Close(None) => End::Retry,
-            Gone::Close(Some(code)) => match close_action(code) {
+            Gone::Lost => End::Retry,
+            Gone::Close(code) => match close_action(code) {
                 CloseAction::AuthFailed => End::Auth,
                 CloseAction::Stop => End::Stop,
                 CloseAction::Identify => {
@@ -699,44 +735,29 @@ impl Task {
     }
 }
 
-async fn send<S: Sink<Message, Error = WsError> + Unpin>(socket: &mut S, text: &str) -> bool {
+async fn send(socket: &dyn WebSocket, text: Zeroizing<String>) -> bool {
     matches!(
-        timeout(Duration::from_secs(5), socket.send(Message::text(text))).await,
+        timeout(Duration::from_secs(5), socket.send(Frame::Text(text))).await,
         Ok(Ok(()))
     )
 }
 
-/// Next JSON packet, inflating binary zlib-stream frames. Control frames are skipped.
-async fn read_packet<S: Stream<Item = Result<Message, WsError>> + Unpin>(
-    socket: &mut S,
-    decoder: &mut Decoder,
-) -> Result<Packet, Gone> {
+/// Next JSON packet, inflating binary zlib-stream frames. Cancel-safe: the transport keeps a
+/// message whose `receive` was dropped for the next call, and the decoder keeps partial input.
+async fn read_packet(socket: &dyn WebSocket, decoder: &mut Decoder) -> Result<Packet, Gone> {
     loop {
-        let frame = match socket.next().await {
-            Some(Ok(frame)) => frame,
-            _ => return Err(Gone::Lost),
+        let frame = match socket.receive().await {
+            Received::Frame(frame) => frame,
+            Received::Closed(code) => return Err(Gone::Close(code)),
+            Received::Lost => return Err(Gone::Lost),
         };
-        let frame = match decoder.frame(frame) {
-            Ok(Some(frame)) => frame,
+        match decoder.frame(frame) {
+            Ok(Some(text)) => return serde_json::from_str(&text).map_err(|_| Gone::Lost),
             Ok(None) => continue,
             Err(DecodeError::CompressedCap | DecodeError::DecompressedCap) => {
                 return Err(Gone::Capacity)
             }
             Err(DecodeError::Protocol) => return Err(Gone::Lost),
-        };
-        match frame {
-            Message::Text(text) => return serde_json::from_str(&text).map_err(|_| Gone::Lost),
-            Message::Close(frame) => return Err(Gone::Close(frame.map(|f| u16::from(f.code)))),
-            _ => {}
         }
-    }
-}
-
-#[cfg(test)]
-pub(crate) mod test_support {
-    use std::cell::RefCell;
-    thread_local! {
-        /// Set by a test on its own (current-thread runtime) thread before `Session::connect`.
-        pub(crate) static TEST_ENDPOINTS: RefCell<Option<(String, String)>> = const { RefCell::new(None) };
     }
 }

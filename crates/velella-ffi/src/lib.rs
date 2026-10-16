@@ -13,28 +13,30 @@ uniffi::setup_scaffolding!();
 mod markdown;
 mod members;
 mod messages;
+mod transport;
 pub use markdown::*;
 pub use messages::*;
+pub use transport::*;
 
 /// The one process-wide runtime. Exported async fns spawn onto it and await the
 /// JoinHandle, so bodies run on `velella-rt` threads regardless of who polls the
 /// returned future. (`uniffi::export(async_runtime = "tokio")` is deliberately
 /// not used: async-compat polls the body on the caller's thread.)
 ///
-/// `enable_all()`: sessions dial WebSockets on this runtime, which needs the IO driver as well as
-/// timers (`owned_runtime_has_io` fails without it).
+/// Timers only: core does no IO of its own; all network traffic goes through the app's
+/// `Transport` (plan NET).
 ///
 /// Log hygiene: shipped code installs NO logger of any kind — no `log` logger (env_logger, oslog,
-/// ...), no `tracing-log`/`LogTracer` bridge, no tracing subscriber. tungstenite logs raw frames
-/// through `log` at TRACE, and the IDENTIFY/RESUME frames carry the account token; with nothing
-/// installed, every `log` and `tracing` record is dropped unemitted. Do not add one here or anywhere
-/// else in the shipped build.
+/// ...), no `tracing-log`/`LogTracer` bridge, no tracing subscriber. Core's tracing records op
+/// codes and event names only, but with nothing installed every `log` and `tracing` record is
+/// dropped unemitted, so no payload can reach a log even by mistake (the IDENTIFY/RESUME frames
+/// carry the account token). Do not add one here or anywhere else in the shipped build.
 fn runtime() -> &'static Runtime {
     static RT: OnceLock<Runtime> = OnceLock::new();
     RT.get_or_init(|| {
         Builder::new_multi_thread()
             .thread_name("velella-rt")
-            .enable_all()
+            .enable_time()
             .build()
             .expect("failed to build tokio runtime")
     })
@@ -318,14 +320,17 @@ impl std::error::Error for ConnectError {}
 
 /// Validates the token immediately (Token zeroizes it on drop, also on rejection), then starts the
 /// session on the owned runtime. No URL crosses this boundary: the gateway URL is fixed in core.
+/// All of the session's traffic goes through `transport` (the app's URLSession one).
 #[uniffi::export]
 pub fn connect(
     token: String,
+    transport: Arc<dyn Transport>,
     listener: Arc<dyn SessionListener>,
 ) -> Result<Arc<SessionHandle>, ConnectError> {
     let token = Token::new(token).map_err(|_| ConnectError::InvalidToken)?;
+    let transport = Arc::new(transport::ForeignTransport(transport));
     let _context = runtime().enter();
-    let handle = Session::connect(token, move |event| match event {
+    let handle = Session::connect(token, transport, move |event| match event {
         SessionEvent::Ready {
             generation,
             user_id,
@@ -351,21 +356,19 @@ mod tests {
         assert!(name.starts_with("velella-rt"), "ran on {name:?}");
     }
 
-    /// `Session::connect` dials through tokio's IO driver; a time-only runtime panics there.
-    #[test]
-    fn owned_runtime_has_io() {
-        let task = runtime().spawn(async {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-            let addr = listener.local_addr()?;
-            let (client, accepted) =
-                tokio::join!(tokio::net::TcpStream::connect(addr), listener.accept());
-            client?;
-            accepted?;
-            Ok::<(), std::io::Error>(())
-        });
-        futures::executor::block_on(task)
-            .expect("IO task panicked (runtime without IO driver?)")
-            .expect("loopback connect failed");
+    /// Never used: only invalid tokens reach `connect` here.
+    struct NoTransport;
+    impl Transport for NoTransport {
+        fn http(&self, _: Arc<HttpRequest>, _: Arc<HttpCompletion>) -> Arc<dyn TransportTask> {
+            unreachable!()
+        }
+        fn websocket(
+            &self,
+            _: Arc<WebSocketRequest>,
+            _: Arc<WebSocketCompletion>,
+        ) -> Arc<dyn TransportTask> {
+            unreachable!()
+        }
     }
 
     struct NoEvents;
@@ -386,7 +389,8 @@ mod tests {
             "SYNTH",
             "Bot SYNTHETIC_TOKEN_MARKER_0123456789",
         ] {
-            let Err(err) = connect(bad.to_owned(), Arc::new(NoEvents)) else {
+            let Err(err) = connect(bad.to_owned(), Arc::new(NoTransport), Arc::new(NoEvents))
+            else {
                 panic!("accepted an invalid token");
             };
             assert_eq!(err.to_string(), "invalid token");

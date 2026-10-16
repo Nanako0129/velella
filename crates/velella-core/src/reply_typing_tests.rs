@@ -11,7 +11,7 @@ fn store_with_clock(mock: &MockHttp, clock: Arc<Mutex<Instant>>) -> Arc<MessageS
     let (tx, _rx) = mpsc::unbounded_channel();
     Arc::new(MessageStore {
         clock: Box::new(move || *clock.lock().unwrap()),
-        ..MessageStore::build(Rest::new(token(), 7, tx), None)
+        ..MessageStore::build(Rest::test(token(), 7, tx), None)
     })
 }
 

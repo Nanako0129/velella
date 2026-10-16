@@ -1,11 +1,12 @@
 //! zlib-stream inflater: one shared inflater per connection, `00 00 FF FF` suffix framing, caps on
 //! the compressed buffer and the decompressed message. Adapted from Serein's
-//! `crates/discord-gateway/src/compression.rs` (MIT OR Apache-2.0).
+//! `crates/discord-gateway/src/compression.rs` (MIT OR Apache-2.0). Takes the transport's raw
+//! frames (plan NET).
+use crate::transport::Frame;
 use flate2::{Decompress, FlushDecompress, Status};
-use tokio_tungstenite::tungstenite::Message as Frame;
 
 /// Cap for both the compressed buffer and one decompressed message. Large accounts' READY exceeds
-/// tungstenite's 16 MiB default, so the socket config uses the same bound.
+/// common 16 MiB WebSocket defaults, so the transport's message-size limit is this same bound.
 pub(crate) const MAX_GATEWAY_WIRE: usize = 64 << 20;
 const RETAINED_PENDING_BYTES: usize = 128 * 1024;
 const SUFFIX: [u8; 4] = [0, 0, 255, 255];
@@ -33,13 +34,13 @@ impl Default for Decoder {
 }
 
 impl Decoder {
-    /// `Ok(None)`: a partial message is buffered. Non-binary frames pass through unchanged.
-    pub(crate) fn frame(&mut self, frame: Frame) -> Result<Option<Frame>, DecodeError> {
-        let Frame::Binary(bytes) = frame else {
-            if matches!(frame, Frame::Text(_)) && !self.pending.is_empty() {
-                return Err(DecodeError::Protocol);
-            }
-            return Ok(Some(frame));
+    /// The text of one whole message, or `Ok(None)` while a partial one is buffered. Text frames
+    /// pass through unchanged.
+    pub(crate) fn frame(&mut self, frame: Frame) -> Result<Option<String>, DecodeError> {
+        let bytes = match frame {
+            Frame::Binary(bytes) => bytes,
+            Frame::Text(_) if !self.pending.is_empty() => return Err(DecodeError::Protocol),
+            Frame::Text(mut text) => return Ok(Some(std::mem::take(&mut *text))),
         };
         if bytes.len() > MAX_GATEWAY_WIRE.saturating_sub(self.pending.len()) {
             return Err(DecodeError::CompressedCap);
@@ -81,8 +82,9 @@ impl Decoder {
         if self.pending.capacity() > RETAINED_PENDING_BYTES {
             self.pending = Vec::new();
         }
-        let text = String::from_utf8(output).map_err(|_| DecodeError::Protocol)?;
-        Ok(Some(Frame::Text(text.into())))
+        String::from_utf8(output)
+            .map(Some)
+            .map_err(|_| DecodeError::Protocol)
     }
 }
 
@@ -91,8 +93,8 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    fn text(s: &str) -> Frame {
-        Frame::Text(s.into())
+    fn text(s: &str) -> String {
+        s.to_owned()
     }
 
     #[test]
@@ -105,12 +107,12 @@ mod tests {
         let split = bytes.len() - 2; // between the two halves of the suffix
         let mut decoder = Decoder::default();
         assert!(decoder
-            .frame(Frame::Binary(bytes[..split].to_vec().into()))
+            .frame(Frame::Binary(bytes[..split].to_vec()))
             .unwrap()
             .is_none());
         assert_eq!(
             decoder
-                .frame(Frame::Binary(bytes[split..].to_vec().into()))
+                .frame(Frame::Binary(bytes[split..].to_vec()))
                 .unwrap(),
             Some(text(r#"{"op":11,"d":null}"#))
         );
@@ -133,20 +135,18 @@ mod tests {
             offset = encoder.get_ref().len();
             second = bytes.clone();
             assert_eq!(
-                decoder.frame(Frame::Binary(bytes.into())).unwrap(),
+                decoder.frame(Frame::Binary(bytes)).unwrap(),
                 Some(text(msg))
             );
         }
         // Without the shared window the second message alone is undecodable.
-        assert!(Decoder::default()
-            .frame(Frame::Binary(second.into()))
-            .is_err());
+        assert!(Decoder::default().frame(Frame::Binary(second)).is_err());
     }
 
     #[test]
     fn decoder_rejects_oversized_compressed_input() {
         assert_eq!(
-            Decoder::default().frame(Frame::Binary(vec![0; MAX_GATEWAY_WIRE + 1].into())),
+            Decoder::default().frame(Frame::Binary(vec![0; MAX_GATEWAY_WIRE + 1])),
             Err(DecodeError::CompressedCap)
         );
     }
@@ -164,7 +164,7 @@ mod tests {
         assert!(compressed.ends_with(&SUFFIX));
         assert!(compressed.len() < MAX_GATEWAY_WIRE);
         assert_eq!(
-            Decoder::default().frame(Frame::Binary(compressed.into())),
+            Decoder::default().frame(Frame::Binary(compressed)),
             Err(DecodeError::DecompressedCap)
         );
     }

@@ -6,30 +6,20 @@ license.workspace = true
 
 [dependencies]
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
-# Stock rustls with webpki roots and normal certificate verification; no TLS impersonation.
-tokio-tungstenite = { version = "=0.30.0", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
-# tokio-tungstenite enables rustls without a crypto provider; with none selected, the first wss dial
-# panics. Exactly one provider feature must be on, so name it here (ring: no C toolchain beyond cc).
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+# No network stack here (plan NET): HTTP and the gateway WebSocket go through `transport.rs`,
+# which the app implements on URLSession (TLS, trust and proxy from the system, like Safari).
 flate2 = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 zeroize = "1.8"
 tracing = "0.1"
 url = "2"
-# REST (rest.rs). No default features: those bring native-tls, HTTP/2 and the macOS system proxy.
-# `rustls-tls-webpki-roots` selects rustls with webpki roots and the ring provider (reqwest's
-# `__rustls-ring`), the same single provider as the gateway, so `cargo tree -i aws-lc-rs` and
-# `cargo tree -i native-tls` stay empty. Pinned: a feature rename in a minor update must not
-# silently bring a second provider back.
-reqwest = { version = "=0.12.28", default-features = false, features = ["rustls-tls-webpki-roots"] }
-# Already in the graph through reqwest; encodes X-Super-Properties.
+# Encodes X-Super-Properties.
 base64 = "0.22"
 # Code-block highlighting (highlight.rs, plan K6). Pinned, and only the bundled grammars with the
 # pure-Rust regex engine: no oniguruma (C), no theme, plist or YAML loading, no HTML output.
 syntect = { version = "=5.3.0", default-features = false, features = ["parsing", "default-syntaxes", "regex-fancy"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "rt", "sync", "test-util", "time"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }

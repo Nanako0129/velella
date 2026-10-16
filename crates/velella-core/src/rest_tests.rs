@@ -1,18 +1,23 @@
-//! REST tests against a local mock (see `rest::test_support`). Each named property fails if its
-//! clause in rest.rs is removed. Session-level 401 tests live in session_tests.rs.
+//! REST tests on the in-memory transport (see `rest::test_support`). Each named property fails if
+//! its clause in rest.rs is removed. Session-level 401 tests live in session_tests.rs. What the
+//! app's URLSession transport puts on the wire (redirects, cookies, proxy, TLS) is tested in
+//! `Tests/VelellaTransportTests`.
 use crate::{
     identify,
     rest::{
-        test_support::{response, MockHttp, TEST_REST_BASE},
-        validated, Rest, RestError,
+        test_support::{response, MockHttp, HANG},
+        validated, Rest, RestError, TokenSlot,
+    },
+    transport::{
+        BoxFuture, HttpRequest, HttpResponse, Method, Transport, TransportError, WebSocket,
+        WebSocketRequest,
     },
     Token,
 };
 use base64::Engine as _;
-use reqwest::Method;
 use serde_json::{json, Value};
 use std::{sync::Arc, time::Duration};
-use tokio::{io::AsyncReadExt, net::TcpListener, sync::mpsc, time::timeout};
+use tokio::{sync::mpsc, time::timeout};
 
 const MARKER: &str = "SYNTHETIC_TOKEN_MARKER_0123456789";
 
@@ -20,7 +25,7 @@ const MARKER: &str = "SYNTHETIC_TOKEN_MARKER_0123456789";
 fn rest_for(mock: &MockHttp) -> (Rest, mpsc::UnboundedReceiver<()>) {
     mock.install();
     let (tx, rx) = mpsc::unbounded_channel();
-    let rest = Rest::new(Arc::new(Token::new(MARKER.into()).unwrap()), 7, tx);
+    let rest = Rest::test(Arc::new(Token::new(MARKER.into()).unwrap()), 7, tx);
     (rest, rx)
 }
 
@@ -40,62 +45,6 @@ fn too_many(body: &str) -> String {
 
 async fn get(rest: &Rest) -> Result<Value, RestError> {
     rest.get("/users/@me").await
-}
-
-async fn untouched(listener: &TcpListener) -> bool {
-    timeout(Duration::from_millis(300), listener.accept())
-        .await
-        .is_err()
-}
-
-/// Both rustls users (gateway, REST) build configs from the process-wide provider choice. With two
-/// providers compiled in and none installed, this panics; with exactly one (ring), it does not.
-#[test]
-fn rustls_client_config_builds_under_the_unified_features() {
-    let _ = rustls::ClientConfig::builder();
-}
-
-#[tokio::test]
-async fn shipped_client_sends_a_tls_client_hello_and_fails_with_fixed_text() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let peer = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let mut first = [0u8; 1];
-        stream.read_exact(&mut first).await.unwrap();
-        first[0] // then drop: the handshake can never finish
-    });
-    let (tx, _rx) = mpsc::unbounded_channel();
-    TEST_REST_BASE.with(|b| *b.borrow_mut() = None); // the shipped configuration
-    let rest = Rest::new(Arc::new(Token::new(MARKER.into()).unwrap()), 7, tx);
-    let url = format!("https://127.0.0.1:{port}/api/v9/users/@me");
-    // `request` would refuse this host; send through the same client and error mapping instead.
-    let err = rest.send_unvalidated(Method::GET, &url).await.unwrap_err();
-    assert_eq!(
-        peer.await.unwrap(),
-        0x16,
-        "first byte is not a TLS handshake record"
-    );
-    assert_eq!(err, RestError::Network);
-    assert_eq!(err.to_string(), "network error");
-}
-
-#[tokio::test]
-async fn shipped_client_refuses_plain_http() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let (tx, _rx) = mpsc::unbounded_channel();
-    TEST_REST_BASE.with(|b| *b.borrow_mut() = None);
-    let rest = Rest::new(Arc::new(Token::new(MARKER.into()).unwrap()), 7, tx);
-    let url = format!("http://127.0.0.1:{port}/api/v9/users/@me");
-    assert_eq!(
-        rest.send_unvalidated(Method::GET, &url).await.unwrap_err(),
-        RestError::Network
-    );
-    assert!(
-        untouched(&listener).await,
-        "https_only let a plain-http request out"
-    );
 }
 
 #[tokio::test]
@@ -125,7 +74,7 @@ async fn url_validator_rejects_everything_but_discord_api_v9_before_any_request(
         "",
     ] {
         assert!(validated(bad).is_none(), "{bad}");
-        let sent: Result<Value, _> = rest.request(Method::GET, bad, None).await;
+        let sent: Result<Value, _> = rest.request(Method::Get, bad, None).await;
         assert_eq!(sent.unwrap_err(), RestError::InvalidUrl, "{bad}");
     }
     // The typed path cannot climb out of the base either.
@@ -134,54 +83,45 @@ async fn url_validator_rejects_everything_but_discord_api_v9_before_any_request(
     assert_eq!(mock.count(), 0, "a rejected URL reached the server");
 }
 
+/// S-1: a typed path the URL parser would normalise into another path (still under `/api/v9/`)
+/// is refused, and nothing is sent.
 #[tokio::test]
-async fn a_redirect_is_not_followed() {
-    let second = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let location = format!(
-        "Location: http://{}/api/v9/users/@me\r\n",
-        second.local_addr().unwrap()
-    );
-    let (mock, rest, _rx) = serve(&[response(302, &location, "")]).await;
+async fn a_typed_path_that_normalises_into_another_is_refused() {
+    let (mock, rest, _rx) = serve(&[ok("{}")]).await;
+    for path in [
+        "/channels/1/messages/2/reactions/../../../../users/@me",
+        "/channels/1/./messages",
+        "/channels/1/%2e%2e/messages",
+        "/channels/1/%2E/messages",
+        "/channels/1/messages\\..\\x",
+    ] {
+        let sent: Result<Value, _> = rest.get(path).await;
+        assert_eq!(sent.unwrap_err(), RestError::InvalidUrl, "{path}");
+        let sent: Result<Value, _> = rest.post(path, &json!({})).await;
+        assert_eq!(sent.unwrap_err(), RestError::InvalidUrl, "{path}");
+    }
+    assert_eq!(mock.count(), 0, "a normalised path reached the server");
+    // The paths in use today pass unchanged.
+    let _: Value = rest
+        .get("/channels/1/messages?limit=50&before=2")
+        .await
+        .unwrap();
+    let _: Value = rest.get("/users/@me").await.unwrap();
+    assert_eq!(mock.count(), 2);
+}
+
+/// The transport hands a 3xx back as it is (the app's transport refuses to follow, see the Swift
+/// wire tests); core treats it as a failure and sends nothing more.
+#[tokio::test]
+async fn a_redirect_is_a_failure_and_nothing_follows_it() {
+    let location = "Location: https://discord.com/api/v9/users/@me/elsewhere\r\n";
+    let (mock, rest, _rx) = serve(&[response(302, location, ""), ok("{}")]).await;
     let err = get(&rest).await.unwrap_err();
     assert_eq!(
         (err, err.to_string().as_str()),
         (RestError::Failed, "request failed")
     );
     assert_eq!(mock.count(), 1);
-    assert!(
-        untouched(&second).await,
-        "the redirect target was contacted"
-    );
-}
-
-#[tokio::test]
-async fn proxy_environment_is_never_used() {
-    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let proxy_url = format!("http://{}", proxy.local_addr().unwrap());
-    let vars = [
-        "HTTPS_PROXY",
-        "https_proxy",
-        "ALL_PROXY",
-        "all_proxy",
-        "HTTP_PROXY",
-        "http_proxy",
-    ];
-    for var in vars {
-        std::env::set_var(var, &proxy_url);
-    }
-    std::env::remove_var("NO_PROXY");
-    std::env::remove_var("no_proxy");
-    // The client reads proxy variables when it is built, i.e. in `Rest::new`.
-    let (mock, rest, _rx) = serve(&[ok("{}")]).await;
-    for var in vars {
-        std::env::remove_var(var);
-    }
-    assert_eq!(get(&rest).await.unwrap(), json!({}));
-    assert_eq!(mock.count(), 1);
-    assert!(
-        untouched(&proxy).await,
-        "the proxy from the environment was contacted"
-    );
 }
 
 #[tokio::test]
@@ -200,6 +140,81 @@ async fn a_body_over_4_mib_is_a_fixed_error() {
         (RestError::TooLarge, "response too large")
     );
     assert_eq!(mock.count(), 2);
+}
+
+/// A transport that ignores the cap and returns a fixed status with an over-cap body.
+struct Oversized(u16);
+
+impl Transport for Oversized {
+    fn http(&self, _: HttpRequest) -> BoxFuture<'_, Result<HttpResponse, TransportError>> {
+        let status = self.0;
+        Box::pin(async move {
+            Ok(HttpResponse {
+                status,
+                headers: vec![],
+                body: Some(br#"{"retry_after": 0.01, "captcha_key": ["x"]}"#.repeat(200_000)),
+            })
+        })
+    }
+    fn websocket(
+        &self,
+        _: WebSocketRequest,
+    ) -> BoxFuture<'_, Result<Box<dyn WebSocket>, TransportError>> {
+        Box::pin(async { Err(TransportError::Other) })
+    }
+}
+
+/// Core re-checks the cap whatever the transport does; an over-cap error body is unreadable,
+/// exactly as before (429 → RateLimited, never retried; other → Failed, no captcha read).
+#[tokio::test]
+async fn core_rechecks_the_body_cap_whatever_the_transport_returns() {
+    for (status, want) in [
+        (200, RestError::TooLarge),
+        (429, RestError::RateLimited),
+        (400, RestError::Failed),
+    ] {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let rest = Rest::new(
+            TokenSlot::new(Arc::new(Token::new(MARKER.into()).unwrap())),
+            7,
+            tx,
+            Arc::new(Oversized(status)),
+            Arc::new(identify::Identity::current()),
+        );
+        assert_eq!(get(&rest).await.unwrap_err(), want, "{status}");
+    }
+}
+
+/// Core's deadline: a request the transport never answers fails with the fixed network error
+/// once 30 s pass, and the dropped request future is what cancels it in the transport.
+#[tokio::test(start_paused = true)]
+async fn core_deadline_fails_a_silent_request_and_cancels_it() {
+    let (mock, rest, _rx) = serve(&[HANG.to_owned()]).await;
+    let cancelled = mock.cancelled();
+    let started = tokio::time::Instant::now();
+    assert_eq!(get(&rest).await.unwrap_err(), RestError::Network);
+    let waited = started.elapsed();
+    assert!(waited >= Duration::from_secs(30) && waited < Duration::from_secs(31));
+    timeout(Duration::from_secs(1), cancelled)
+        .await
+        .expect("the request was not cancelled");
+    assert_eq!(mock.count(), 1);
+}
+
+/// Every transport failure is the same fixed network error; none is retried by `Rest` (D11's
+/// connect-failed retry for sends belongs to F2).
+#[tokio::test]
+async fn transport_failures_map_to_network_and_are_not_retried() {
+    for kind in ["connect", "timeout", "other"] {
+        let (mock, rest, _rx) = serve(&[format!("ERROR {kind}")]).await;
+        assert_eq!(get(&rest).await.unwrap_err(), RestError::Network, "{kind}");
+        assert_eq!(mock.count(), 1, "{kind}: GET retried");
+        let sent: Result<Value, _> = rest
+            .post("/channels/1/messages", &json!({"content": "hi"}))
+            .await;
+        assert_eq!(sent.unwrap_err(), RestError::Network, "{kind}");
+        assert_eq!(mock.count(), 2, "{kind}: POST retried");
+    }
 }
 
 #[tokio::test]
@@ -305,10 +320,9 @@ async fn the_token_appears_only_in_the_authorization_header() {
     get(&rest).await.unwrap();
     // The 401 error and the latched state are formatted too.
     let unauthorized = get(&rest).await.unwrap_err();
-    let client = reqwest::Client::new();
     let url = validated("https://discord.com/api/v9/users/@me").unwrap();
     let built = rest
-        .build_request(&client, Method::POST, url, Some(b"{}".to_vec()))
+        .build_request(Method::Post, &url, Some(b"{}".to_vec()))
         .unwrap();
     let errors = [
         RestError::Unauthorized,
@@ -326,14 +340,19 @@ async fn the_token_appears_only_in_the_authorization_header() {
         format!("{rest:?}"),
         format!("{rest:#?}"),
         format!("{built:?}"),
+        format!("{built:#?}"),
     ];
     texts.extend(errors.iter().map(|e| format!("{e} {e:?}")));
     for text in &texts {
         assert!(!text.contains("SYNTHETIC"), "{text}");
     }
-    // The guard is not vacuous: the built request does carry the token, as a sensitive header.
-    let auth = built.headers().get(reqwest::header::AUTHORIZATION).unwrap();
-    assert!(auth.is_sensitive() && auth.as_bytes() == MARKER.as_bytes());
+    // The guard is not vacuous: the built request does carry the token, in its own field and in
+    // no header.
+    assert_eq!(built.authorization().unwrap().reveal(), MARKER);
+    assert!(built
+        .headers()
+        .iter()
+        .all(|(n, v)| !v.contains(MARKER) && !n.eq_ignore_ascii_case("authorization")));
 
     let raw = &mock.requests()[0];
     assert_eq!(raw.matches(MARKER).count(), 1, "{raw}");
@@ -372,6 +391,76 @@ async fn the_token_appears_only_in_the_authorization_header() {
         assert!(!name.starts_with("sec-ch-ua"), "{name}");
         assert_ne!(name, "accept-encoding");
     }
+}
+
+/// The seam slice ID uses: after `replace_token`, every request carries the new token.
+#[tokio::test]
+async fn a_replaced_token_is_used_by_later_requests() {
+    let (mock, rest, _rx) = serve(&[ok("{}")]).await;
+    get(&rest).await.unwrap();
+    let fresh = "SYNTHETIC_FRESH_TOKEN_9876543210";
+    rest.clone()
+        .replace_token(Arc::new(Token::new(fresh.into()).unwrap()));
+    get(&rest).await.unwrap();
+    let requests = mock.requests();
+    assert!(requests[0].contains(&format!("authorization: {MARKER}\r\n")));
+    assert!(requests[1].contains(&format!("authorization: {fresh}\r\n")));
+    assert!(!requests[1].contains(MARKER));
+}
+
+/// The identity's closed set of extras is read when each request is built: unset, nothing
+/// changes; set, the super-properties carry them and `X-Installation-ID` appears.
+#[tokio::test]
+async fn identity_extras_reach_the_headers_at_send_time() {
+    let headers = |raw: &str| -> Vec<(String, String)> {
+        raw.split("\r\n\r\n")
+            .next()
+            .unwrap()
+            .lines()
+            .skip(1)
+            .filter_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                Some((k.trim().to_ascii_lowercase(), v.trim().to_owned()))
+            })
+            .collect()
+    };
+    let props = |h: &[(String, String)]| -> Value {
+        let raw = &h.iter().find(|(k, _)| k == "x-super-properties").unwrap().1;
+        serde_json::from_slice(
+            &base64::engine::general_purpose::STANDARD
+                .decode(raw)
+                .unwrap(),
+        )
+        .unwrap()
+    };
+    let (mock, rest, _rx) = serve(&[ok("{}")]).await;
+    get(&rest).await.unwrap();
+    let identity = rest.identity();
+    identity.set_client_app_state(identify::AppState::Focused);
+    assert!(identity.set_client_heartbeat_session_id("hb-1".into()));
+    assert!(identity.set_installation_id("inst.1".into()));
+    assert!(!identity.set_installation_id("bad\r\nX-Evil: 1".into()));
+    assert!(!identity.set_installation_id(String::new()));
+    get(&rest).await.unwrap();
+    let requests = mock.requests();
+    let (before, after) = (headers(&requests[0]), headers(&requests[1]));
+    assert!(before.iter().all(|(k, _)| k != "x-installation-id"));
+    let base = props(&before);
+    assert!(base.get("client_app_state").is_none());
+    assert_eq!(
+        after
+            .iter()
+            .find(|(k, _)| k == "x-installation-id")
+            .map(|(_, v)| v.as_str()),
+        Some("inst.1")
+    );
+    let mut extended = props(&after);
+    assert_eq!(extended["client_app_state"], "focused");
+    assert_eq!(extended["client_heartbeat_session_id"], "hb-1");
+    let map = extended.as_object_mut().unwrap();
+    map.remove("client_app_state");
+    map.remove("client_heartbeat_session_id");
+    assert_eq!(extended, base, "the base properties changed");
 }
 
 #[tokio::test]

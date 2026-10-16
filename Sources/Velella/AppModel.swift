@@ -3,6 +3,7 @@ import Observation
 import Security
 import VelellaFFI
 import VelellaLogin
+import VelellaTransport
 import VelellaUI
 
 /// Owns the session, its generation and the pending freshly captured token, and executes the
@@ -80,7 +81,9 @@ final class AppModel {
         handle?.disconnect()
         dropSubscriptions()
         do {
-            let handle = try VelellaFFI.connect(token: token, listener: Listener(model: self))
+            let handle = try VelellaFFI.connect(
+                token: token, transport: URLSessionTransport.shared, listener: Listener(model: self)
+            )
             self.handle = handle
             generation = handle.generation()
             pending = fresh ? (handle.generation(), token) : nil

@@ -1,45 +1,63 @@
-//! Mock-server tests through the public `Session::connect`. The mock speaks zlib-stream Binary
-//! frames like Discord; the only test seam is the dial target (see `Task::dial_target`).
-use crate::{session::test_support::TEST_ENDPOINTS, Session, SessionEvent, SessionHandle, Token};
+//! Session tests through the public `Session::connect` on the in-memory transport. The mock
+//! gateway speaks zlib-stream Binary frames like Discord; the transport routes a dial to the
+//! fixed gateway URL to `Rig::initial` and any other (resume) URL to `Rig::resume`.
+use crate::{
+    identify::{self, GATEWAY_URL},
+    rest::test_support::TEST_HTTP,
+    transport::{
+        memory::{Endpoints, FromClient, MemoryTransport, ServerEnd},
+        Frame, Received,
+    },
+    Session, SessionEvent, SessionHandle, Token,
+};
 use flate2::write::ZlibEncoder;
-use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::{
     io::Write,
     sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
-use tokio::{
-    net::{TcpListener, TcpStream},
-    sync::mpsc,
-    time::timeout,
-};
-use tokio_tungstenite::{
-    accept_async,
-    tungstenite::{protocol::CloseFrame, Message},
-    WebSocketStream,
-};
+use tokio::{sync::mpsc, time::timeout};
 
 const MARKER: &str = "SYNTHETIC_TOKEN_MARKER_0123456789";
 const WAIT: Duration = Duration::from_secs(15);
 
+/// One gateway endpoint: the connections the session dials there, in order.
+struct Listener(tokio::sync::Mutex<mpsc::UnboundedReceiver<ServerEnd>>);
+
+impl Listener {
+    async fn accept(&self) -> ServerEnd {
+        timeout(WAIT, self.0.lock().await.recv())
+            .await
+            .expect("no connection")
+            .expect("transport gone")
+    }
+
+    /// A connection is already waiting (no wait).
+    fn has_pending(&self) -> bool {
+        !self.0.try_lock().expect("listener busy").is_empty()
+    }
+}
+
 /// One accepted client connection with its own zlib-stream compressor.
 struct Conn {
-    ws: WebSocketStream<TcpStream>,
+    end: ServerEnd,
     enc: ZlibEncoder<Vec<u8>>,
     sent: usize,
 }
 
 impl Conn {
-    async fn accept(listener: &TcpListener) -> Conn {
-        let (stream, _) = timeout(WAIT, listener.accept())
-            .await
-            .expect("no connection")
-            .unwrap();
+    async fn accept(listener: &Listener) -> Conn {
         Conn {
-            ws: accept_async(stream).await.unwrap(),
+            end: listener.accept().await,
             enc: ZlibEncoder::new(Vec::new(), flate2::Compression::fast()),
             sent: 0,
+        }
+    }
+
+    fn to_client(&self, received: Received) {
+        if let Some(tx) = &self.end.to_client {
+            let _ = tx.send(received);
         }
     }
 
@@ -49,7 +67,7 @@ impl Conn {
         self.enc.flush().unwrap();
         let bytes = self.enc.get_ref()[self.sent..].to_vec();
         self.sent = self.enc.get_ref().len();
-        self.ws.send(Message::Binary(bytes.into())).await.unwrap();
+        self.to_client(Received::Frame(Frame::Binary(bytes)));
     }
 
     async fn hello(&mut self, interval_ms: u64) {
@@ -57,13 +75,17 @@ impl Conn {
             .await;
     }
 
+    /// Next thing the client did on this connection.
+    async fn next(&mut self) -> Option<FromClient> {
+        timeout(WAIT, self.end.from_client.recv())
+            .await
+            .expect("client did nothing")
+    }
+
     /// Next client packet as raw text (clients send uncompressed Text).
     async fn recv_raw(&mut self) -> String {
-        match timeout(WAIT, self.ws.next())
-            .await
-            .expect("client sent nothing")
-        {
-            Some(Ok(Message::Text(t))) => t.to_string(),
+        match self.next().await {
+            Some(FromClient::Frame(Frame::Text(t))) => t.to_string(),
             other => panic!("expected a text frame, got {other:?}"),
         }
     }
@@ -83,25 +105,39 @@ impl Conn {
         }
     }
 
+    /// The close code the client sent, skipping heartbeats before it.
+    async fn closed_with(&mut self) -> u16 {
+        loop {
+            match self.next().await {
+                Some(FromClient::Close(code)) => return code,
+                Some(FromClient::Frame(Frame::Text(t)))
+                    if serde_json::from_str::<Value>(&t).is_ok_and(|v| v["op"] == 1) => {}
+                other => panic!("expected a close, got {other:?}"),
+            }
+        }
+    }
+
     /// True when nothing but heartbeats arrives for a while.
     async fn quiet(&mut self) -> bool {
         let deadline = tokio::time::Instant::now() + Duration::from_millis(400);
         loop {
-            match tokio::time::timeout_at(deadline, self.ws.next()).await {
+            match tokio::time::timeout_at(deadline, self.end.from_client.recv()).await {
                 Err(_) => return true,
-                Ok(Some(Ok(Message::Text(t))))
+                Ok(Some(FromClient::Frame(Frame::Text(t))))
                     if serde_json::from_str::<Value>(&t).is_ok_and(|v| v["op"] == 1) => {}
                 Ok(_) => return false,
             }
         }
     }
 
+    /// A close frame with `code`.
     async fn close(&mut self, code: u16) {
-        let frame = CloseFrame {
-            code: code.into(),
-            reason: "".into(),
-        };
-        self.ws.send(Message::Close(Some(frame))).await.unwrap();
+        self.to_client(Received::Closed(code));
+    }
+
+    /// The connection ends without a close frame (TCP drop).
+    fn drop_abruptly(&mut self) {
+        self.end.to_client = None;
     }
 }
 
@@ -115,26 +151,33 @@ fn ready(seq: u64, resume_url: &str) -> Value {
 }
 
 struct Rig {
-    initial: TcpListener,
-    resume: TcpListener,
+    initial: Listener,
+    resume: Listener,
     handle: SessionHandle,
     events: mpsc::UnboundedReceiver<SessionEvent>,
 }
 
 impl Rig {
+    /// A session on the in-memory transport: the gateway endpoints here, HTTP answered by the
+    /// mock installed on this thread (if any).
     async fn start() -> Rig {
         capture();
-        let initial = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let resume = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = |l: &TcpListener| format!("ws://{}/", l.local_addr().unwrap());
-        TEST_ENDPOINTS.with(|e| *e.borrow_mut() = Some((url(&initial), url(&resume))));
+        let (initial_tx, initial) = mpsc::unbounded_channel();
+        let (resume_tx, resume) = mpsc::unbounded_channel();
+        let transport = Arc::new(MemoryTransport {
+            http: TEST_HTTP.with(|h| h.borrow().clone()),
+            endpoints: Some(Endpoints {
+                initial: initial_tx,
+                resume: resume_tx,
+            }),
+        });
         let (tx, events) = mpsc::unbounded_channel();
-        let handle = Session::connect(Token::new(MARKER.into()).unwrap(), move |e| {
+        let handle = Session::connect(Token::new(MARKER.into()).unwrap(), transport, move |e| {
             let _ = tx.send(e);
         });
         Rig {
-            initial,
-            resume,
+            initial: Listener(tokio::sync::Mutex::new(initial)),
+            resume: Listener(tokio::sync::Mutex::new(resume)),
             handle,
             events,
         }
@@ -158,7 +201,7 @@ impl Rig {
     }
 }
 
-async fn no_connection(listener: &TcpListener) -> bool {
+async fn no_connection(listener: &Listener) -> bool {
     timeout(Duration::from_millis(400), listener.accept())
         .await
         .is_err()
@@ -189,6 +232,30 @@ async fn hello_identify_ready_yields_ready_event() {
     assert_eq!(*rig.handle.state().borrow(), 1);
 }
 
+/// The dial carries the fixed URL, the session's User-Agent (never the platform default), and the
+/// inflation cap as the message-size limit; the resume dial the validated, normalized URL.
+#[tokio::test]
+async fn the_dial_carries_the_fixed_url_the_user_agent_and_the_cap() {
+    let mut rig = Rig::start().await;
+    let first = rig.ready(100, "wss://gateway-us-east1-b.discord.gg").await;
+    let request = &first.end.request;
+    assert_eq!(request.url(), GATEWAY_URL);
+    assert_eq!(
+        request.headers(),
+        [
+            ("User-Agent".to_owned(), identify::USER_AGENT.to_owned()),
+            ("Accept-Language".to_owned(), "en-US,en;q=0.9".to_owned())
+        ]
+    );
+    assert_eq!(request.max_message_size(), 64 << 20);
+    // Missed ACK: the session resumes at the validated resume URL.
+    let resumed = Conn::accept(&rig.resume).await;
+    assert_eq!(
+        resumed.end.request.url(),
+        "wss://gateway-us-east1-b.discord.gg/?v=9&encoding=json&compress=zlib-stream"
+    );
+}
+
 #[tokio::test]
 async fn dispatches_bump_state_revision() {
     let mut rig = Rig::start().await;
@@ -217,7 +284,62 @@ async fn dispatches_bump_state_revision() {
 async fn missed_ack_resumes_at_the_resume_endpoint() {
     let mut rig = Rig::start().await;
     // 100 ms interval and the mock never ACKs: the second beat finds the first unanswered.
+    let mut first = rig.ready(100, "wss://gateway-resume.discord.gg/").await;
+    let mut conn = Conn::accept(&rig.resume).await;
+    assert_eq!(
+        rig.event().await,
+        SessionEvent::Reconnecting {
+            generation: rig.handle.generation()
+        }
+    );
+    // T-4: the old connection was closed explicitly, with a code that keeps the session resumable.
+    assert_eq!(first.closed_with().await, 4000);
+    conn.hello(30_000).await;
+    let resume = conn.recv().await;
+    assert_eq!(resume["op"], 6);
+    assert_eq!(resume["d"]["token"], MARKER);
+    assert_eq!(resume["d"]["session_id"], "sess-1");
+    assert_eq!(resume["d"]["seq"], 1);
+    assert!(no_connection(&rig.initial).await, "must not IDENTIFY again");
+}
+
+/// One token slot for REST and the gateway: after `replace_token`, a RESUME of the running
+/// session still sends the token that session identified with, and the next fresh IDENTIFY sends
+/// the new one.
+#[tokio::test]
+async fn a_replaced_token_goes_to_the_next_identify_but_not_to_a_resume() {
+    const FRESH: &str = "SYNTHETIC_FRESH_TOKEN_9876543210";
+    let mut rig = Rig::start().await;
     let _first = rig.ready(100, "wss://gateway-resume.discord.gg/").await;
+    rig.handle
+        .rest()
+        .replace_token(Arc::new(Token::new(FRESH.into()).unwrap()));
+    // Missed ACK: RESUME on a new connection, with the session's own token.
+    let mut conn = Conn::accept(&rig.resume).await;
+    conn.hello(30_000).await;
+    let resume = conn.recv_non_beat().await;
+    assert_eq!(
+        (resume["op"].as_u64(), resume["d"]["token"].as_str()),
+        (Some(6), Some(MARKER))
+    );
+    // Op 9 clears the session: the fresh IDENTIFY reads the slot.
+    conn.send(json!({"op": 9, "d": false})).await;
+    let mut again = Conn::accept(&rig.initial).await;
+    again.hello(30_000).await;
+    let identify = again.recv_non_beat().await;
+    assert_eq!(
+        (identify["op"].as_u64(), identify["d"]["token"].as_str()),
+        (Some(2), Some(FRESH))
+    );
+}
+
+/// A connection that ends without a close frame (TCP drop) resumes; a 4004 close frame ends the
+/// session. The two must never be confused (T-6).
+#[tokio::test]
+async fn an_abrupt_drop_resumes() {
+    let mut rig = Rig::start().await;
+    let mut first = rig.ready(30_000, "wss://gateway-resume.discord.gg/").await;
+    first.drop_abruptly();
     let mut conn = Conn::accept(&rig.resume).await;
     assert_eq!(
         rig.event().await,
@@ -226,12 +348,7 @@ async fn missed_ack_resumes_at_the_resume_endpoint() {
         }
     );
     conn.hello(30_000).await;
-    let resume = conn.recv().await;
-    assert_eq!(resume["op"], 6);
-    assert_eq!(resume["d"]["token"], MARKER);
-    assert_eq!(resume["d"]["session_id"], "sess-1");
-    assert_eq!(resume["d"]["seq"], 1);
-    assert!(no_connection(&rig.initial).await, "must not IDENTIFY again");
+    assert_eq!(conn.recv().await["op"], 6);
 }
 
 #[tokio::test]
@@ -269,12 +386,8 @@ async fn acked_heartbeats_keep_the_connection_and_carry_the_sequence() {
     // (A first beat can race ahead of READY and carry null; by now the sequence is known.)
     assert_eq!(last["d"], 1);
     // Checked right after the last ACK (before the mock goes silent): nothing reconnected.
-    assert!(timeout(Duration::from_millis(5), rig.initial.accept())
-        .await
-        .is_err());
-    assert!(timeout(Duration::from_millis(5), rig.resume.accept())
-        .await
-        .is_err());
+    assert!(!rig.initial.has_pending());
+    assert!(!rig.resume.has_pending());
     assert!(
         rig.events.try_recv().is_err(),
         "no Reconnecting while ACKs arrive"
@@ -335,6 +448,8 @@ async fn close_4004_is_auth_failed_and_not_retried() {
             generation: rig.handle.generation()
         }
     );
+    // T-4: closed explicitly on this exit path too.
+    assert_eq!(conn.closed_with().await, 1000);
     assert!(no_connection(&rig.initial).await, "4004 must not retry");
     assert!(no_connection(&rig.resume).await);
     // The task ended: its callback was dropped, so the channel is closed and nothing else came.
@@ -367,17 +482,8 @@ async fn disconnect_emits_closed_and_generations_increase() {
         }
     };
     assert_eq!(ended, SessionEvent::Closed { generation });
-    let closing = loop {
-        match timeout(WAIT, conn.ws.next()).await.unwrap() {
-            Some(Ok(Message::Text(t))) if serde_json::from_str::<Value>(&t).unwrap()["op"] == 1 => {
-            }
-            other => break other,
-        }
-    };
-    assert!(matches!(
-        closing,
-        Some(Ok(Message::Close(_))) | Some(Err(_)) | None
-    ));
+    // T-4: a disconnect closes with 1000 (or 4000 if that racing reconnect won).
+    assert!(matches!(conn.closed_with().await, 1000 | 4000));
     let second = Rig::start().await;
     assert!(second.handle.generation() > generation);
 }
@@ -473,24 +579,6 @@ async fn trace_logs_never_contain_the_token_but_identify_and_resume_frames_do() 
     );
     assert!(!logs.contains(MARKER), "token leaked into logs");
     assert!(!logs.contains("SYNTHETIC"));
-}
-
-/// A `wss://` dial must reach the TLS handshake. Without an explicit rustls crypto provider the
-/// stack panics before any I/O (what the Cargo.toml `rustls` entry exists to prevent). A plain TCP
-/// peer cannot complete a handshake, so a clean error is the expected outcome.
-#[tokio::test]
-async fn wss_dial_builds_the_tls_stack_and_fails_cleanly_against_a_non_tls_peer() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("wss://127.0.0.1:{}/", listener.local_addr().unwrap().port());
-    tokio::spawn(async move {
-        let _ = listener.accept().await;
-    });
-    let dialed = timeout(
-        Duration::from_secs(5),
-        tokio_tungstenite::connect_async(url),
-    )
-    .await;
-    assert!(matches!(dialed, Ok(Err(_))), "expected a handshake error");
 }
 
 // ---- Sidebar subscriptions (through the same mock gateway) ----

@@ -10,8 +10,8 @@ crate-type = ["staticlib"]
 [dependencies]
 velella-core = { path = "../velella-core" }
 uniffi = { version = "0.32", features = ["cli"] }
-# `net`: the session's WebSocket dial needs the runtime's IO driver (see `runtime()`).
-tokio = { version = "1", features = ["rt-multi-thread", "time", "net"] }
+# Timers for the runtime, oneshot channels for the transport adapter (transport.rs).
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 
 [dev-dependencies]
 futures = "0.3"
