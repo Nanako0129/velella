@@ -2,7 +2,7 @@
 
 ## 文件目的
 
-這份文件列出 velella 從第一次登入到 iOS 版的里程碑順序，目標是追上 Swiftcord v2 的功能面（訊息、Voice & Video、Liquid Glass、iPad）。只有進行中的里程碑有詳細計畫；後面的里程碑等前一個完成、Rust API 成形之後才寫計畫，每份計畫都經過審查與核准才開工。參考專案的分析見 [reference-analysis.md](reference-analysis.md)。
+這份文件列出 velella 從第一次登入到 iOS 版的里程碑順序。目標是完整的 Discord 客戶端，功能與行為對齊官方桌面客戶端（使用者 2026-10-16）；每個功能群組的狀態與所屬波次見 [parity.md](parity.md)。外觀仍參考 Swiftcord v2（Liquid Glass、iPad）。只有進行中的里程碑有詳細計畫；後面的里程碑等前一個完成、Rust API 成形之後才寫計畫，每份計畫都經過審查與核准才開工。參考專案的分析見 [reference-analysis.md](reference-analysis.md)。
 
 ## 里程碑
 
