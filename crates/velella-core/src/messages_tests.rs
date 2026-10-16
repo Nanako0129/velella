@@ -1,15 +1,16 @@
-//! Message-store tests against W0's mock HTTP server (`rest::test_support`). Live wiring through
+//! Message-store tests against the mock HTTP answers on the in-memory transport
+//! (`rest::test_support`). Live wiring through
 //! the session and the mock gateway is in session_tests.rs (`messages_live`).
 use super::*;
 use crate::{
     identify,
-    rest::test_support::{response, MockHttp, TEST_REST_BASE},
+    rest::test_support::{response, MockHttp, HANG},
     Token,
 };
 use base64::Engine as _;
 use serde_json::json;
 use std::time::Duration;
-use tokio::{io::AsyncReadExt, net::TcpListener, sync::mpsc, time::timeout};
+use tokio::{sync::mpsc, time::timeout};
 
 #[path = "reply_typing_tests.rs"]
 mod reply_typing;
@@ -28,7 +29,7 @@ fn token() -> Arc<Token> {
 fn store_for(mock: &MockHttp) -> Arc<MessageStore> {
     mock.install();
     let (tx, _rx) = mpsc::unbounded_channel();
-    MessageStore::with_wake(Rest::new(token(), 7, tx), None)
+    MessageStore::with_wake(Rest::test(token(), 7, tx), None)
 }
 
 async fn serve(responses: &[String]) -> (MockHttp, Arc<MessageStore>) {
@@ -119,8 +120,11 @@ async fn history_get_uses_the_typed_path_and_the_token_only_in_authorization() {
         .unwrap();
     let props: Value = serde_json::from_slice(&props).unwrap();
     let token = token();
-    let identify: Value =
-        serde_json::from_str(&identify::encode(&identify::identify(&token))).unwrap();
+    let identify: Value = serde_json::from_str(&identify::encode(&identify::identify(
+        &token,
+        &identify::Identity::current(),
+    )))
+    .unwrap();
     assert_eq!(props, identify["d"]["properties"]);
 }
 
@@ -586,22 +590,23 @@ async fn a_latched_401_shows_as_failed_and_sends_nothing_more() {
 
 #[tokio::test]
 async fn leaving_the_channel_cancels_the_in_flight_get() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base = format!("http://{}", listener.local_addr().unwrap());
-    TEST_REST_BASE.with(|b| *b.borrow_mut() = Some(base));
-    let (tx, _rx) = mpsc::unbounded_channel();
-    let store = MessageStore::with_wake(Rest::new(token(), 7, tx), None);
+    // The transport takes the request and never answers.
+    let (mock, store) = serve(&[HANG.to_owned()]).await;
+    let cancelled = mock.cancelled();
     let epoch = store.open(5);
-    // The server takes the request and never answers.
-    let (mut stream, _) = timeout(WAIT, listener.accept()).await.unwrap().unwrap();
-    let mut buf = [0u8; 4096];
-    assert!(stream.read(&mut buf).await.unwrap() > 0);
+    timeout(WAIT, async {
+        while mock.count() == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the GET never started");
     store.close(epoch);
-    // The aborted request drops its connection: the server reads end-of-stream.
-    let n = timeout(WAIT, stream.read(&mut buf))
+    // The aborted request drops its transport future, which cancels it there (the app's
+    // transport then cancels the URLSession task; see the Swift deadline test).
+    timeout(WAIT, cancelled)
         .await
         .expect("the GET was not cancelled");
-    assert_eq!(n.unwrap(), 0);
     assert!(store.snapshot(epoch, &Context::default()).is_none());
 }
 
@@ -1090,7 +1095,7 @@ async fn opened_with_wake(wake: SyncSender<()>) -> (MockHttp, Arc<MessageStore>,
     let mock = MockHttp::start(vec![ok(&json!([]))]).await;
     mock.install();
     let (tx, _rx) = mpsc::unbounded_channel();
-    let store = MessageStore::with_wake(Rest::new(token(), 7, tx), Some(wake));
+    let store = MessageStore::with_wake(Rest::test(token(), 7, tx), Some(wake));
     let epoch = store.open(5);
     settled(&store, epoch).await;
     (mock, store, epoch)
@@ -1143,7 +1148,7 @@ async fn the_worker_colours_a_message_and_ends_with_its_store() {
     mock.install();
     let (tx, _rx) = mpsc::unbounded_channel();
     let started = std::time::Instant::now();
-    let (store, handle) = MessageStore::start(Rest::new(token(), 7, tx), highlight::compute_job);
+    let (store, handle) = MessageStore::start(Rest::test(token(), 7, tx), highlight::compute_job);
     let handle = handle.expect("the worker thread started");
     let epoch = store.open(5);
     settled(&store, epoch).await;
@@ -1177,7 +1182,7 @@ async fn the_worker_holds_no_store_while_it_computes() {
         let _ = release_rx.recv();
         vec![None; job.blocks.len()]
     };
-    let (store, handle) = MessageStore::start(Rest::new(token(), 7, tx), compute);
+    let (store, handle) = MessageStore::start(Rest::test(token(), 7, tx), compute);
     let handle = handle.expect("the worker thread started");
     let epoch = store.open(5);
     settled(&store, epoch).await;
@@ -1220,7 +1225,7 @@ async fn release_cold_observe() {
     let mock = MockHttp::start(vec![ok(&json!([]))]).await;
     mock.install();
     let (tx, _rx) = mpsc::unbounded_channel();
-    let store = MessageStore::new(Rest::new(token(), 7, tx));
+    let store = MessageStore::new(Rest::test(token(), 7, tx));
     let epoch = store.open(5);
     settled(&store, epoch).await;
     let mut worst = Duration::ZERO;

@@ -27,6 +27,7 @@ mod sidebar;
 mod state;
 mod threads;
 mod token;
+pub mod transport;
 mod typing;
 mod voice;
 

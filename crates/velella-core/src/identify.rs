@@ -4,6 +4,7 @@
 use crate::token::{self, Token};
 use base64::Engine as _;
 use serde::Serialize;
+use std::sync::Mutex;
 use zeroize::Zeroizing;
 
 /// Initial gateway URL: v9 because the READY shapes we parse (Concord's) are v9's, zlib-stream
@@ -44,7 +45,7 @@ pub(crate) const ACCEPT_LANGUAGE: &str = "en-US,en;q=0.9";
 /// unverified; the first live login (S3) is the check.
 const CLIENT_BUILD_NUMBER: u64 = 580_004;
 
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Debug, Clone)]
 struct Properties {
     os: &'static str,
     browser: &'static str,
@@ -87,7 +88,7 @@ pub(crate) struct IdentifyData<'a> {
     #[serde(serialize_with = "token::serialize")]
     token: &'a Token,
     capabilities: u64,
-    properties: Properties,
+    properties: &'a Properties,
     presence: Presence,
     /// Browsers keep payload compression off; transport compression is the zlib-stream URL.
     compress: bool,
@@ -130,9 +131,143 @@ fn properties() -> Properties {
 }
 
 /// `X-Super-Properties`: standard base64 of the IDENTIFY properties JSON, as the web client sends.
+#[cfg(test)]
 pub(crate) fn super_properties() -> String {
-    let json = serde_json::to_string(&properties()).expect("properties serialize");
+    encode_properties(&properties())
+}
+
+fn encode_properties(properties: &Properties) -> String {
+    let json = serde_json::to_string(properties).expect("properties serialize");
     base64::engine::general_purpose::STANDARD.encode(json)
+}
+
+/// The identity one session presents, built once per session (`Session::connect`): REST takes its
+/// headers from it and the gateway task its IDENTIFY, so the two cannot disagree within a
+/// session. The base is immutable (today this file's constants; slice ID fills it at runtime);
+/// only the closed set of `Extras` changes during a session, through their three setters.
+pub(crate) struct Identity {
+    properties: Properties,
+    capabilities: u64,
+    super_properties: String,
+    timezone: String,
+    extras: Mutex<Extras>,
+}
+
+/// `client_app_state` in X-Super-Properties.
+#[allow(dead_code)] // Set by slice ID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AppState {
+    Focused,
+    Unfocused,
+}
+
+/// The only per-session values that change after start, read by REST at send time. No other
+/// key can be added at runtime.
+#[derive(Default)]
+struct Extras {
+    client_app_state: Option<AppState>,
+    client_heartbeat_session_id: Option<String>,
+    /// Sent as `X-Installation-ID` (from READY, slice ID).
+    installation_id: Option<String>,
+}
+
+/// An extra string that may reach a header: 1-128 visible ASCII bytes.
+fn extra_ok(value: &str) -> bool {
+    (1..=128).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_graphic())
+}
+
+impl Identity {
+    pub(crate) fn current() -> Identity {
+        let properties = properties();
+        Identity {
+            super_properties: encode_properties(&properties),
+            properties,
+            capabilities: CAPABILITIES,
+            timezone: timezone(),
+            extras: Mutex::default(),
+        }
+    }
+
+    fn extras(&self) -> std::sync::MutexGuard<'_, Extras> {
+        self.extras.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[allow(dead_code)] // Set by slice ID.
+    pub(crate) fn set_client_app_state(&self, state: AppState) {
+        self.extras().client_app_state = Some(state);
+    }
+
+    /// False (and nothing stored) unless 1-128 visible ASCII bytes.
+    #[allow(dead_code)] // Set by slice ID.
+    pub(crate) fn set_client_heartbeat_session_id(&self, id: String) -> bool {
+        let ok = extra_ok(&id);
+        if ok {
+            self.extras().client_heartbeat_session_id = Some(id);
+        }
+        ok
+    }
+
+    /// False (and nothing stored) unless 1-128 visible ASCII bytes.
+    #[allow(dead_code)] // Set by slice ID.
+    pub(crate) fn set_installation_id(&self, id: String) -> bool {
+        let ok = extra_ok(&id);
+        if ok {
+            self.extras().installation_id = Some(id);
+        }
+        ok
+    }
+
+    pub(crate) fn installation_id(&self) -> Option<String> {
+        self.extras().installation_id.clone()
+    }
+
+    pub(crate) fn user_agent(&self) -> &str {
+        self.properties.browser_user_agent
+    }
+
+    /// The base properties in their own key order, then `client_app_state` and
+    /// `client_heartbeat_session_id` (in that order) once set. Appended to the serialized object
+    /// rather than re-serialized through `serde_json::Value`, which would sort the keys.
+    pub(crate) fn super_properties(&self) -> String {
+        let extras = self.extras();
+        if extras.client_app_state.is_none() && extras.client_heartbeat_session_id.is_none() {
+            return self.super_properties.clone();
+        }
+        let mut json = serde_json::to_string(&self.properties).expect("properties serialize");
+        json.pop(); // the closing brace of a non-empty object
+        let mut append = |key: &str, value: &str| {
+            json.push_str(&format!(
+                ",\"{key}\":{}",
+                serde_json::to_string(value).expect("string serializes")
+            ));
+        };
+        if let Some(state) = extras.client_app_state {
+            append(
+                "client_app_state",
+                match state {
+                    AppState::Focused => "focused",
+                    AppState::Unfocused => "unfocused",
+                },
+            );
+        }
+        if let Some(id) = &extras.client_heartbeat_session_id {
+            append("client_heartbeat_session_id", id);
+        }
+        json.push('}');
+        base64::engine::general_purpose::STANDARD.encode(json)
+    }
+
+    pub(crate) fn locale(&self) -> &str {
+        LOCALE
+    }
+
+    pub(crate) fn accept_language(&self) -> &str {
+        ACCEPT_LANGUAGE
+    }
+
+    pub(crate) fn timezone(&self) -> &str {
+        &self.timezone
+    }
 }
 
 /// `X-Discord-Timezone`: the system's IANA zone, which a browser reports from the same setting.
@@ -150,13 +285,13 @@ pub(crate) fn timezone() -> String {
         .unwrap_or_else(|| "UTC".to_owned())
 }
 
-pub(crate) fn identify(token: &Token) -> Payload<IdentifyData<'_>> {
+pub(crate) fn identify<'a>(token: &'a Token, identity: &'a Identity) -> Payload<IdentifyData<'a>> {
     Payload {
         op: 2,
         d: IdentifyData {
             token,
-            capabilities: CAPABILITIES,
-            properties: properties(),
+            capabilities: identity.capabilities,
+            properties: &identity.properties,
             presence: Presence {
                 since: 0,
                 activities: [],
@@ -206,7 +341,8 @@ mod tests {
     #[test]
     fn payloads_carry_the_token_but_debug_redacts_it() {
         let token = Token::new(MARKER.into()).unwrap();
-        let identify = identify(&token);
+        let identity = Identity::current();
+        let identify = identify(&token, &identity);
         let resume = resume(&token, "sess", 7);
         for debug in [
             format!("{identify:?}"),
@@ -232,7 +368,10 @@ mod tests {
     #[test]
     fn super_properties_decode_to_the_identify_properties() {
         let token = Token::new(MARKER.into()).unwrap();
-        let wire: serde_json::Value = serde_json::from_str(&encode(&identify(&token))).unwrap();
+        let identity = Identity::current();
+        let wire: serde_json::Value =
+            serde_json::from_str(&encode(&identify(&token, &identity))).unwrap();
+        assert_eq!(identity.super_properties(), super_properties());
         let raw = base64::engine::general_purpose::STANDARD
             .decode(super_properties())
             .unwrap();
@@ -240,7 +379,7 @@ mod tests {
         let decoded: serde_json::Value = serde_json::from_slice(&raw).unwrap();
         assert_eq!(decoded, wire["d"]["properties"]);
         let tz = timezone();
-        assert!(!tz.is_empty() && reqwest::header::HeaderValue::from_str(&tz).is_ok());
+        assert!(!tz.is_empty() && crate::transport::valid_value(&tz));
     }
 
     #[test]
