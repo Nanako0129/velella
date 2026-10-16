@@ -127,12 +127,16 @@ private struct Pixels {
     var width: Int { image.width }
     var height: Int { image.height }
 
-    @MainActor init?<V: View>(_ view: V, width: CGFloat = 240) {
-        let renderer = ImageRenderer(content: view.frame(width: width, alignment: .leading).environment(\.colorScheme, .light))
-        renderer.scale = 1
-        guard let image = renderer.cgImage, image.bitsPerPixel == 32, let data = image.dataProvider?.data as Data? else { return nil }
+    /// A hosted render (selection plan N1: message text is an AppKit view, which `ImageRenderer`
+    /// does not draw), light, at 1x, RGBA.
+    @MainActor init?<V: View>(hosted view: V, width: CGFloat = 240) {
+        guard let render = TextHarness.render(view, width: width, scale: 1),
+              let provider = CGDataProvider(data: render.data as CFData),
+              let image = CGImage(width: render.width, height: render.height, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: render.bytesPerRow,
+                                  space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+                                  provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent) else { return nil }
         self.image = image
-        self.data = data
+        data = render.data
     }
 
     /// (r, g, b, a) at a pixel, as stored.
@@ -154,7 +158,7 @@ private struct Pixels {
 }
 
 @MainActor private func render(_ blocks: [MarkdownBlock], width: CGFloat = 240) -> Pixels? {
-    Pixels(BlockList(blocks: blocks, text: MarkdownText(body: MessageBody(blocks: blocks))), width: width)
+    Pixels(hosted: BlockList(blocks: blocks, text: MarkdownText(body: MessageBody(blocks: blocks))), width: width)
 }
 
 @MainActor @Test func aQuoteDrawsItsBarAlongTheLeftEdgeAndAParagraphDoesNot() throws {
@@ -203,16 +207,17 @@ private struct Pixels {
 
     // `**# mmmmmm**` and `# mmmmmm` are both semibold; a paragraph in bold is wider than plain.
     let word = [MarkdownInline.text("mmmmmmmmmm")]
-    let plain = try #require(Pixels(InlineFlow(inlines: [.block(.paragraph(word))], text: base)))
-    let bold = try #require(Pixels(InlineFlow(inlines: [.bold([.block(.paragraph(word))])], text: base)))
+    let plain = try #require(Pixels(hosted: InlineFlow(inlines: [.block(.paragraph(word))], text: base)))
+    let bold = try #require(Pixels(hosted: InlineFlow(inlines: [.bold([.block(.paragraph(word))])], text: base)))
     let widthPlain = try #require(plain.inkColumns).count, widthBold = try #require(bold.inkColumns).count
     #expect(widthBold > widthPlain, "\(widthBold) vs \(widthPlain)")
 }
 
 @MainActor @Test func aCodeBlockInABoldContainerIsUnchanged() throws {
     let code = MarkdownBlock.codeBlock(language: nil, code: "mmmmmmmmmm", header: nil, highlight: nil)
-    let plain = try #require(Pixels(InlineFlow(inlines: [.block(code)], text: base)))
-    let bold = try #require(Pixels(InlineFlow(inlines: [.bold([.italic([.underline([.strike([.block(code)])])])])], text: base)))
+    // Hosted: `ImageRenderer` draws the AppKit code view as a placeholder that is not byte-stable.
+    let plain = try #require(Pixels(hosted: InlineFlow(inlines: [.block(code)], text: base)))
+    let bold = try #require(Pixels(hosted: InlineFlow(inlines: [.bold([.italic([.underline([.strike([.block(code)])])])])], text: base)))
     #expect(plain.data == bold.data)
 }
 
@@ -221,7 +226,7 @@ private struct Pixels {
         let inlines: [MarkdownInline] = [.spoiler(id: 0, [.block(.codeBlock(language: nil, code: "WWWWWWWWWW", header: nil, highlight: nil))])]
         let body = MessageBody(blocks: [.paragraph(inlines)])
         guard case .paragraph(let numbered) = body.blocks[0] else { return nil }
-        return Pixels(InlineFlow(inlines: numbered, text: MarkdownText(body: body, revealed: revealed)), width: 200)
+        return Pixels(hosted: InlineFlow(inlines: numbered, text: MarkdownText(body: body, revealed: revealed)), width: 200)
     }
     let hidden = try #require(flow(revealed: []))
     let shown = try #require(flow(revealed: [0]))
@@ -232,6 +237,6 @@ private struct Pixels {
     // the cover over the heading's own covered runs, never glyph edges.
     let body = MessageBody(blocks: [.paragraph([.spoiler(id: 0, [.block(.heading(level: 1, [.text("WWWW")]))])])])
     guard case .paragraph(let numbered) = body.blocks[0] else { return }
-    let heading = try #require(Pixels(InlineFlow(inlines: numbered, text: MarkdownText(body: body)), width: 200))
+    let heading = try #require(Pixels(hosted: InlineFlow(inlines: numbered, text: MarkdownText(body: body)), width: 200))
     #expect(heading.colours.count <= 2, "\(heading.colours.count) colours")
 }

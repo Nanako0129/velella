@@ -397,30 +397,28 @@ private func linkBody(_ url: String, host: String, label: String, masked: Bool =
 
 // MARK: The paragraph host
 
-@MainActor @Test func renderingATippedSegmentRecordsItsFrame() {
-    let frames = TipFrames()
-    let view = ParagraphView(frames: frames) { _ in
+@MainActor @Test func renderingATippedSegmentRecordsItsFrame() throws {
+    let view = ParagraphView { _ in
         [Segment(text: AttributedString("before ")), Segment(text: AttributedString("pill"), hoverTip: "stub tip"), Segment(text: AttributedString(" after"))]
     }
-    let renderer = ImageRenderer(content: view.frame(width: 320))
-    #expect(renderer.nsImage != nil)
-    let recorded = frames.all
+    // Moved to the message text view (selection plan N1): rendered in a hosted window.
+    let (host, window) = TextHarness.hosting(view.frame(width: 320), size: CGSize(width: 320, height: 40))
+    let frames = try #require(TextHarness.textViews(in: host).first)
+    let recorded = frames.tipFrames
     #expect(recorded.map(\.tip) == ["stub tip"])
     guard let rect = recorded.first?.rect else { return }
     #expect(rect.width > 0 && rect.height > 0 && rect.minX > 0)
     #expect(frames.tip(at: CGPoint(x: rect.midX, y: rect.midY))?.tip == "stub tip")
     #expect(frames.tip(at: CGPoint(x: rect.minX / 2, y: rect.midY)) == nil)
+    _ = window
 }
 
 /// The colour at the middle of an offscreen render of segments, as (red, green, blue).
 @MainActor private func middlePixel(_ segments: [Segment]) -> (Double, Double, Double)? {
-    let renderer = ImageRenderer(content: ParagraphView { _ in segments }.environment(\.colorScheme, .light))
-    renderer.scale = 1
-    guard let image = renderer.cgImage, let data = image.dataProvider?.data as Data?, image.bitsPerPixel == 32 else { return nil }
-    let offset = (image.height / 2) * image.bytesPerRow + (image.width / 2) * 4
-    let rgb = (Double(data[offset]), Double(data[offset + 1]), Double(data[offset + 2]))
-    // BGRA or RGBA: compare as a set of channel values, never by order.
-    return image.bitmapInfo.contains(.byteOrder32Little) ? (rgb.2, rgb.1, rgb.0) : rgb
+    // A hosted render (the paragraph is an AppKit view since selection plan N1), RGBA.
+    guard let image = TextHarness.render(ParagraphView { _ in segments }, width: nil, scale: 1) else { return nil }
+    let p = image.at(image.width / 2, image.height / 2)
+    return (Double(p[0]), Double(p[1]), Double(p[2]))
 }
 
 /// Pills keep their fill under the segment renderer, and a hidden spoiler draws its cover, not
@@ -491,13 +489,10 @@ private func linkBody(_ url: String, host: String, label: String, masked: Bool =
 /// "Spoiler" in place of hidden text. Offscreen: the window is never ordered in.
 @MainActor @Test func theDrawnParagraphSpeaksItsLabelNotHiddenText() {
     let s = segments([.text("a "), .spoiler(id: 0, [.text("secret")]), .text(" b")])
-    let host = NSHostingView(rootView: ParagraphView { _ in s }.frame(width: 320))
-    let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 320, height: 80), styleMask: .borderless, backing: .buffered, defer: true)
-    window.contentView = host
-    // What an assistive app sets on the application; SwiftUI builds no accessibility nodes before.
-    NSApplication.shared.accessibilitySetValue(true, forAttribute: NSAccessibility.Attribute(rawValue: "AXEnhancedUserInterface"))
-    host.layoutSubtreeIfNeeded()
+    // Hosted in the harness window (selection plan N1); the text view is an AppKit element.
+    let (host, window) = TextHarness.hosting(ParagraphView { _ in s }.frame(width: 320), size: CGSize(width: 320, height: 80), accessibility: true)
     let spoken = spokenTexts(host)
+    _ = window
     #expect(spoken.contains("a Spoiler b"), "\(spoken)")
     #expect(!spoken.contains { $0.contains("secret") }, "\(spoken)")
 }

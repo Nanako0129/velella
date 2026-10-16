@@ -1,13 +1,10 @@
 import AppKit
 import Observation
-import Synchronization
 import SwiftUI
 
-// The one paragraph host (docs/plans/markdown.md, K2): segments become `Text`s joined by
-// interpolation, drawn by a `TextRenderer` that records hover-tipped runs and covers hidden
-// spoilers, inside a `TimelineView` that rebuilds them at the smallest refresh they ask for.
-// K3 and K4 build on this interface: K4 fills `RenderContext`-dependent timestamp segments, K3
-// styles `BlockView`.
+// The paragraph host (docs/plans/markdown.md, K2; docs/plans/selection.md, N1): a paragraph's
+// segments in one message text view, inside a `TimelineView` that rebuilds them at the smallest
+// refresh they ask for.
 
 /// What a paragraph's segments are built from on each timeline tick.
 struct RenderContext: Equatable, Sendable {
@@ -19,45 +16,6 @@ struct RenderContext: Equatable, Sendable {
 extension EnvironmentValues {
     /// `ShellState.locale`, set by ShellView; read into every `RenderContext`.
     @Entry var discordLocale = Locale(identifier: "en-US")
-}
-
-/// Tip of a segment; a `TextRenderer` can read only attributes attached through `customAttribute`.
-struct HoverTipAttribute: TextAttribute { var tip: String }
-
-/// Marks a hidden spoiler's runs: the renderer fills them instead of drawing their glyphs.
-struct SpoilerCoverAttribute: TextAttribute {}
-
-struct TipFrame: Equatable, Sendable {
-    var rect: CGRect
-    var tip: String
-}
-
-/// Where the last draw put each tipped run, in the text's own coordinates.
-final class TipFrames: Sendable {
-    private let frames = Mutex<[TipFrame]>([])
-    var all: [TipFrame] { frames.withLock { $0 } }
-    func replace(_ new: [TipFrame]) { frames.withLock { $0 = new } }
-    func tip(at point: CGPoint) -> TipFrame? { all.first { $0.rect.contains(point) } }
-}
-
-struct SegmentRenderer: TextRenderer {
-    let frames: TipFrames
-
-    func draw(layout: Text.Layout, in ctx: inout GraphicsContext) {
-        var tipped: [TipFrame] = []
-        for line in layout {
-            for run in line {
-                let rect = run.typographicBounds.rect
-                if let tip = run[HoverTipAttribute.self] { tipped.append(TipFrame(rect: rect, tip: tip.tip)) }
-                if run[SpoilerCoverAttribute.self] != nil {
-                    ctx.fill(Path(roundedRect: rect, cornerRadius: MarkdownPalette.spoilerRadius), with: .color(MarkdownPalette.spoilerCover))
-                } else {
-                    ctx.draw(run)
-                }
-            }
-        }
-        frames.replace(tipped)
-    }
 }
 
 /// Every `interval` from the start, or a single entry (static) without one.
@@ -76,23 +34,28 @@ struct RefreshSchedule: TimelineSchedule {
 
 struct ParagraphView: View {
     let build: (RenderContext) -> [Segment]
+    /// The block's base size and weight (`MarkdownText`): its line box and first baseline.
+    var size: CGFloat = MarkdownText.bodySize
+    var weight: Font.Weight = .regular
+    /// The text view's place in its `MarkdownView`'s document order.
+    var participant = 0
     @Environment(\.discordLocale) private var locale
-    @State private var frames: TipFrames
-    /// The tipped run under the pointer, and the tip shown for it.
-    @State private var armed: TipFrame?
-    @State private var shown: TipFrame?
-    private let images = EmojiImages.shared
+    @Environment(\.textSecondary) private var secondary
 
-    init(frames: TipFrames = TipFrames(), build: @escaping (RenderContext) -> [Segment]) {
-        _frames = State(initialValue: frames)
+    init(size: CGFloat = MarkdownText.bodySize, weight: Font.Weight = .regular, participant: Int = 0, build: @escaping (RenderContext) -> [Segment]) {
+        self.size = size
+        self.weight = weight
+        self.participant = participant
         self.build = build
     }
 
     var body: some View {
         let refresh = build(RenderContext(now: .now, locale: locale)).compactMap(\.refreshEvery).min()
         TimelineView(RefreshSchedule(interval: refresh)) { timeline in
-            content(Self.tick(timeline.date, locale: locale, build: build))
+            MessageTextBlock(leaves: [.text(segments: Self.tick(timeline.date, locale: locale, build: build), size: size, weight: weight, secondary: secondary)],
+                             participant: participant)
         }
+        .alignmentGuide(.firstTextBaseline) { [size, weight] _ in MainActor.assumeIsolated { TextMetrics.firstBaseline(size: size, weight: weight) } }
     }
 
     /// What VoiceOver reads: each run of covered (hidden spoiler) segments becomes one "Spoiler",
@@ -115,61 +78,6 @@ struct ParagraphView: View {
     /// What one timeline tick renders: `build` at the tick's date.
     nonisolated static func tick(_ date: Date, locale: Locale, build: (RenderContext) -> [Segment]) -> [Segment] {
         build(RenderContext(now: date, locale: locale))
-    }
-
-    private func content(_ segments: [Segment]) -> some View {
-        Self.join(segments.map(text))
-            .textRenderer(SegmentRenderer(frames: frames))
-            .accessibilityLabel(Text(verbatim: Self.spoken(segments)))
-            .onContinuousHover(perform: hover)
-            .tooltipOverlay(shown.map { TooltipRequest(text: $0.tip, rect: $0.rect) })
-            .task(id: segments.compactMap(\.image?.url)) {
-                for segment in segments { if let url = segment.image?.url { images.load(url) } }
-            }
-    }
-
-    private func text(_ segment: Segment) -> Text {
-        if let image = segment.image, let loaded = images.loaded[image.url] {
-            return Text(Image(nsImage: Self.sized(loaded, height: image.height))).baselineOffset(image.baselineOffset)
-        }
-        var text = Text(segment.text)
-        if let tip = segment.hoverTip { text = text.customAttribute(HoverTipAttribute(tip: tip)) }
-        if segment.covered { text = text.customAttribute(SpoilerCoverAttribute()) }
-        return text
-    }
-
-    /// Joined by interpolation (`Text + Text` is deprecated on macOS 26), pairwise so the nesting
-    /// stays logarithmic in the segment count.
-    static func join(_ texts: [Text]) -> Text {
-        var level = texts
-        while level.count > 1 {
-            level = stride(from: 0, to: level.count, by: 2).map { i in
-                i + 1 < level.count ? Text("\(level[i])\(level[i + 1])") : level[i]
-            }
-        }
-        return level.first ?? Text(verbatim: "")
-    }
-
-    /// An emoji image scaled to `height`, at most 4:1 wide.
-    static func sized(_ image: NSImage, height: CGFloat) -> NSImage {
-        let copy = (image.copy() as? NSImage) ?? image
-        let aspect = image.size.height > 0 ? min(image.size.width / image.size.height, 4) : 1
-        copy.size = NSSize(width: height * aspect, height: height)
-        return copy
-    }
-
-    private func hover(_ phase: HoverPhase) {
-        switch phase {
-        case .active(let point):
-            let hit = frames.tip(at: point)
-            guard hit != armed else { return }
-            armed = hit
-            // At once, as v2's text views do (TooltipStyle).
-            shown = hit
-        case .ended:
-            armed = nil
-            shown = nil
-        }
     }
 }
 
@@ -253,23 +161,42 @@ private extension MarkdownInline {
 }
 
 /// A paragraph's inlines: one `ParagraphView`, or a vertical stack when blocks sit inside it.
+/// `leaf` numbers its first text view; parts at or past the view limit are left to the remainder.
 struct InlineFlow: View {
     let inlines: [MarkdownInline]
     var style = InlineStyle()
     let text: MarkdownText
+    var leaf = 0
 
     var body: some View {
+        let parts = InlinePart.paragraph(inlines, style: style)
+        let starts = Self.starts(parts, from: leaf)
         VStack(alignment: .leading, spacing: T.Spacing.xs) {
-            ForEach(Array(InlinePart.paragraph(inlines, style: style).enumerated()), id: \.offset) { _, part in
+            ForEach(Array(parts.enumerated()).filter { starts[$0.offset] < TextLeaves.limit }, id: \.offset) { index, part in
                 switch part {
                 case .inlines(let run):
-                    ParagraphView { [text, style] context in text.segments(run, style: style, context: context) }
+                    ParagraphView(size: text.size, weight: text.weight, participant: starts[index]) { [text, style] context in
+                        text.segments(run, style: style, context: context)
+                    }
                 case .block(let block, let blockStyle):
                     SpoilerCover(hidden: blockStyle.hiddenSpoiler(revealed: text.revealed)) {
-                        BlockView(block: block, style: blockStyle, text: text)
+                        BlockView(block: block, style: blockStyle, text: text, leaf: starts[index])
                     }
                 }
             }
+        }
+    }
+
+    static func starts(_ parts: [InlinePart], from first: Int) -> [Int] {
+        var next = first
+        return parts.map { part in
+            defer {
+                switch part {
+                case .inlines: next += 1
+                case .block(let block, _): next += TextLeaves.count(block)
+                }
+            }
+            return next
         }
     }
 }
@@ -319,6 +246,9 @@ final class EmojiImages {
     nonisolated static func fetchable(_ url: URL) -> Bool {
         url.scheme == "https" && url.host() == "cdn.discordapp.com"
     }
+
+    /// Test seam: an image for `url` without any fetch.
+    func insert(_ image: NSImage, for url: URL) { loaded[url] = image }
 
     func load(_ url: URL) {
         guard Self.fetchable(url), started.insert(url).inserted else { return }
