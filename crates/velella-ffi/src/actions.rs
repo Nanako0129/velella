@@ -1,8 +1,8 @@
 //! The message-menu REST actions across FFI (menu plan F2). Inputs are closed types (S-13): ids
 //! as `u64`, enums for location, reaction type, saved-message source and ack flags, `due_at` as
 //! integer milliseconds. Thread preconditions and guild ids are computed in core from current
-//! state, never passed from Swift. Each call returns success or a typed `ActionError` with fixed
-//! text; the token, MFA tickets and MFA tokens stay in core.
+//! state, never passed from Swift. Each call returns success or a typed `ActionError`; the token,
+//! MFA tickets and MFA tokens stay in core.
 use crate::{runtime, SessionHandle};
 use std::fmt;
 use std::future::Future;
@@ -86,8 +86,10 @@ pub enum ApiErrorCode {
     Other,
 }
 
-/// Typed failures. `Debug` and `Display` (Swift's descriptions) are fixed text: no server
-/// message, no challenge.
+/// Typed failures. The Rust `Debug` and `Display` below are fixed text (no server message, no
+/// challenge). They do not reach Swift: UniFFI's generated Swift `errorDescription` is
+/// `String(reflecting: self)`, which includes the associated values (`message`, the WebAuthn
+/// `challenge`), so Swift callers must never log an `ActionError`'s description.
 #[derive(uniffi::Error)]
 pub enum ActionError {
     Unauthorized,

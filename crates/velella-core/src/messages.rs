@@ -1544,11 +1544,14 @@ impl SessionHandle {
     }
 
     /// Sends `content` to `channel_id` when that is the open channel, with a local echo and a
-    /// fresh nonce; never retried. Returns `None` (nothing sent) for an empty or whitespace-only
-    /// text, before READY, or when `channel_id` is not the open channel. The outcome shows in the
+    /// fresh nonce. Retried only when the request provably never reached Discord (D11: the
+    /// connection failed to open, or 522 / 523), with the same body and nonce. Returns `None`
+    /// (nothing sent) for an empty or whitespace-only text, before READY, or when `channel_id` is
+    /// not the open channel. The outcome shows in the
     /// snapshot: the echo is replaced by the real message, or marked failed with fixed text. With
     /// `reply_to` the message is a reply to that message of the same channel (the echo carries its
-    /// preview when buffered). Must be called inside a runtime context.
+    /// preview when buffered) and names the channel's guild from current state (none in DMs).
+    /// Must be called inside a runtime context.
     pub fn send_message(
         &self,
         channel_id: u64,
@@ -1560,12 +1563,13 @@ impl SessionHandle {
         }
         let state = self.snapshot();
         let me = state.users.get(&state.user_id?)?.clone();
+        let guild_id = crate::rest_actions::guild_of(&state, channel_id);
         let store = self.messages();
         let (epoch, nonce) = store.begin_send(channel_id, &content, me, reply_to)?;
         Some(tokio::spawn(async move {
             let result = store
                 .rest
-                .create_message(channel_id, &content, &nonce, reply_to)
+                .create_message(channel_id, guild_id, &content, &nonce, reply_to)
                 .await;
             store.finish_send(epoch, &nonce, result);
         }))

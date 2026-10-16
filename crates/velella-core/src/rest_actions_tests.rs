@@ -392,7 +392,9 @@ async fn sends_follow_the_official_body_order_and_context() {
         .await
         .unwrap();
     rest.forward_comment(6, "look", "N6", true).await.unwrap();
-    rest.create_message(5, "old", "N7", Some(30)).await.unwrap();
+    rest.create_message(5, Some(9), "old", "N7", Some(30))
+        .await
+        .unwrap();
     let r = requests(&mock);
     let to = |c: u64| format!("POST /api/v9/channels/{c}/messages");
     check(
@@ -434,7 +436,7 @@ async fn sends_follow_the_official_body_order_and_context() {
     check(
         &r[6],
         &to(5),
-        r#"{"mobile_network_type":"unknown","content":"old","nonce":"N7","tts":false,"message_reference":{"channel_id":"5","message_id":"30"},"flags":0}"#,
+        r#"{"mobile_network_type":"unknown","content":"old","nonce":"N7","tts":false,"message_reference":{"guild_id":"9","channel_id":"5","message_id":"30"},"flags":0}"#,
         Some(CHAT_INPUT),
     );
 }
@@ -1578,4 +1580,22 @@ async fn out_of_date_or_400_discards_the_change_and_reloads_without_retrying() {
     let r = requests(&mock);
     assert_eq!(r.len(), 3);
     assert!(r[2].line.starts_with("GET "));
+}
+
+/// The guild a send or forward names comes from current state: a guild channel's guild, none
+/// for a DM or an unknown channel (§18.4: `guild_id` omitted in DMs).
+#[test]
+fn guild_of_reads_the_channels_guild_from_state() {
+    let mut s = State::default();
+    assert!(s.apply(
+        "READY",
+        &serde_json::json!({
+            "user": {"id": "1", "username": "me"},
+            "guilds": [{"id": "100", "name": "g", "channels": [{"id": "10", "type": 0, "name": "general"}]}],
+            "private_channels": [{"id": "500", "type": 1, "recipient_ids": ["2"]}],
+        })
+    ));
+    assert_eq!(crate::rest_actions::guild_of(&s, 10), Some(100));
+    assert_eq!(crate::rest_actions::guild_of(&s, 500), None);
+    assert_eq!(crate::rest_actions::guild_of(&s, 999), None);
 }

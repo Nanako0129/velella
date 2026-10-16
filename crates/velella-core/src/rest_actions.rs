@@ -165,7 +165,7 @@ pub fn thread_state(_state: &State, _channel_id: u64) -> ThreadState {
 
 /// The guild a channel or thread belongs to, from current state; `None` for DMs and unknown
 /// channels.
-fn guild_of(state: &State, channel_id: u64) -> Option<u64> {
+pub(crate) fn guild_of(state: &State, channel_id: u64) -> Option<u64> {
     state
         .guilds
         .iter()

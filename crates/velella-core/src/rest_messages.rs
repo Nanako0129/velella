@@ -108,17 +108,19 @@ impl Rest {
             .await
     }
 
-    /// The existing send (its caller has no guild id or mention toggle yet): a reply pings its
-    /// author and carries no `guild_id`. Slice B moves the caller to `send_message`.
+    /// The composer's send (`SessionHandle::send_message`): a reply pings its author (the
+    /// composer has no mention toggle until slice B) and names `guild_id`, the channel's guild
+    /// from state (`None` in DMs, so the key is omitted, §18.4).
     pub(crate) async fn create_message(
         &self,
         channel_id: u64,
+        guild_id: Option<u64>,
         content: &str,
         nonce: &str,
         reply_to: Option<u64>,
     ) -> Result<Value, RestError> {
         let reply = reply_to.map(|message_id| Reply {
-            guild_id: None,
+            guild_id,
             message_id,
             mention: true,
         });

@@ -1313,6 +1313,29 @@ mod messages_live {
             [(11, false), (12, false), (14, false)]
         );
 
+        // A reply in this guild channel names the channel's guild from state (§18.4).
+        rig.handle
+            .send_message(20, "re".into(), Some(11))
+            .unwrap()
+            .await
+            .unwrap();
+        let reply = mock
+            .requests()
+            .into_iter()
+            .filter(|r| r.starts_with("POST"))
+            .nth(1)
+            .unwrap();
+        let body = reply.split("\r\n\r\n").nth(1).unwrap();
+        assert!(
+            body.contains(
+                r#""message_reference":{"guild_id":"10","channel_id":"20","message_id":"11"}"#
+            ),
+            "{body}"
+        );
+        // The echo (4 rows) gives way to the answer, which the mock gives as message 14 again.
+        until(&mut rx, |s| s.rows.len() == 4).await;
+        until(&mut rx, |s| s.rows.len() == 3).await;
+
         // Leaving ends the deliveries.
         drop(sub);
         conn.send(dispatch(8, "MESSAGE_CREATE", json!({

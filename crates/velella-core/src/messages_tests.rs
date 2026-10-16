@@ -704,7 +704,7 @@ async fn sends_post_the_exact_body_with_a_fresh_nonce_each() {
         // The mock answers in order: the GET, then each POST.
         let result = store
             .rest
-            .create_message(5, "hi", &nonce, None)
+            .create_message(5, None, "hi", &nonce, None)
             .await
             .map(|_| reply(id, &nonce));
         store.finish_send(epoch, &nonce, result);
@@ -735,7 +735,7 @@ async fn a_post_500_sends_one_request_and_marks_the_echo_failed() {
     let epoch = store.open(5);
     settled(&store, epoch).await;
     let (_, nonce) = store.begin_send(5, "hi", me(), None).unwrap();
-    let result = store.rest.create_message(5, "hi", &nonce, None).await;
+    let result = store.rest.create_message(5, None, "hi", &nonce, None).await;
     store.finish_send(epoch, &nonce, result);
     assert_eq!(mock.count(), 2, "the POST was retried");
     let s = now(&store, epoch);
@@ -757,7 +757,7 @@ async fn a_captcha_answer_fails_with_the_official_app_text() {
     let epoch = store.open(5);
     settled(&store, epoch).await;
     let (_, nonce) = store.begin_send(5, "hi", me(), None).unwrap();
-    let result = store.rest.create_message(5, "hi", &nonce, None).await;
+    let result = store.rest.create_message(5, None, "hi", &nonce, None).await;
     store.finish_send(epoch, &nonce, result);
     assert_eq!(mock.count(), 2);
     assert_eq!(
