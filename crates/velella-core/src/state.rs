@@ -156,6 +156,9 @@ pub struct State {
     /// Raw `apex_experiments` objects for slice X, in arrival order: READY's, then each
     /// STATE_UPDATE's (each overwrites the units it lists). Rebuilt by READY.
     pub apex_experiments: Vec<Value>,
+    /// Slice X: legacy experiments, guild units and info, user flags, session overrides (see
+    /// `experiments.rs`). Rebuilt by READY.
+    pub(crate) experiments: crate::experiments::Experiments,
 }
 
 /// STATE_UPDATEs kept after READY's entry; older ones are dropped first.
@@ -595,6 +598,9 @@ impl State {
             "STATE_UPDATE" => self.state_update(d),
             "VOICE_STATE_UPDATE_BATCH" => self.voice_batch(d),
             "PASSIVE_UPDATE_V2" => self.passive_update_v2(d),
+            "EXPERIMENT_SESSION_OVERRIDE_CREATE" => self.session_override(d, true),
+            "EXPERIMENT_SESSION_OVERRIDE_DELETE" => self.session_override(d, false),
+            "USER_UPDATE" => self.user_flags_update(d),
             _ => {
                 known = false;
                 false
@@ -679,6 +685,7 @@ impl State {
         if let Some(a) = d.get("apex_experiments").filter(|a| a.is_object()) {
             self.apex_experiments.push(a.clone());
         }
+        self.experiments.ready(d);
         true
     }
 
@@ -914,6 +921,7 @@ impl State {
     }
 
     fn guild_create(&mut self, d: &Value) -> bool {
+        self.experiments.guild(d);
         if is_partial(d) {
             return self.partial_guild_create(d);
         }

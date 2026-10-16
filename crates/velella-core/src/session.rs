@@ -10,8 +10,13 @@
 //! Logging policy: tracing records op codes and event names only, never payloads or the token.
 use crate::{
     compression::{DecodeError, Decoder, MAX_GATEWAY_WIRE},
+    experiments::{Gate, MenuGate},
     gateway::{backoff, close_action, jitter_ms, member_frames, validated_resume_url, CloseAction},
-    identify::{self, normal_capabilities, now_ms, AppState, Identity, Launch, Shape, GATEWAY_URL},
+    identify::{
+        self, normal_capabilities, now_ms, obfuscated_capabilities, AppState, Identity, Launch,
+        Shape, GATEWAY_URL,
+    },
+    identity_fetch::BUILTIN_PAIR,
     identity_store::{HeartbeatSession, HEARTBEAT_SESSION_TTL_MS},
     local_presence::{local_presence, EmojiLookup, LocalPresence},
     messages::MessageStore,
@@ -537,6 +542,7 @@ impl Session {
             account: options.expected_user,
             fresh_token: options.expected_user.is_none(),
             identity_fixed: false,
+            obfuscated_capabilities: obfuscated_capabilities(BUILTIN_PAIR),
             heartbeat_session: None,
             awaiting_ack: false,
             ready_extras: None,
@@ -612,6 +618,9 @@ struct Task {
     fresh_token: bool,
     /// The identity base was fixed with the launch's resolved values (first IDENTIFY only).
     identity_fixed: bool,
+    /// The capabilities a normal IDENTIFY sends while the obfuscation experiment is Enabled (D14),
+    /// from the same resolved pair as the base's normal value.
+    obfuscated_capabilities: u64,
     heartbeat_session: Option<HeartbeatSession>,
     awaiting_ack: bool,
     /// READY's identity fields, read before `State` consumes the payload.
@@ -700,6 +709,7 @@ impl Task {
                 };
                 self.identity
                     .fix(resolved.build, normal_capabilities(resolved.pair));
+                self.obfuscated_capabilities = obfuscated_capabilities(resolved.pair);
                 if resolved.fetch_failed && launch.notice_once(false) {
                     self.notice(IdentityNotice::IdentityFetchFailed);
                 }
@@ -829,7 +839,15 @@ impl Task {
         let focused = self.activity_rx.borrow().focused == Some(true);
         let derived = self.account.and_then(|u| store.qos_derived(u));
         let qos = identify::qos_token(focused, derived.as_deref());
-        identify::identify(
+        // D14: the obfuscation variant only when the experiment is known Enabled from an earlier
+        // READY of this session (a re-IDENTIFY after an invalid session); Disabled and Unknown
+        // (no READY yet, a new session) send the normal value.
+        let obfuscated = self
+            .shared
+            .snapshot()
+            .menu_gate(MenuGate::ChannelObfuscation, None)
+            == Gate::Enabled;
+        identify::identify_with(
             token,
             &self.identity,
             Shape::Normal {
@@ -838,6 +856,7 @@ impl Task {
                 presence: presence.as_ref(),
                 qos_token: Some(&qos),
             },
+            obfuscated.then_some(self.obfuscated_capabilities),
         )
     }
 

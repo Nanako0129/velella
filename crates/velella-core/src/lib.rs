@@ -4,6 +4,7 @@
 //! runtime. Nothing here owns a runtime.
 mod compression;
 pub mod embeds;
+mod experiments;
 mod frecency_proto;
 mod gateway;
 mod guild_settings;
@@ -36,6 +37,8 @@ mod typing;
 mod voice;
 
 #[cfg(test)]
+mod experiments_tests;
+#[cfg(test)]
 mod fixture_tests;
 #[cfg(test)]
 mod member_list_tests;
@@ -54,6 +57,7 @@ mod sidebar_state_tests;
 #[cfg(test)]
 mod sidebar_tests;
 
+pub use experiments::{BookmarkLimits, Gate, MenuGate};
 pub use identify::{Launch, LaunchConfig, USER_AGENT};
 pub use member_list::{member_sections, MemberListEntry, MemberListSection, MemberListStatus};
 pub use messages::{

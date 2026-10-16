@@ -1778,6 +1778,36 @@ mod identity {
         );
     }
 
+    /// D14: a normal IDENTIFY sends the obfuscation variant only when an earlier READY of the
+    /// session left `2026-02-private-channel-hiding` Enabled. The fast-connect IDENTIFY, a normal
+    /// one before any READY (Unknown), and a Disabled variant all send the normal value.
+    #[tokio::test]
+    async fn obfuscation_capabilities_follow_the_experiment_on_a_reidentify() {
+        for (variant, expected) in [(1, 1_767_421), (2, 1_767_421), (3, 1_734_653)] {
+            let mut rig = Rig::start_with(opts(&launch(false), None)).await;
+            let mut c1 = Conn::accept(&rig.initial).await;
+            c1.hello(30_000).await;
+            assert_eq!(identify(&mut c1).await["d"]["capabilities"], 1_734_653);
+            c1.close(4009).await;
+            let mut c2 = Conn::accept(&rig.initial).await;
+            c2.hello(30_000).await;
+            assert_eq!(identify(&mut c2).await["d"]["capabilities"], 1_734_653);
+            let apex = json!({"assignments": {"1": {"1": {
+                "evaluation_id": "e",
+                "assignments": [[764_569_958u64, variant, 0, 1, variant]]
+            }}}});
+            c2.send(ready_with(json!({"apex_experiments": apex}))).await;
+            rig.ready_event().await;
+            c2.send(json!({"op": 9, "d": false})).await;
+            let mut c3 = Conn::accept(&rig.initial).await;
+            c3.hello(30_000).await;
+            let again = identify(&mut c3).await;
+            assert_eq!(again["d"]["capabilities"], expected, "variant {variant}");
+            // Only the capabilities differ from a normal IDENTIFY: the shape is the same.
+            assert_eq!(again["d"]["properties"]["is_fast_connect"], false);
+        }
+    }
+
     /// Op 40 with `qos` null until the first activity report, then the report; a gateway op 1 is
     /// answered with op 40. Op 1 never goes out.
     #[tokio::test]
