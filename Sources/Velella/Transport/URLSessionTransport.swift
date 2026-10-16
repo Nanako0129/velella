@@ -323,9 +323,11 @@ final class Upgrade: TaskState, @unchecked Sendable {
 
 /// One open WebSocket, as core's `WebSocketConnection`.
 final class WebSocketSocket: WebSocketConnection, @unchecked Sendable {
-    // @unchecked: immutable references to thread-safe objects.
+    // @unchecked: immutable references to thread-safe objects; `closedByClient` is behind `lock`.
     private let task: URLSessionWebSocketTask
     private let upgrade: Upgrade
+    private let lock = NSLock()
+    private var closedByClient = false
 
     init(task: URLSessionWebSocketTask, upgrade: Upgrade) {
         self.task = task
@@ -359,15 +361,21 @@ final class WebSocketSocket: WebSocketConnection, @unchecked Sendable {
         }
     }
 
-    /// One message, or the end: a close code only when a close frame arrived (T-6), from the
-    /// delegate's record or the task's own (it sets it from the received frame).
+    /// One message, or the end. A close code is reported only for a close frame the server sent
+    /// (T-6). URLSession fails the pending receive before it calls `didCloseWith`, so at that
+    /// moment the delegate's record is usually still empty while the task's `closeCode` is
+    /// already set from the received frame; the record is used when it did arrive first. The
+    /// task's `closeCode` also holds a code the client sent itself, so once `close(code:)` ran the
+    /// end is reported as lost, never as that code. (A server close frame racing the client's own
+    /// close is then reported as lost too; core is already closing.)
     func receive(_ handler: @escaping @Sendable (ReceivedMessage) -> Void) {
-        task.receive { [task, upgrade] result in
+        task.receive { [self] result in
             switch result {
             case .success(.string(let text)): handler(.text(text))
             case .success(.data(let data)): handler(.binary(data))
             case .success: handler(.lost)
             case .failure:
+                guard !lock.withLock({ closedByClient }) else { return handler(.lost) }
                 let code = upgrade.receivedCloseCode
                     ?? (task.closeCode != .invalid ? UInt16(clamping: task.closeCode.rawValue) : nil)
                 handler(code.map(ReceivedMessage.closed) ?? .lost)
@@ -380,6 +388,7 @@ final class WebSocketSocket: WebSocketConnection, @unchecked Sendable {
     }
 
     func close(code: UInt16) {
+        lock.withLock { closedByClient = true }
         task.cancel(with: URLSessionWebSocketTask.CloseCode(rawValue: Int(code)) ?? .normalClosure, reason: nil)
     }
 }
@@ -451,6 +460,13 @@ extension HTTPOutcome: CustomStringConvertible, CustomDebugStringConvertible, Cu
     }
     var debugDescription: String { description }
     var customMirror: Mirror { Mirror(self, children: [], displayStyle: .enum) }
+}
+
+/// Holds response headers and the body while they arrive.
+extension Exchange: CustomStringConvertible, CustomDebugStringConvertible, CustomReflectable {
+    var description: String { "Exchange([REDACTED])" }
+    var debugDescription: String { description }
+    var customMirror: Mirror { Mirror(self, children: [], displayStyle: .class) }
 }
 
 extension ReceivedMessage: CustomStringConvertible, CustomDebugStringConvertible, CustomReflectable {

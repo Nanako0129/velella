@@ -408,6 +408,55 @@ async fn a_replaced_token_is_used_by_later_requests() {
     assert!(!requests[1].contains(MARKER));
 }
 
+/// The decoded X-Super-Properties JSON text of one recorded request.
+fn raw_props(headers: &[(String, String)]) -> String {
+    let raw = &headers
+        .iter()
+        .find(|(k, _)| k == "x-super-properties")
+        .unwrap()
+        .1;
+    String::from_utf8(
+        base64::engine::general_purpose::STANDARD
+            .decode(raw)
+            .unwrap(),
+    )
+    .unwrap()
+}
+
+/// The keys of a JSON object's top level, in the order written (serde_json's `Value` sorts).
+fn top_level_keys(json: &str) -> Vec<String> {
+    let (mut keys, mut depth, mut current, mut in_string, mut escaped) =
+        (Vec::new(), 0, String::new(), false, false);
+    let mut last_string = None;
+    for c in json.chars() {
+        if in_string {
+            match (escaped, c) {
+                (true, _) => escaped = false,
+                (false, '\\') => escaped = true,
+                (false, '"') => {
+                    in_string = false;
+                    last_string = Some(std::mem::take(&mut current));
+                    continue;
+                }
+                _ => {}
+            }
+            current.push(c);
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            '{' | '[' => depth += 1,
+            '}' | ']' => depth -= 1,
+            ':' if depth == 1 => keys.extend(last_string.take()),
+            _ => {}
+        }
+        if c != ':' && !c.is_whitespace() && c != '"' {
+            last_string = None;
+        }
+    }
+    keys
+}
+
 /// The identity's closed set of extras is read when each request is built: unset, nothing
 /// changes; set, the super-properties carry them and `X-Installation-ID` appears.
 #[tokio::test]
@@ -454,6 +503,27 @@ async fn identity_extras_reach_the_headers_at_send_time() {
             .map(|(_, v)| v.as_str()),
         Some("inst.1")
     );
+    // Exact key order on the wire: the base keys as IDENTIFY sends them, extras appended.
+    let base_keys = [
+        "os",
+        "browser",
+        "device",
+        "system_locale",
+        "browser_user_agent",
+        "browser_version",
+        "os_version",
+        "referrer",
+        "referring_domain",
+        "referrer_current",
+        "referring_domain_current",
+        "release_channel",
+        "client_build_number",
+        "client_event_source",
+    ];
+    assert_eq!(top_level_keys(&raw_props(&before)), base_keys);
+    let mut with_extras = base_keys.to_vec();
+    with_extras.extend(["client_app_state", "client_heartbeat_session_id"]);
+    assert_eq!(top_level_keys(&raw_props(&after)), with_extras);
     let mut extended = props(&after);
     assert_eq!(extended["client_app_state"], "focused");
     assert_eq!(extended["client_heartbeat_session_id"], "hb-1");

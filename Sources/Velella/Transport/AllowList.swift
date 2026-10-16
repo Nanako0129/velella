@@ -60,12 +60,23 @@ struct AllowList: Sendable {
         }
         guard hostOK else { return false }
         let path = url.path(percentEncoded: true)
+        // A dot segment (plain or percent-encoded) could be resolved into another path by the
+        // platform or a server, after this check passed.
+        guard !path.split(separator: "/", omittingEmptySubsequences: false).contains(where: isDotSegment) else {
+            return false
+        }
         let query = url.query(percentEncoded: true)
         return switch rule.path {
         case .prefix(let prefix): path.hasPrefix(prefix)
         case .exact(let exact, let allowsQuery): path == exact && (allowsQuery || query == nil)
         case .fastConnect: query == nil && isFastConnect(path)
         }
+    }
+
+    /// `.` or `..`, each dot possibly written `%2e` / `%2E`.
+    private static func isDotSegment(_ segment: Substring) -> Bool {
+        let plain = segment.lowercased().replacingOccurrences(of: "%2e", with: ".")
+        return plain == "." || plain == ".."
     }
 
     private static func isGatewayLabel(_ host: String) -> Bool {

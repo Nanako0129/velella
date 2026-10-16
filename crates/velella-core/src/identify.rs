@@ -225,24 +225,36 @@ impl Identity {
         self.properties.browser_user_agent
     }
 
-    /// The base properties, plus `client_app_state` and `client_heartbeat_session_id` once set.
+    /// The base properties in their own key order, then `client_app_state` and
+    /// `client_heartbeat_session_id` (in that order) once set. Appended to the serialized object
+    /// rather than re-serialized through `serde_json::Value`, which would sort the keys.
     pub(crate) fn super_properties(&self) -> String {
         let extras = self.extras();
         if extras.client_app_state.is_none() && extras.client_heartbeat_session_id.is_none() {
             return self.super_properties.clone();
         }
-        let mut json = serde_json::to_value(&self.properties).expect("properties serialize");
+        let mut json = serde_json::to_string(&self.properties).expect("properties serialize");
+        json.pop(); // the closing brace of a non-empty object
+        let mut append = |key: &str, value: &str| {
+            json.push_str(&format!(
+                ",\"{key}\":{}",
+                serde_json::to_string(value).expect("string serializes")
+            ));
+        };
         if let Some(state) = extras.client_app_state {
-            json["client_app_state"] = match state {
-                AppState::Focused => "focused",
-                AppState::Unfocused => "unfocused",
-            }
-            .into();
+            append(
+                "client_app_state",
+                match state {
+                    AppState::Focused => "focused",
+                    AppState::Unfocused => "unfocused",
+                },
+            );
         }
         if let Some(id) = &extras.client_heartbeat_session_id {
-            json["client_heartbeat_session_id"] = id.as_str().into();
+            append("client_heartbeat_session_id", id);
         }
-        base64::engine::general_purpose::STANDARD.encode(json.to_string())
+        json.push('}');
+        base64::engine::general_purpose::STANDARD.encode(json)
     }
 
     pub(crate) fn locale(&self) -> &str {

@@ -89,37 +89,67 @@ func header(_ name: String, in head: String) -> [String] {
 
 // MARK: Body caps
 
-/// The declared length over the cap stops it at once; an undeclared body is cut at cap + 1, so
-/// the server cannot finish writing; a body exactly at the cap arrives whole.
+/// How far past the cap the server may get before its writes fail: what was in flight when the
+/// client cancelled (measured about cap + 56-80 KiB), with a wide margin.
+let capSlack = 512 << 10
+
+/// The server writes a body far over the cap slowly (16 KiB every 2 ms) until a write fails, so
+/// the kernel's socket buffers (4 MiB each way here) cannot absorb it and what the server
+/// managed to write shows where the client stopped reading. Returns the body bytes written.
+func slowBody(_ peer: Peer, total: Int, chunked: Bool) -> Int {
+    let piece = Data(repeating: 0x61, count: 16 << 10)
+    var written = 0
+    while written < total {
+        let frame = chunked ? Data(String(format: "%x\r\n", piece.count).utf8) + piece + Data("\r\n".utf8) : piece
+        guard peer.write(frame) else { break }
+        written += piece.count
+        Thread.sleep(forTimeInterval: 0.002)
+    }
+    return written
+}
+
+/// A declared length over the cap stops the body at once; an undeclared one (close-delimited or
+/// chunked) is cut at cap + 1, so the server's writes start failing just past the cap; a body
+/// exactly at the cap arrives whole.
 func capCase(cap: Int) async throws {
-    let full = Box<[Bool]>([])
+    let total = cap + (16 << 20)
+    let written = Box<[String: Int]>([:])
     let server = try TestServer { peer in
         guard let (head, _) = peer.readRequest() else { return }
-        let path = head.split(separator: " ")[1]
+        let path = String(head.split(separator: " ")[1])
         switch path {
         case "/api/v9/declared":
-            peer.write(httpResponse(body: Data(count: cap + 1)))
+            peer.write(httpResponse(headers: ["Content-Length: \(total)"], length: false))
+            let n = slowBody(peer, total: total, chunked: false)
+            written.update { $0[path] = n }
         case "/api/v9/streamed":
-            // No length: the body ends at close. Far more than the cap, in chunks.
             peer.write(httpResponse(length: false))
-            var wrote = true
-            for _ in 0..<64 where wrote { wrote = peer.write(Data(count: max(cap / 4, 16 << 10))) }
-            full.update { $0.append(wrote) }
+            let n = slowBody(peer, total: total, chunked: false)
+            written.update { $0[path] = n }
+        case "/api/v9/chunked":
+            peer.write(httpResponse(headers: ["Transfer-Encoding: chunked"], length: false))
+            let n = slowBody(peer, total: total, chunked: true)
+            written.update { $0[path] = n }
         default:
             peer.write(httpResponse(body: Data(repeating: 0x61, count: cap)))
         }
     }
     let transport = URLSessionTransport(allowList: local(server.port))
     let base = "http://127.0.0.1:\(server.port)/api/v9/"
-    let declared = await transport.perform(try request(base + "declared", cap: UInt64(cap)))
-    guard case .response(200, _, let body, true) = declared, body.isEmpty else { Issue.record("\(declared)"); return }
-    let streamed = await transport.perform(try request(base + "streamed", cap: UInt64(cap)))
-    guard case .response(200, _, let body2, true) = streamed, body2.isEmpty else { Issue.record("\(streamed)"); return }
-    #expect(await eventually { full.get.count == 1 })
-    #expect(full.get == [false], "the server wrote the whole oversized body: the client kept reading")
+    for (name, limit) in [("declared", capSlack), ("streamed", cap + capSlack), ("chunked", cap + capSlack)] {
+        let outcome = await transport.perform(try request(base + name, cap: UInt64(cap), deadlineMs: 30_000))
+        guard case .response(200, _, let body, true) = outcome, body.isEmpty else {
+            Issue.record("\(name): \(outcome)"); continue
+        }
+        let path = "/api/v9/\(name)"
+        #expect(await eventually(30) { written.get[path] != nil }, "\(name): the server never stopped writing")
+        let n = written.get[path] ?? total
+        #expect(n < limit, "\(name): the server wrote \(n) bytes; the client kept reading past the cap")
+        #expect(n < total)
+    }
     let atCap = await transport.perform(try request(base + "exact", cap: UInt64(cap)))
-    guard case .response(200, _, let body3, false) = atCap else { Issue.record("\(atCap)"); return }
-    #expect(body3.count == cap)
+    guard case .response(200, _, let body, false) = atCap else { Issue.record("\(atCap)"); return }
+    #expect(body.count == cap)
 }
 
 @Test func anOverCapAPIBodyIsStopped() async throws { try await capCase(cap: 4 << 20) }
@@ -312,23 +342,40 @@ func openSocket(_ transport: URLSessionTransport, port: UInt16, max: UInt64 = 64
 /// T-4: core's close code (4000 keeps a Discord session resumable) reaches the server, and the
 /// upgrade carries core's User-Agent.
 @Test func theClientsCloseCodeAndUserAgentReachTheServer() async throws {
-    let seen = Box<(head: String, close: Data?)>(("", nil))
+    let seen = Box<(head: String, close: Data?, done: Bool)>(("", nil, false))
     let server = try TestServer { peer in
         guard let (head, _) = peer.readRequest() else { return }
         peer.acceptWebSocket(head)
         seen.update { $0.head = head }
+        peer.setTimeout(30)
         while let frame = peer.readFrame() {
-            if frame.opcode == 0x8 { seen.update { $0.close = frame.payload }; return }
+            if frame.opcode == 0x8 { seen.update { $0.close = frame.payload }; break }
         }
+        // Set once the server read the close frame or the connection ended without one.
+        seen.update { $0.done = true }
     }
     let transport = URLSessionTransport(allowList: local(server.port))
     guard let socket = try await openSocket(transport, port: server.port) else { return }
     let sent = await withCheckedContinuation { c in socket.send(.string("{\"op\":1,\"d\":null}")) { c.resume(returning: $0) } }
     #expect(sent == nil)
     socket.close(code: 4000)
-    #expect(await eventually { seen.get.close != nil })
+    #expect(await eventually(35) { seen.get.done }, "the server never saw the connection end")
     #expect(seen.get.close.map { Array($0.prefix(2)) } == [0x0F, 0xA0])
     #expect(header("user-agent", in: seen.get.head) == [ua])
+}
+
+/// T-6: only a close frame the server sent is reported as a close. The client's own close(4000)
+/// (which the task's `closeCode` also shows) must not come back as a received 4000.
+@Test func aClientCloseIsNotReportedAsAReceivedClose() async throws {
+    let server = try webSocketServer { peer in
+        peer.setTimeout(30)
+        while let frame = peer.readFrame(), frame.opcode != 0x8 {}
+    }
+    let transport = URLSessionTransport(allowList: local(server.port))
+    guard let socket = try await openSocket(transport, port: server.port) else { return }
+    socket.close(code: 4000)
+    let after = await socket.receive()
+    if case .closed(let code) = after { Issue.record("reported a received close \(code) after the client closed") }
 }
 
 // MARK: Allow-list and URL fidelity
@@ -346,6 +393,35 @@ func openSocket(_ transport: URLSessionTransport, port: UInt16, max: UInt64 = 64
     }
     let ws = await transport.open(try WebSocketRequest(url: "ws://127.0.0.1:\(server.port)/a b", headers: [], maxMessageSize: 1, deadlineMs: 1000))
     guard case .failure(.rejected) = ws else { Issue.record("\(ws)"); return }
+    try await Task.sleep(for: .milliseconds(200))
+    #expect(server.accepted == 0)
+}
+
+/// A dot segment, plain or percent-encoded, is refused for HTTP and WebSocket before anything is
+/// sent: the platform or a server could resolve it into a path the allow-list never saw.
+@Test func aDotSegmentPathIsRejectedAndNothingIsSent() async throws {
+    let server = try TestServer { peer in
+        _ = peer.readRequest()
+        peer.write(httpResponse(body: Data("{}".utf8)))
+    }
+    let transport = URLSessionTransport(allowList: local(server.port))
+    let base = "http://127.0.0.1:\(server.port)"
+    for path in ["/api/v9/../app", "/api/v9/%2e%2e/app", "/api/v9/%2E%2E/app", "/api/v9/./users/@me"] {
+        for auth in [marker, nil] {
+            let outcome = await transport.perform(try request(base + path, auth: auth))
+            guard case .failure(.rejected) = outcome else { Issue.record("\(path): \(outcome)"); continue }
+        }
+    }
+    for path in ["/./?v=9", "/%2e%2e/?v=9"] {
+        let ws = await transport.open(try WebSocketRequest(url: "ws://127.0.0.1:\(server.port)\(path)", headers: [], maxMessageSize: 1, deadlineMs: 1000))
+        guard case .failure(.rejected) = ws else { Issue.record("\(path): \(ws)"); continue }
+    }
+    // The shipped list refuses the same forms against discord.com before anything leaves.
+    for url in ["https://discord.com/api/v9/../app", "https://discord.com/api/v9/%2e%2e/app"] {
+        guard case .failure(.rejected) = await URLSessionTransport().perform(try request(url)) else {
+            Issue.record("\(url) was not refused"); continue
+        }
+    }
     try await Task.sleep(for: .milliseconds(200))
     #expect(server.accepted == 0)
 }
@@ -408,6 +484,14 @@ func openSocket(_ transport: URLSessionTransport, port: UInt16, max: UInt64 = 64
         "https://discord.com.evil.test/api/v9/x": false,
         "https://cdn.discordapp.com/api/v9/x": false,
         "https://gateway.discord.gg/api/v9/x": false,
+        "https://discord.com/api/v9/../app": false,
+        "https://discord.com/api/v9/%2e%2e/app": false,
+        "https://discord.com/api/v9/%2E%2e/app": false,
+        "https://discord.com/api/v9/.%2e/app": false,
+        "https://discord.com/api/v9/./users/@me": false,
+        "https://discord.com/api/v9/%2E/users/@me": false,
+        "https://discord.com/api/v9/users/..": false,
+        "https://discord.com/api/v9/users/...": true,
     ]
     for (url, want) in http { #expect(list.allowsHTTP(URL(string: url)!) == want, "\(url)") }
     let ws = [
@@ -421,6 +505,8 @@ func openSocket(_ transport: URLSessionTransport, port: UInt16, max: UInt64 = 64
         "ws://gateway.discord.gg/": false,
         "wss://discord.com/": false,
         "https://gateway.discord.gg/": false,
+        "wss://gateway.discord.gg/./?v=9": false,
+        "wss://gateway.discord.gg/%2e%2e/?v=9": false,
     ]
     for (url, want) in ws { #expect(list.allowsWebSocket(URL(string: url)!) == want, "\(url)") }
     #expect(list.authorizes("https://discord.com/api/v9/users/@me"))
@@ -439,7 +525,12 @@ func openSocket(_ transport: URLSessionTransport, port: UInt16, max: UInt64 = 64
     let ws = try WebSocketRequest(url: "wss://gateway.discord.gg/?\(marker)", headers: [], maxMessageSize: 1, deadlineMs: 1)
     let outcome = HTTPOutcome.response(status: 200, headers: [HttpHeader(name: "X", value: marker)], body: Data(marker.utf8), overCap: false)
     let message = ReceivedMessage.text(marker)
-    let values: [Any] = [req, frame, ws, outcome, message]
+    let exchange = Exchange(cap: 1 << 20)
+    _ = exchange.received(HTTPURLResponse(
+        url: URL(string: "http://127.0.0.1/")!, statusCode: 200, httpVersion: nil, headerFields: ["X-Token": marker]
+    )!)
+    _ = exchange.received(Data(marker.utf8))
+    let values: [Any] = [req, frame, ws, outcome, message, exchange]
     for value in values {
         var dumped = ""
         dump(value, to: &dumped)

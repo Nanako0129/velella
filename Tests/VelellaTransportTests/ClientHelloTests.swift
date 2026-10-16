@@ -128,31 +128,9 @@ let cipherNames: [UInt16: String] = [
     0xC012: "ECDHE_RSA_3DES_EDE_CBC_SHA", 0x000A: "RSA_3DES_EDE_CBC_SHA", 0x5600: "TLS_FALLBACK_SCSV",
 ]
 
-@Test func captureTheTransportClientHello() async throws {
-    let captured = Box<[UInt8]?>(nil)
-    let server = try TestServer { peer in
-        guard let head = peer.take(5) else { return }
-        let length = Int(head[3]) << 8 | Int(head[4])
-        guard let body = peer.take(length) else { return }
-        captured.update { $0 = Array(head) + Array(body) }
-        peer.drop() // abort: no ServerHello, nothing to trust
-    }
-    let list = AllowList(
-        http: [AllowList.Rule(scheme: "https", host: .exact("localhost"), port: Int(server.port), path: .prefix("/api/v9/"))],
-        webSocket: [], authorizedPrefix: "https://localhost:\(server.port)/api/v9/"
-    )
-    let transport = URLSessionTransport(allowList: list)
-    let outcome = await transport.perform(try request("https://localhost:\(server.port)/api/v9/users/@me"))
-    // A handshake that never completed: no request byte was written.
-    guard case .failure(.connectFailed) = outcome else { Issue.record("\(outcome)"); return }
-    guard let bytes = captured.get, let hello = ClientHello(bytes) else { Issue.record("no ClientHello"); return }
-    #expect(hello.sni == "localhost")
-
-    let safari = (NSDictionary(contentsOfFile: "/Applications/Safari.app/Contents/Info.plist")?["CFBundleShortVersionString"] as? String) ?? "unknown"
+func describe(_ hello: ClientHello) -> String {
     let (ja4, raw) = hello.ja4
-    let report = """
-    velella transport ClientHello (URLSessionTransport, ephemeral configuration)
-    captured: \(ISO8601DateFormatter().string(from: Date())) on \(ProcessInfo.processInfo.operatingSystemVersionString), target https://localhost:<port>/
+    return """
     JA4: \(ja4)
     JA4_r: \(raw)
     record version: \(ClientHello.hex(hello.recordVersion)); client_version: \(ClientHello.hex(hello.clientVersion))
@@ -166,11 +144,47 @@ let cipherNames: [UInt16: String] = [
     supported_versions: \(hello.supportedVersions.map { ClientHello.isGrease($0) ? "GREASE" : ClientHello.hex($0) }.joined(separator: ", "))
     ec_point_formats: \(hello.pointFormats.map { String($0) }.joined(separator: ", "))
     compress_certificate: \(hello.compressCertificate.map(ClientHello.hex).joined(separator: ", "))
+    """
+}
+
+/// Records every ClientHello in order: after an aborted handshake URLSession tries once more
+/// (with TLS_FALLBACK_SCSV 0x5600), so the first attempt is the one a real server sees. The JA4
+/// depends on the OS, so it is printed and written, never asserted.
+@Test func captureTheTransportClientHello() async throws {
+    let captured = Box<[[UInt8]]>([])
+    let server = try TestServer { peer in
+        guard let head = peer.take(5) else { return }
+        let length = Int(head[3]) << 8 | Int(head[4])
+        guard let body = peer.take(length) else { return }
+        captured.update { $0.append(Array(head) + Array(body)) }
+        peer.drop() // abort: no ServerHello, nothing to trust
+    }
+    let list = AllowList(
+        http: [AllowList.Rule(scheme: "https", host: .exact("localhost"), port: Int(server.port), path: .prefix("/api/v9/"))],
+        webSocket: [], authorizedPrefix: "https://localhost:\(server.port)/api/v9/"
+    )
+    let transport = URLSessionTransport(allowList: list)
+    let outcome = await transport.perform(try request("https://localhost:\(server.port)/api/v9/users/@me"))
+    // A handshake that never completed: no request byte was written.
+    guard case .failure(.connectFailed) = outcome else { Issue.record("\(outcome)"); return }
+    try await Task.sleep(for: .milliseconds(300))
+    let hellos = captured.get.compactMap(ClientHello.init)
+    guard let first = hellos.first, hellos.count == captured.get.count else { Issue.record("unparsed ClientHello"); return }
+    #expect(first.sni == "localhost")
+
+    let safari = (NSDictionary(contentsOfFile: "/Applications/Safari.app/Contents/Info.plist")?["CFBundleShortVersionString"] as? String) ?? "unknown"
+    var report = """
+    velella transport ClientHello (URLSessionTransport, ephemeral configuration)
+    captured: \(ISO8601DateFormatter().string(from: Date())) on \(ProcessInfo.processInfo.operatingSystemVersionString), target https://localhost:<port>/
+    attempts: \(hellos.count). Attempt 1 is the one that counts (what a server that answers sees); later ones are URLSession's retries after the aborted handshake.
     User-Agent velella sends: \(ua)
     This machine's Safari (Info.plist CFBundleShortVersionString): \(safari)
     Not measured (need a finished handshake): HTTP/2 SETTINGS and frame order, header order, WebSocket upgrade headers.
 
     """
+    for (i, hello) in hellos.enumerated() {
+        report += "--- attempt \(i + 1)\(i == 0 ? " (counts)" : " (retry)") ---\n\(describe(hello))\n\n"
+    }
     let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
     let dir = root.appending(path: "measurement")
     try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
