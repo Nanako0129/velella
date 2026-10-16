@@ -1,0 +1,285 @@
+# velella Full Message Menu and Client Identity Plan (revision 2.5)
+
+Repo: /Users/nanako/side-project/velella, branch `m1`. Builds on `docs/plans/selection.md` (C1's glass menu, N2, W1), `docs/element-map.md` and `docs/parity.md` (rows this wave moves).
+
+**Ground truth.** `refs/discord-ground-truth/menu-requests.md` (git-excluded, absolute path `/Users/nanako/side-project/velella/refs/discord-ground-truth/menu-requests.md`; cited below as §n.m) holds every protocol fact this plan relies on, each with its evidence in the official web client's JavaScript: REST shapes, enums, limits, error codes, menu and hover-bar conditions, permission bits, frecency proto fields. It was produced by static analysis of the bundle the desktop app cached on this machine, plus five public chunks fetched once without authentication (the main entry and the View Reactions and custom-reminder modals). Only facts are taken from it, never code.
+
+The user saw C1's four-item menu and asked for every official item, "全部都要，對齊discord官方原生" (2026-10-16), and set the project rule that velella is a complete client (project `CLAUDE.md`). Decisions the user made on 2026-10-16: request shapes from the official code (D2), frecency read and written (D3), Twemoji everywhere (D4), the main account for live checks (D5), experiment evaluation in core (D7), the thread side panel in this wave (D8), End Poll and Configure with their own features (D9), sends retried only when provably unsent (D11), and, after a survey of other third-party clients (`refs/discord-ground-truth/identify-survey.md`), the client identity aligned with the official web client in this wave (D12-D14).
+
+## Envelope
+
+| Field | Value |
+|---|---|
+| Outcome | Right-clicking a message shows the official menu for that context, item for item, in the official groups and order (§14), and every item works as in the official client. The hover action bar (normal and Shift-expanded, §15) and the focused-message keyboard shortcuts (§14.2) offer the same actions. Unicode emoji render as Twemoji everywhere |
+| Items | G1 Copy; G2 Search with Google; G3 quick reactions (4), Add Reaction › (12 + View More → picker), View Reactions; G4 Edit Message, Reply, Forward, Create Thread; G5 Copy Text, Translate / Revert Translation, Pin / Unpin, Official-message toggle, Bookmark / Remove Bookmark, Remind Me › / Edit Reminder, Apps ›, Resend, Mark Unread, Copy Message Link, View Conversation, Speak / Stop Speaking, View Interaction Info; G6 Remove Reactions ›, Remove All Reactions, Delete Message, Report Message / Report to Discord, report to moderators; G7/G8 Copy Message ID (Developer Mode), media and link items (§14). Hover-only: Publish, View Thread, Retry. With their own waves (D9): End Poll (message types), Configure (server settings) |
+| How it is seen working | For each item the user (or main, announced) acts in velella on a test message in the dev thread and sees the official result, both in velella and in the official client; the reverse (an action taken in the official client) arrives in velella live. The menu is compared per context with the official client side by side (own, other, DM, no permission, with reactions, link, image, selection, thread) |
+| Non-goals | Channel, server and user context menus; composer features beyond the inline editor; polls and join-message settings (D9); voice. Inbox tabs other than Bookmarks and Reminders are in slice I only as far as the Inbox shell needs them; Mentions, Unreads and For You content is the notifications wave (`docs/parity.md`) |
+| Traffic added | Only what the official client sends for the same user action (§1-§13): reactions, edits, deletes, pins, forwards (each notifies its destination), saved messages, interactions, reports, thread creation. Read acks while reading at the official cadence (§8.7-§8.9: at most one POST per channel per 3 s), where velella sends none today. Frecency: one GET at start and a PATCH about every 2 h or when velella goes inactive (§13.9). Each settings-proto PATCH is preceded by one GET of the same type (S-2). At each start one unauthenticated `GET https://discord.com/app` and, when Discord has shipped a new build, one download of its main entry chunk (D12). Existing message sends gain the official `X-Context-Properties` header and `mobile_network_type` field (§17.1), no new requests |
+| Order | Phase 1, alongside N2: **NET** (transport on URLSession) and **PB** (bounded protobuf codec) in two worktrees; the static discoveries **ID-D** and **X-D** run by main (X-D done). Phase 2: **ID** (identity and READY shapes) and **F2** (REST actions). Phase 3: **F1** and **X**. Then **Tw**. After W1, F1 and X: **J**. After J and F2: **A, B, C, D, E, T, S, K** in parallel worktrees. After Tw: **P1**, then A's picker entry. **I, G, H** after their contracts (rev 3). ID lands before 2026-11-16 (channel obfuscation for every user) |
+| Owners | PB, F1, X, Tw, P1, J, T, S: pilotfish:executor. NET, ID, F2, A, B, C, D, E, I, G, H, K: pilotfish:security-executor (writes from the user's account; A, B and C remove content). Any item that writes to the account belongs to a security-executor slice, never to J. Each slice gets a fresh pilotfish:verifier |
+| External actions by agents | None: no network (no Discord, no CDN, no package downloads), no git push, no publishing, no installs, no launching velella or other GUI apps, no real preferences or Keychain. Assets that need downloading (Twemoji) are fetched by main. Every live check is main's or the user's |
+| Checkpoints | One merge commit per slice after its verifier; main merges into m1 and pushes main. `docs/parity.md` updated at the end of the wave |
+| Rollback | `git revert -m 1` per slice. A write misbehaving live is disabled by hiding its item (one line) until fixed; each background writer (E's automatic acks, A's frecency sync) has its own core kill switch (S-9) |
+| Budget | At most 2 executor passes per slice, then main takes over or asks |
+| Stops | An action gated off for the main account; a request shape that cannot be established without a real side effect on others (a submitted report); a live action that hits something other than its target; any captcha, 401 or unexpected 429 during a live check: main stops the slice and asks. Live checks act only on test messages main posted in the dev thread and on reactions placed by the main account (or the alt, when the user picks it for that check); a moderator action on another person's content needs the user's go for that check (S-17) |
+
+## Decisions
+
+| # | Decision | Source |
+|---|---|---|
+| D1 | Items, groups, order, icons, danger colour, visibility, confirms (with Shift skipping them, §3.5, §5.2, §6.5) and toasts follow the official client; the glass panel stays (selection.md D5). Dialogs use official copy and layout on velella's glass/native chrome | User |
+| D2 | Requests match §1-§13 exactly: method, path, query (`location`, `type`, `burst`), body, the per-action retry rules (§1.9, §4.3) and the error handling (§1.9, §6.2, §9.6). velella identifies as the web client (`identify.rs:32`); the web bundle is the reference | User; account safety |
+| D3 | Quick reactions, the picker's Recent and Favorites: settings-proto type 2 (`FrecencyUserSettings`, §13.7), read at start and written back as §13.8-§13.9 do (partial proto with full top-100 maps, unknown fields preserved, round-trip tested); defaults §13.4 | User |
+| D4 | Unicode emoji draw as Twemoji in message text, reactions, the quick row and the picker; names and shortcodes match Discord's; CC-BY 4.0 attribution in `THIRD_PARTY_NOTICES.md` | User |
+| D5 | Live checks run on the main account in the dev thread (guild 1523004250152501341, thread 1556391419621671022); main announces before driving any input | User; standing rules |
+| D6 | Every write names its target captured at menu open (C1's rule): message, channel, emoji, user. No write is retried except where §1.9/§4.3 retry, and never against another target | Security |
+| D7 | Items gated by experiments or feature flags (Translate, View Conversation, report to moderators, Official message, bookmark limits, `tidaWebform` ordering) are shown exactly when the account's evaluation in core says so (slice X) | User |
+| D8 | Create Thread and View Thread open the official thread side panel, built in this wave (slice T) | User |
+| D9 | End Poll joins with poll rendering (message types wave); Configure joins with server settings; both stay listed in `docs/parity.md` | User |
+| D10 | Copy Message ID follows the account's Developer Mode setting (§14, item row), read from the account's settings | Official behaviour |
+| D11 | Message sends (including forwards and their comments) are retried only when the request provably never reached Discord: a connection that failed to establish, or a Cloudflare 522 or 523; the retry sends the byte-identical body with the same nonce and `X-Failed-Requests: N`, as the official retries do. Every other failure stays failed for the user to resend. Deviates from the official `retries:3` (§17.1) to rule out duplicates | User (2026-10-16: 只在確定沒送到時重試) |
+| D12 | IDENTIFY `capabilities` and `client_build_number` come from the official web client at runtime: at start velella fetches `https://discord.com/app`, finds the main entry chunk, and reads the build number and the capabilities literal from it under ID's identity-fetch rules (T-1, T-5, T-7, T-14) (cached by the chunk's hash, so a new download happens only when Discord ships a new build). A capabilities value velella supports is used; an unsupported one keeps the newest supported value and shows a notice in velella so main can add support. Built-in fallbacks: the values measured in §18.7 (build 627798, capabilities 1734653) | User (2026-10-16: 啟動時從 discord.com 抓; 沿用上一個支援的值並提醒) |
+| D13 | REST and the gateway WebSocket run on Apple's URLSession (implemented in Swift behind a core transport trait), so the TLS handshake comes from the system stack instead of rustls; the User-Agent, X-Super-Properties and IDENTIFY claim the Safari version of this machine. Only what NET measures is claimed to match; known remaining differences (cookies, fast-connect, missing super-properties fields) are listed, not called aligned (T-13) | User (2026-10-16: 這波一起做) |
+| D15 | The URLSession transport behaves like Safari for trust and routing: the system proxy applies and every root the system and the user trust is accepted (debugging proxies and MDM roots included). This replaces rustls's webpki-only, no-proxy rule; the doc comments and the proxy test that state the old rule are updated or retired | User (2026-10-16: 跟 Safari 一樣) |
+| D14 | The supported capabilities set starts with 1734653 and the obfuscation variant 1767421 (bit 15, user experiment `2026-02-private-channel-hiding`). 1734653 is sent unless X reports that experiment Enabled (Unknown → 1734653); obfuscated channel objects are handled whichever is sent, since Discord applies obfuscation to every user from 2026-11-16 (T-12) | §18.7; identify-survey.md |
+
+## Slices
+
+| ID | Outcome | Ground truth | Prerequisites | Owner |
+|---|---|---|---|---|
+| NET | Core's HTTP and WebSocket traffic goes through a transport trait implemented in Swift with URLSession; reqwest and tokio-tungstenite leave the core; every rest.rs and session.rs protection stays in core | contract below | none | security-executor |
+| PB | One bounded protobuf codec in `proto.rs`: varints with a length cap, length-delimited fields bounded by the remaining bytes, nesting depth ≤ 16, unknown fields kept for re-encoding; decode and encode of a generic field tree that typed schemas sit on. Tests: truncated input, over-long varint, deep nesting, unknown-field round trip, a synthetic blob round trip | `.proto` wire format | none | executor |
+| ID-D | Static discovery (main): what each capability bit 0-20 changes in READY and the dispatches, from the official client's own handlers; the PreloadedUserSettings fields velella needs (guild folders, Developer Mode, render reactions, and any setting velella reads today from legacy `user_settings`); `auth_token` refresh; the obfuscated channel format; how the web page exposes the build number and capabilities. Output `refs/discord-ground-truth/identify.md` | bundle; identify-survey.md | none | main |
+| ID | IDENTIFY and X-Super-Properties per D12-D14; READY and dispatch parsing for every bit of the supported values (proto settings with guild folders, guild shape changes, reaction batches, token refresh); obfuscated channels; the unsupported-capabilities notice. Rev 3's contract must carry T-1 (identity fetch outside Rest, two fixed URL forms, no Authorization or Discord headers), T-5 (caps from the measured decoded size), T-7 (typed and cross-checked parse, cache of values only, re-validated on load, one identity snapshot per session), T-8 (token refresh: `Token::new` validation, atomic swap after READY, generation-checked `SecItemUpdate`), T-11 (type 1 decoded on PB's codec) and T-14 (fetch failure and timing); it also adds `X-Installation-ID` from READY `apex_experiments.installation` to every API request, as the logged-in web client does (experiments.md §5) | ID-D; contract in rev 3 | NET, PB, ID-D | security-executor |
+| F1 | Core computes the open channel's full permission set from current state and exposes it; self state (`premium_type`, guild emojis, Developer Mode, reactions setting) | §16, §17.5; contract below | ID | executor |
+| X | Core evaluates the account's user and guild experiments and feature flags, and answers "is X on for this account / guild"; the menu's gates and D14's variant use it | discovery X-D (main, static) first; contract below | ID | executor |
+| F2 | Core sends every request in §1-§9, §13.8 and §17 with the official shapes, headers, retries and error mapping, including the thread unarchive and join that precede some actions, and fixes the existing message send's missing `X-Context-Properties` (§17.1); typed results over FFI | §1-§9, §13.8, §17, §18; contract below | NET, PB | security-executor |
+| Tw | Twemoji renderer: unicode emoji in message text, reply previews, reactions and embeds draw as Twemoji at the current sizes (inline and jumbo); copy and accessibility keep the characters | contract in rev 3 (asset source, dataset licence) | main fetches the assets | executor |
+| J | The menu skeleton (every item, group, submenu, condition per §14), the hover action bar and Shift layout (§15), focused-message shortcuts (§14.2), Speak Message (§12), Search with Google, media and link items that act locally (copy, save, open); each item shown only when its action exists. J sends nothing to Discord; its verifier checks that J's diff references no F2 action symbol (S-20) | §12, §14, §15 | W1, F1, X | executor |
+| P1 | Emoji picker popout: Recent (reaction frecency), Favorites, server emoji, categories, search by Discord names, skin tone, Nitro locks, Super Reaction toggle; Shift keeps it open (§13.10) | §13 | Tw, F1 (emojis, premium) | executor |
+| A | Reactions write: pill click toggles (`location` per entry), quick row and picker add, super reactions (Nitro), optimistic update with rollback (§1.7-§1.8), View Reactions modal (M0 status row), Remove Reactions › and Remove All with confirms; frecency tracking and sync loop (§13.6, §13.9) | §1-§3, §13 | F2, J, P1 | security-executor |
+| B | Edit and delete: inline editor (§4.4-§4.8), `e` and Up-arrow entry; the reply bar's mention toggle (default per §14 Reply row: on unless Shift or own message) feeding the send body; the MFA modal (§18.6) used by every moderator action; delete confirm with preview, Shift skips, the report checkbox (§5.3) only once H has landed, moderator delete; Resend and the hover Retry for failed sends (§14 Resend, §15.4) | §4, §5 | F2, J | security-executor |
+| C | Pins: pin/unpin confirms (§6.5), error alerts (§6.2), the pinned-messages popout (§6.6-§6.8), the type-6 system row | §6 | F2, J | security-executor |
+| D | Forward: "Forward To" modal (§7.4-§7.7), forwarded messages rendered from `message_snapshots` | §7 | F2, J | security-executor |
+| E | Read state: automatic acks (§8.7-§8.9), Mark Unread (§8.1-§8.6, §17.4, §17.6), unread divider and new-messages bar, sidebar badges | §8 | F2, J | security-executor |
+| T | Thread side panel: Create Thread form, View Thread, messages and composer in the panel; whether opening joins the thread is established by discovery first, and until then nothing auto-joins (S-8) | discovery inside the slice | F2, J | executor + security-executor for the writes |
+| S | Speak Message settings parity (§12.4); may fold into J | §12 | J | executor |
+| K | The remaining account writes and reads of the menu: Translate / Revert (§14, `POST /ai/translate`), Publish (§15.1, crosspost), Official-message toggle (§4.10 flags), View Conversation (discovery), favourite / unfavourite emoji and sticker (settings-proto type 2, §13.7), AutoMod "add keyword to rule" for a text selection (§14 G7/G8), report image false positive (§11.9) | §4.10, §11.9, §13, §14, §15 | F2, J, X | security-executor |
+| I | Bookmarks and reminders (§9), custom reminder dialog (M0 status row), Inbox shell with Bookmarks and Reminders tabs | §9 | F2, J, X | executor + security-executor |
+| G | Apps › (§10) and View Interaction Info | §10 | F2, J | security-executor |
+| H | Report Message (§11) | §11; N4 | F2, J | security-executor |
+
+Contracts for Tw, J, P1, A-I, G, H, K, T, S are written in revision 3 from the cited sections before each slice starts; this revision gives F1, X and F2.
+
+## Files and order
+
+Files owned in an earlier phase are free once that phase merges. N2 touches only its own Swift files, none of these.
+
+### Phase 1: NET and PB (parallel worktrees)
+
+| File | NET | PB |
+|---|---|---|
+| `crates/velella-core/src/rest.rs`, `rest_tests.rs` | owns: the transport, and the token and identity seam (`Rest` holds the token behind a lock with a `replace_token` used only by ID, and takes its headers from an `Identity` snapshot value built once per session; today's constants fill it) | — |
+| `crates/velella-core/src/session.rs`, `session_tests.rs`, `gateway.rs`, `compression.rs` | owns (WebSocket on the transport; the gateway task takes the same `Identity` snapshot) | — |
+| new `crates/velella-core/src/transport.rs` | owns | — |
+| new `crates/velella-core/src/proto.rs`, `proto_tests.rs` | — | owns |
+| `crates/velella-core/src/lib.rs` | additive only (`mod` line) | additive only (`mod` line) |
+| `crates/velella-core/Cargo.toml` | owns (removes reqwest, tokio-tungstenite, rustls) | — |
+| `crates/velella-ffi/src/lib.rs`, `Cargo.toml`, new `crates/velella-ffi/src/transport.rs` | owns | — |
+| new `Sources/Velella/Transport/*.swift`, `Sources/Velella/AppModel.swift` (the `connect` call only), `Package.swift` (a test target linking VelellaFFI), new `Tests/VelellaTransportTests/` | owns | — |
+
+### Phase 2: ID and F2 (parallel worktrees)
+
+| File | ID | F2 |
+|---|---|---|
+| `crates/velella-core/src/identify.rs`, new `identity_fetch.rs` | owns (runtime identity, `Identity` snapshot contents, IDENTIFY) | — |
+| `crates/velella-core/src/session.rs` | owns (READY shapes, token refresh through `replace_token`) | — |
+| `crates/velella-core/src/state.rs`, `guild_settings.rs`, `sidebar.rs`, `threads.rs` (READY parsing only) | owns | — |
+| new `crates/velella-core/src/settings_proto.rs` (type 1 schema on `proto.rs`) | owns | — |
+| `crates/velella-core/src/rest.rs` | additive only: none expected (the seam is NET's) | owns |
+| new `crates/velella-core/src/rest_actions.rs`, `rest_messages.rs` | — | owns |
+| `crates/velella-core/src/proto.rs` | read-only | read-only (type 2 schema lives in `rest_actions.rs` or a new `frecency_proto.rs`) |
+| `crates/velella-core/src/lib.rs`, `crates/velella-ffi/src/lib.rs` | additive only | additive only (new functions; no existing signature changes) |
+| new `crates/velella-ffi/src/identity.rs` / `actions.rs` | owns identity | owns actions |
+| `Sources/Velella/AppModel.swift`, `Keychain.swift` | owns (token refresh write, T-8) | — |
+
+### Phase 3: F1 and X (parallel worktrees)
+
+| File | F1 | X |
+|---|---|---|
+| `crates/velella-core/src/permissions.rs`, new `self_state.rs` | owns | — |
+| new `crates/velella-core/src/experiments.rs` | — | owns |
+| `crates/velella-core/src/state.rs` | additive only | additive only |
+| `crates/velella-core/src/threads.rs` | additive only (new fields `archived_known`, `locked`; the existing `archived: bool` and `joined` stay and keep their readers) | — |
+| `crates/velella-core/src/rest_actions.rs` | additive only (fills F2's `ThreadState` from current state) | — |
+| `crates/velella-core/src/lib.rs`, `crates/velella-ffi/src/lib.rs` | additive only | additive only |
+| new `crates/velella-ffi/src/permissions.rs` / `experiments.rs` | owns | owns |
+
+"Additive only" in `state.rs`: new fields appended at the end of `State`; new match arms in `apply` placed immediately before `_ => false`; at most one call line each inside `ready()`, `ready_supplemental()`, `guild_create()` and `self_member_update()`; no existing line edited. Main resolves the textual merge of neighbouring additions.
+
+## M0 status
+
+| Part | State | Needed by |
+|---|---|---|
+| Request shapes, enums, limits, errors, conditions, permission bits, frecency proto, hover bar, shortcuts | Done statically (§1-§16) | all |
+| N1 burst credits | Closed: none client-side; server errors only (§1.9) | A |
+| N2 View Reactions modal | Done (fetched): page size 100, `after` = last reactor id, load more within 52 pt of the bottom, row 52 pt, remove shown for MANAGE_MESSAGES in an active channel or for one's own reaction | A |
+| N3 custom reminder dialog | Done (fetched): title, date picker (minimum today), time field, primary confirm | I |
+| N4 report modal node schema | Open: fetched and read before H's contract | H |
+| N5 Reply hidden conditions, report-to-mod eligibility | Open (mention rule done, §17.6): read before J's and H's contracts | J, H |
+| N6 forwarding location, `QCW` | Done (§17.1): `forwarding`, `chat_input`, `APP` | F2, E |
+| N7 DMs and MANAGE_MESSAGES | Done (§17.5): false in DMs | F1, A, B |
+| N8 non-subscriber bookmark limits | Runtime value from X | I |
+| N9 settings-proto encoding | Done (§17.2): standard padded base64, lenient decode. Frecency sort internals open: read before A's contract | F2, A |
+| N10 gateway echoes after Mark Unread, pin, forward | Observed in velella's logs during live checks | C, D, E |
+| N11 Speak humaniser | Open: read before J's contract | J |
+| N12 `SAVED_MESSAGE_UPDATE` | Closed: updates arrive as CREATE | I |
+| N13 Apps `source`, `section_name` | Open: read before G's contract | G |
+| N14 interaction follow-up shapes | Open: read before G's contract | G |
+| Screens of dialogs, the picker, the panel | Open: captured from the official client (announced) before each UI slice's contract | UI slices |
+| `X-Fingerprint`, `X-Installation-ID` (sent when non-empty, §17.1) | Open: X's discovery says where they come from; F2 does not add them | X |
+| Query and path encoding, JSON omission, send and reply body, `X-Failed-Requests`, MFA re-auth (S-10, S-11, S-12) | Done (§18.1-§18.6): query `%20`, insertion order, null/undefined keys dropped; emoji raw in the path (`:` literal, non-ASCII percent-encoded as UTF-8); `JSON.stringify` omission; send body order; `X-Failed-Requests: N`; MFA flow. Open: the MFA modal's exact wiring (chunk 965171 absent), fetched before B's contract | F2, B |
+| IDENTIFY identity (§18.7): official `capabilities` 1734653 and READY `user_settings_proto`; velella sends 253 and a stale fallback build number (580004, July; official 627798) | Decided after the survey: D12-D14; effects of each bit established by ID-D | ID, F1, X |
+
+## NET — Transport on URLSession (contract)
+
+| Part | Contract |
+|---|---|
+| Boundary | Core defines one transport trait, exported as a UniFFI foreign trait: `http(request) -> response` and a WebSocket (connect, send text or binary, receive one frame per call, close with a code). A request carries method, URL, headers, body, a deadline and a body cap; Authorization travels in its own opaque object, never in the header list, and Swift reads it once when building the `URLRequest` (T-2). A response carries status, headers (looked up case-insensitively, duplicates handled), body bytes, or a transport error kind. Rust tests implement the trait in memory |
+| Error kinds | A closed mapping from `URLError` (T-3): **connect failed** only for `.cannotFindHost`, `.cannotConnectToHost`, `.dnsLookupFailed`, `.notConnectedToInternet`, `.secureConnectionFailed` and the TLS handshake errors (no request byte can have been written); `.timedOut` → timeout; `.cancelled` → cancelled; everything else, unknown codes included, → other. Only connect failed is ever retried for sends (D11) |
+| Stays in core | URL validation (host, `/api/v9/`, the S-1 path check), header composition and validation (names are token characters, values visible ASCII without CR or LF, checked at the trait boundary, T-10), the 401 latch, the global and per-route 429 blocks, body caps, deadlines, retries, the gateway URL check, zlib-stream inflation and its caps, heartbeats, resume. Core closes every WebSocket explicitly on every exit path instead of relying on drop (T-4) |
+| Swift side | One ephemeral `URLSessionConfiguration`: no cookie storage, `httpCookieAcceptPolicy = .never`, `httpShouldSetCookies = false`, no URL cache, no credential storage, no task metrics collection; system proxy and system plus user trust as Safari (D15). Redirects refused in the task delegate, for HTTP and for the WebSocket upgrade (a 3xx comes back to core as is). Each request's deadline also sets the task's `timeoutIntervalForRequest`; cancellation from core cancels the task (T-4). Bodies are streamed: Content-Length checked first, the task cancelled at cap + 1 bytes of decoded body (T-5). WebSocket `maximumMessageSize` is set from core's gateway cap passed across, not hard-coded; a close code is reported only when a close frame was received (`didCloseWith`, code not `.invalid`), otherwise the connection is reported lost (T-6). Swift checks that `URLRequest.url.absoluteString` equals the string core passed and that the host is on an allow-list fixed at init (`discord.com` for HTTP, `gateway.discord.gg` and `gateway-*.discord.gg` for the WebSocket, plus D12's two exact forms: `https://discord.com/app` with no query, and `https://discord.com/assets/web.` followed by exactly 16 characters of `[0-9a-f]` and `.js`, no query); the shipped transport has no URL rewrite hook; tests build it with a test-only allow-list (T-10). The User-Agent header is the one core composes, never CFNetwork's default |
+| No logging | Requests, headers, bodies, WebSocket frames (IDENTIFY and RESUME carry the token) and the MFA header are never logged or interpolated; the Rust request record has a hand-written redacting `Debug`; the Swift types carrying them implement redacting `CustomStringConvertible`, `CustomDebugStringConvertible` and `CustomReflectable`; no `try!` or `fatalError` message interpolates them (T-2, T-16). Residuals stated once: Swift `String` and RustBuffer copies are not zeroized; `CFNETWORK_DIAGNOSTICS` set by the user can log headers |
+| Dependencies | reqwest, tokio-tungstenite and rustls leave the core (no new Rust dependency); `compression.rs` takes raw frames; MediaImages and login keep their own sessions unchanged. Every comment that states the old stack (rest.rs header, Cargo.toml, `velella-ffi/src/lib.rs` log hygiene) is updated (T-15) |
+| Retired tests | Each rest/session test that exercised reqwest or rustls itself is listed with the test that now carries its guarantee: rustls config and ClientHello → the NET measurement; plain-http refusal → core validation plus the Swift allow-list; proxy environment → retired by D15; redirects and cookies → Swift wire tests (T-15). Every other existing case passes against the in-memory transport |
+| Measurement | ClientHello only, with no certificate trust: a local listener on `localhost` records the ClientHello (cipher suites, extensions and their order, ALPN, groups, signature algorithms, SNI present, JA4) and aborts the handshake, so neither client needs to trust anything. The executor captures velella's transport from a test; main captures Safari by opening `https://localhost:<port>/` once, announced. HTTP/2 SETTINGS, header order and the WebSocket upgrade headers need a completed handshake and are listed as unmeasured. The UA version velella sends is compared with this machine's Safari. The report lists every difference; none is patched around without main (T-13) |
+| Tests | Rust: the rest and session suites on the in-memory transport; redaction (a marker token absent from `{:?}`). Swift, against a local HTTP and WebSocket server: no cookie sent back after `Set-Cookie`; a 302 and a WebSocket-upgrade 3xx returned unfollowed; over-cap bodies stopped for an API-sized and a script-sized cap; the composed User-Agent and the exact Authorization bytes on the wire; an emoji path (`%F0…`, literal `:`) and a `%20` query received byte for byte; a POST that the server reads and then closes without replying → not retried, server count exactly 1; a refused port → connect failed; core's deadline tears the connection down server-side; a 2 MiB binary frame received; a 4004 close frame and an abrupt TCP drop give different results; URL mismatch and off-list host rejected; redaction (a marker token absent from `String(describing:)`, `String(reflecting:)` and `dump`); no request to discord.com from tests |
+| Live (main) | velella signs in on the main account, loads a large READY, the sidebar and a channel, sends one message in the dev thread, survives a network drop and resumes |
+
+## F1 — Permissions and self state (contract)
+
+| Part | Contract |
+|---|---|
+| Bits | The full table of §16 as one constant table (bit numbers, source cited), including PIN_MESSAGES (51), USE_EXTERNAL_APPS (50), BYPASS_SLOWMODE (52), MANAGE_OFFICIAL_MESSAGES (53); 64-bit values |
+| Computation | A pure function of current state, evaluated on each request (no cache keyed by events). Discord's documented algorithm: owner → all; base = @everyone OR member's roles; ADMINISTRATOR → all; overwrites in order @everyone, roles (all denies then all allows), member; a thread uses its parent channel's overwrites; a timed-out member (`communication_disabled_until` in the future, not owner and not ADMINISTRATOR) keeps only VIEW_CHANNEL and READ_MESSAGE_HISTORY. Then Discord's implicit rules: without VIEW_CHANNEL nothing else is granted; without SEND_MESSAGES, MENTION_EVERYONE, SEND_TTS_MESSAGES, ATTACH_FILES and EMBED_LINKS are not granted (S-18; the slice confirms the official store applies them and reports if not). DMs and group DMs report "private" with an empty set, as the official store does (§17.5); the gates handle `isPrivate()` themselves. Missing guild, member or role data → unknown, never a guess |
+| Inputs | The self member's roles and `communication_disabled_until` from every source velella receives: READY guild members / `merged_members`, READY_SUPPLEMENTAL `merged_members`, GUILD_CREATE, GUILD_MEMBER_UPDATE (self); roles and overwrites from the existing handlers |
+| Self state | `premium_type` (READY user, USER_UPDATE); guild emojis (id, name, animated, available, roles, managed) from READY, GUILD_CREATE and GUILD_EMOJIS_UPDATE; Developer Mode (`appearance.developer_mode`, default off) and render reactions (`text_and_images.render_reactions`, absent = on) from READY `user_settings_proto` and `USER_SETTINGS_PROTO_UPDATE` as ID parses them (§18.7, T-11); F1 reads ID's parsed values and decodes nothing itself |
+| Threads | `threads.rs` gains new fields (archived known or not, `locked` tri-state from `thread_metadata`; absent metadata → unknown, never false) next to the existing `archived` and `joined`, which keep their readers; F1 fills F2's `ThreadState` from them and from MANAGE_THREADS (S-7) |
+| FFI | The open channel's permissions (bits, private, or unknown) and the self state, as records |
+| Existing behaviour | `can_view_channel` results for every current caller are unchanged; its tests pass unedited |
+| Tests | Permission table (owner; admin role; @everyone deny + role allow; member overwrite beats role; thread inherits parent; timeout strips; timeout ignored for admin and owner; DM private; missing role → unknown); roles arriving only in READY_SUPPLEMENTAL (unknown, then known); a timeout carried in `merged_members`; a `USER_SETTINGS_PROTO_UPDATE` flipping Developer Mode; emoji update replaces the list; FFI round trip |
+
+## X — Experiments (contract)
+
+| Part | Contract |
+|---|---|
+| Paths | X-D's findings (done by main): `/Users/nanako/side-project/velella/refs/discord-ground-truth/experiments.md`, read-only for the slice; the bundle under `refs/discord-ground-truth/bundle/` for evidence only |
+| Discovery first | X-D, run by main before the slice, writes `experiments.md`; the slice implements from it. Facts only: where the client gets user experiments, guild experiments and the date-named feature flags; the gates the menu needs (`2026-03-message-bookmarks`, `2026-07-message-bookmarks-v2` with its `{b,r}` config, `message_utilities`, `tidaWebform`, `message_context_menu`, the Translate gate, report to moderators `Qo`, the official-message experiment); the payload fields and events; the evaluation (hash key, hash function, buckets, filters, overrides, holdouts); where `X-Fingerprint` and `X-Installation-ID` come from |
+| Stops | (a) A gate's code or inputs are not on disk: stop and report that gate to main. (b) An input needs a request velella does not send today: stop and report it with its shape. No gate defaults to off silently |
+| Core | Parses and stores the inputs from the payload velella already receives; `gate(name, guild?) -> Enabled | Disabled | Unknown` and `bucket(name, guild?)` per the official evaluation; missing or unparsable inputs give Unknown, and Unknown hides the gated item (S-6); no local override exists in shipped builds; live updates from the events discovery finds |
+| FFI | A query for the gate names |
+| Gates | From experiments.md's Gates table: Translate is staff-only (user flag); View Conversation (apex user `2026-03-conversation-highlighting-utility` plus guild feature); report to moderators (the selected guild's `moderator_reporting` setting, not an experiment); Official-message toggle (legacy guild `2026-03_guild_official_messages`, VERIFIED, MANAGE_OFFICIAL_MESSAGES); `tidaWebform` (legacy user `2025-11_tida_webform`); bookmarks v1/v2 (apex user, v2 config `{b,r}`); channel obfuscation (apex user `2026-02-private-channel-hiding`) |
+| Done | Every gate above implemented with experiments.md's test vectors (murmur3 check `h("hello") = 613153351`, the guild cases); a live READY on the main account logs its top-level key names only (never values) to confirm `experiments`, `guild_experiments`, `apex_experiments` and `guilds[].experiments` are present; if any is absent, its gates stay Unknown and main is told |
+| Tests | Evaluation vectors computed by hand from the official algorithm (a guild in range, out of range, filtered out, overridden, held out); inputs missing → Unknown; payload parsing; an unknown experiment name → Unknown |
+| Hygiene | The bundle is downloaded data: helpers run as `python3 -I …/bundle/ctx.py` from a directory outside the bundle; nothing under `bundle/` is executed (S-19) |
+
+## F2 — REST actions (contract)
+
+| Part | Contract |
+|---|---|
+| Transport | Through `rest.rs`'s request path on NET's transport, keeping its protections for every new method: host and `/api/v9/` validation, header validation, Authorization in NET's opaque object, the 401 latch, the global 429 block, deadlines, the 4 MiB body cap (also for error bodies), redirects refused. New: PUT, PATCH, DELETE, POST with JSON bodies and query strings, encoded per §18.1-§18.3. Extra headers are a closed enum: `X-Context-Properties` (standard padded base64 of the JSON `{"location": …}`, §17.1) and `X-Failed-Requests` on `retries` re-sends only (§18.5). Each request takes its retry policy as a required argument with no default (S-5) |
+| Paths | Every path is composed from typed parts and checked: after building the `Url`, if `Url::path()` differs from the composed path string, the request fails with InvalidUrl and nothing is sent (S-1). Emoji cross FFI and core as `Emoji::Custom { name, id: u64 }` or `Emoji::Unicode(String)`; custom names must match `[A-Za-z0-9_]{1,32}`; unicode strings are rejected when empty, `.`, `..`, any case of `%2e`, or containing control characters; the segment is encoded per §18.2 with `%`, `/`, `?`, `#` and non-ASCII always percent-encoded. Ids are `u64` |
+| Actions | Reactions: add, remove own, list reactors, remove a user's, remove one emoji, remove all (§1.1-§1.5, §2.1, §3.1-§3.3). Edit (§4.1-§4.2). Delete (§5.1). Pin, unpin, list pins, pins ack (§6.1, §6.6, §6.8). Forward (§7.1) and its comment (§7.3), both through the send path with `location: forwarding`. Message ack and mark unread (§8.1, §8.7); bulk ack is dropped (server-level "mark as read" belongs to the server-menu wave, S-14). Saved messages put / delete / list (§9.1). Settings-proto get and patch (§13.8, encoding §17.2) under the Settings-proto row. Thread unarchive (fixed body `{"archived":false}`, `PATCH /channels/{id}`; no generic channel PATCH is exposed over FFI) and thread join `POST /channels/{id}/thread-members/@me?location=…` (§17.4) |
+| Preconditions | Each action takes a core-computed `ThreadState { archived, locked, joined, manage_threads }`, each field tri-state, never booleans from Swift. F2 defines the type and, until F1 fills it from current state (phase 3), every field is Unknown, so F2 alone never unarchives or joins; a test covers the all-Unknown path. Reaction add and remove, remove all, remove one emoji, remove a user's, delete and pin unarchive first when archived is known true and (MANAGE_THREADS or locked is known false); if the unarchive fails, the action is not sent and the unarchive's error is returned. Mark unread unarchives when archived is known true and aborts if that fails, then joins when joined is known false; a join failure does not stop the ack (§17.4). Unknown state means no unarchive and no join: the action is sent as is and a 50083 comes back as its typed error (S-7) |
+| Existing send | `rest_messages.rs` bodies follow §18.4 in key order: `mobile_network_type: "unknown"`, `content`, `nonce`, `tts: false`, then for a reply `message_reference: {guild_id (omitted in DMs), channel_id, message_id}` (no `type`, no `fail_if_not_exists`), then `allowed_mentions: {parse: ["users","roles","everyone"], replied_user: false}` only when the reply's mention is off, then `flags` (always, `0` by default). `X-Context-Properties` with `chat_input` for sends and replies (§17.1). Retries per D11 only (S-3, S-11). A new FFI send function takes the reply's mention flag; the existing one stays until its Swift caller moves in B |
+| MFA | A 401 with code 60003 and an `mfa` object returns `MfaRequired { ticket, methods }` (methods: webauthn, totp, sms, backup, password). F2 offers `POST /mfa/finish {ticket, mfa_type, data}` → token, `POST /auth/mfa/sms/send {ticket}`, and re-sending the original request unchanged with `X-Discord-MFA-Authorization: <token>` (one more closed-enum header); a 60008 or 60003 on the re-send returns to the caller (§18.6). The token is held only for that re-send, never stored or logged |
+| Errors | Error bodies are read through the capped reader and only `code` is parsed (S-12): 30010, 90001, 30003, 50001, 50019, 50083, 50021, 10008, 30074, 50035, and "other" with the HTTP status. A 401 whose body carries the MFA-required code of §18.6 is returned as `MfaRequired` and does not latch REST off; every other 401 latches as today. Fixed text in core; where a slice shows the server's `message` (I, §9.6) it is capped at 512 characters, displayed only, never logged |
+| Single flight | At most one write in flight per (message, emoji, reaction type) for reactions, and per message for edit, delete and pin; a second call while one is in flight returns `Busy` without a request (S-16) |
+| Per-route 429 | A 429 records a deadline for its path (query excluded, any method) of max(wait, a backoff from 1 s doubling to 60 s); until then requests to that path fail with `RateLimited` without touching the network (S-4, §17.3) |
+| Settings-proto | Crate-private: the PATCH takes a typed partial proto (fields 3, 5, 6, 13 only), never raw bytes, and the type is an enum whose only writable value is 2; type 1 is never written. A PATCH is allowed only after the server's type-2 proto was decoded successfully this session and is always preceded by a GET of the same type; `required_data_version` is omitted; `out_of_date` or 400 INVALID_USER_SETTINGS_DATA → the local change is discarded and the proto reloaded, never retried; a decode failure disables writes for the session. The decoder is bounded (varint length, length ≤ remaining bytes, nesting depth ≤ 16) and keeps unknown fields, including inside `FrecencyItem`; it is the one protobuf decoder in core, owned by F2 and reused read-only by ID for type 1 (T-11); whichever of F2 and ID merges second rebases onto it. The merge rule (server snapshot plus pending usage, never seeded defaults) is A's and K's contract (S-2) |
+| FFI | Inputs are closed types: `location` (§1.4), saved-message `source` (§9.2), reaction type, settings type and read-state type as enums, `due_at` as integer milliseconds, ids as `u64` (S-13). One async function per action returning success (with the response fields the slices need: saved-message record, pins page, reactors page, ack token) or the typed error; the ack `token` from a response is returned to the caller, never stored globally by F2 |
+| Not here | Optimistic state, UI, the ack cadence and its token chaining, the frecency sync loop and its 429 rescheduling (their slices: E, A) |
+| Tests | On NET's in-memory transport, plus NET's Swift wire tests for the bytes on the wire: each action's method, path, query, headers and body byte for byte against its § (rows §18 leaves open excluded and named); emoji paths for `👍`, `#️⃣`, `name:id`, and the rejections `.`, `..`, `%2e%2e`, `a/b`, `%`, empty; the path-mismatch check; one test per retry-table row, including a 403 30010 (no retry), an over-cap or unreadable 429 (no retry, global flag still armed from the body), a 2xx with an unparsable body (no retry), a 502 then 200 on a `retries` action, a 500 (no retry), a send failing with a refused connection (retried, same nonce and bytes) and with a 504 (not retried); the per-route block; single flight; the unarchive-before-PUT order, the abort when unarchive fails, unknown thread state sending no unarchive; the mark-unread join-failure path still acking; MfaRequired not latching; settings-proto: no PATCH before a successful decode, GET before PATCH, out_of_date discards, decode-failure disables, bounded decoder on truncated and deeply nested input, unknown-field round trip (a real type-2 blob is round-tripped in A's live check, kept git-excluded); a 401 latches; no request leaves the test process for discord.com |
+
+### F2 retry table
+
+Official semantics (§1.9, §4.3, §17.3): the HTTP layer never retries a 429 or 503 by itself; every loop iteration re-checks the 401 latch, the global block and the per-route block, and a 429's body `global` flag still arms the global block whatever the wait source (S-5); `retries:N` retries only statuses 502, 504, 507, 522, 523, 524, 598, 599 and transport errors, with a jittered backoff from 500 ms capped at 5 s. velella's existing global-429 block stays in front of every request. "Wait" is the `Retry-After` header in whole seconds, else the body's `retry_after`, else 5 s.
+
+| Action | Retries on | Count | Wait | Cap | Notes |
+|---|---|---|---|---|---|
+| Reaction add / remove own | 429 with a readable wait → wait then retry; a non-2xx status other than 401, captcha, 403 30010 / 90001 and 3xx, or a transport error → one immediate retry; never after a 2xx | 1 | Wait rule; an unreadable 429 (no header, no JSON) is not retried | 10 s (`MAX_RETRY_AFTER`); a longer wait fails without retry | §1.9; S-5 |
+| Remove all | as reaction add | 1 | Wait rule | 10 s | §3.1 uses the same handler |
+| Remove one emoji, remove a user's | none | 0 | — | — | §3.2-§3.3 do not show the handler: stricter default |
+| List reactors, list saved messages, settings-proto get, list pins | `retries` statuses and transport errors (list pins only, `retries:2`); others none | pins 2, others 0 | backoff 500 ms-5 s | 5 s | rest.rs's current GET-429 retry does not apply to F2 actions; it stays only for message history |
+| Edit | `retries:1` statuses and transport errors; 429 → wait then re-send once | 1 + 1 | backoff / Wait rule | 10 s | §4.3 queue re-send count is not established: one re-send (stricter) |
+| Delete, pin, unpin, pins ack, message ack, mark unread, saved-message put / delete, settings-proto patch, unarchive, join | none | 0 | — | — | official sends them without `retries` |
+| Message send (existing), forward, comment | Only a connection that failed to establish, or 522 / 523; byte-identical body, same nonce (D11) | 3 | backoff 500 ms-5 s | 5 s | deviates from official `retries:3` by user decision; never on 429, 502, 504, timeouts after connect |
+
+## Security review (rev 2.1, pilotfish:security-reviewer)
+
+| # | Finding | Disposition |
+|---|---|---|
+| S-1 (P1) | Emoji path segments (`..`, `%2e%2e`) normalise into another, destructive request | FIX: F2 Paths row (typed emoji, rejections, path-mismatch check); tests |
+| S-2 (P1) | Settings-proto PATCH from stale or empty state wipes synced frecency and favourites | FIX: F2 Settings-proto row; merge rule in A and K; GET before PATCH named in Traffic |
+| S-3 (P2) | Send retries would duplicate messages | FIX: D11 (user decision), retry table, Existing send row |
+| S-4 (P2) | No per-route 429 memory | FIX: F2 Per-route 429 row; test |
+| S-5 (P2) | Reaction retry too broad; unreadable 429 retried; global flag lost | FIX: retry table conditions, required policy argument, per-iteration re-checks |
+| S-6 (P2) | Experiments unevaluable at runtime show gated writes | FIX: X tri-state gate, Unknown hides; test |
+| S-7 (P2) | Thread preconditions on state F2 does not own | FIX: F1 Threads row (tri-state), F2 Preconditions row; tests |
+| S-8 (P2) | Thread panel auto-join unestablished | FIX: T row: discovery first, no auto-join until then |
+| S-9 (P2) | Rollback misses background writers | FIX: Rollback row (kill switch per writer); E's contract asserts the 3 s bound |
+| S-10 (P3) | Encoding facts for byte-for-byte tests | FIX: M0 row, §18 before F2; open rows excluded and named |
+| S-11 (P3) | Existing send body differs from the official | FIX: Existing send row (§18.4) |
+| S-12 (P3) | Typed codes need error bodies; MFA 401 would latch | FIX: Errors row |
+| S-13 (P3) | Open FFI inputs | FIX: FFI row (closed types) |
+| S-14 (P3) | Bulk ack has no caller | FIX: dropped from F2 |
+| S-15 (P3) | Traffic row contradicted F1 | FIX: Traffic row |
+| S-16 (P3) | No single flight | FIX: F2 Single flight row; test |
+| S-17 (P3) | Live checks touching others; stops | FIX: Stops row; B hides the report checkbox until H |
+| S-18 (P4) | Implicit permissions | FIX: F1 Computation row (confirmed against the official store) |
+| S-19 (P4) | Bundle hygiene | FIX: X Hygiene row |
+| S-20 (P4) | J must send nothing | FIX: J row (verifier check) |
+
+## Security review (rev 2.3 additions, pilotfish:security-reviewer)
+
+| # | Finding | Disposition |
+|---|---|---|
+| T-1 (P1) | D12's fetch had no destination contract and the only validator attaches the token | FIX: ID row (identity fetch outside Rest, rebuilt from a constant base, no Authorization or Discord headers, `validated()` unchanged); the two exact forms are written in NET's Swift side row and enforced by the Swift allow-list |
+| T-2 (P2) | Token exposure through FFI records and WebSocket frames | FIX: NET Boundary (opaque Authorization) and No logging rows; redaction tests |
+| T-3 (P2) | URLError mapping could turn a delivered send into a retried one | FIX: NET Error kinds row; POST-then-close test |
+| T-4 (P2) | Deadlines and cancellation across the foreign future | FIX: Swift enforces deadlines and cancels; core closes WebSockets explicitly; server-side teardown test |
+| T-5 (P2) | Body caps must stream in Swift; D12 needs a measured cap | FIX: NET Swift side (streaming, cap + 1); ID row (caps from the measured size) |
+| T-6 (P2) | WebSocket 1 MiB default and close-code fidelity (4004 deletes the sign-in) | FIX: NET Swift side; 2 MiB frame and 4004-versus-drop tests |
+| T-7 (P2) | D12 parse output untyped and unchecked | FIX: ID row (rev 3 contract) |
+| T-8 (P2) | auth_token refresh had no safe write path | FIX: ID row (rev 3 contract) |
+| T-9 (P3) | System proxy and user roots | DECIDED: D15 (the user chose Safari behaviour); doc comments and the proxy test updated or retired |
+| T-10 (P3) | Header validation and URL fidelity after reqwest | FIX: NET Stays in core and Swift side; wire byte test |
+| T-11 (P3) | Bit 9 removes F1's inputs; two decoders | FIX: F1 Self state row; one decoder (F2) reused by ID |
+| T-12 (P3) | D14 variant before X | FIX: D14 (1734653 unless X reports Enabled) |
+| T-13 (P3) | Identity claims wider than JA4; UA version | FIX: D13 wording; NET Measurement row |
+| T-14 (P3) | D12 traffic, failure and timing | FIX: Traffic row; ID row (rev 3 contract) |
+| T-15 (P3) | Old tests and comments | FIX: NET Retired tests and Dependencies rows; F2 rows updated |
+| T-16 (P4) | Header lookup, cookie policy, diagnostics, `try!` | FIX: NET Boundary, Swift side and No logging rows |
+
+## Plan review dispositions (rev 2.4 closing review)
+
+| # | Blocker | Disposition |
+|---|---|---|
+| 1 | F2 needed F1's thread state | FIX: F2 defines `ThreadState`, all Unknown until F1 fills it (no unarchive or join before F1); test |
+| 2 | Decoder and rest.rs seam unowned | FIX: slice PB (phase 1) owns `proto.rs`; NET owns the token and `Identity` seam in `rest.rs`; Files and order rewritten per phase |
+| 3 | Allow-list forms undefined | FIX: the two exact forms written in NET's Swift side row; T-1 aligned |
+| 4 | Measurement impossible as written | FIX: ClientHello only, no trust, handshake aborted; who captures what; the rest listed as unmeasured |
+| Notes | Phase-1 files, FFI signature, threads.rs fields, experiments.md owner, GET before PATCH, J prerequisites, `X-Failed-Requests` on D11 retries | FIX: all applied |
+
+## Plan review dispositions (rev 2)
+
+| # | Blocker | Disposition |
+|---|---|---|
+| 1 | No security review | FIX: security review on rev 2.1, table above (20 findings, all FIX) |
+| 2 | F2 relied on open facts (N6, N9) | FIX: N6 and N9 encoding resolved statically (§17.1, §17.2); M0 lists N1-N14 with owners |
+| 3 | Retry rules undecidable | FIX: F2 retry table with semantics from §17.3 and stricter defaults where official behaviour is unknown |
+| 4 | Thread unarchive and join missing | FIX: F2 Actions and Preconditions (§17.4); tests |
+| 5 | Items without a slice | FIX: slice K; J sends nothing to Discord |
+| 6 | No file ownership | FIX: Files and order table with additive-only rules |
+| 7 | X paths and stops | FIX: absolute paths, stops (a) and (b), done criteria |
+| 8 | F1 live inputs | FIX: computed from current state; inputs from every member source; settings update event; tests |
