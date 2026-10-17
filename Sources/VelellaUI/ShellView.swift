@@ -16,6 +16,9 @@ public struct ShellView: View {
     private let onSend: ((String, ReplyTarget?) -> Void)?
     private let onLoadOlder: (() -> Void)?
     private let replyPreview: ((String) -> String?)?
+    private let attachmentServices: AttachmentServices?
+    /// Shared with the message column, which feeds it the open conversation's state.
+    @State private var attachmentController = AttachmentController()
     @State private var showMembers = true
     @State private var search = ""
     /// Starts at the sidebar's ideal width, not 0: the title's frame is this minus the reserved
@@ -30,15 +33,19 @@ public struct ShellView: View {
     ///   - onLoadOlder: asks for the page of messages before the oldest shown; nil sends nothing.
     ///   - replyPreview: core's one-line reply preview of a message of the open conversation, by
     ///     id, flattened when the message menu opens; nil leaves the reply bar's line empty.
+    ///   - attachments: core and the file layer behind the composer's attachments (plan CUA); nil
+    ///     (fixtures, `--demo`) turns attaching off.
     public init(
         state: Binding<ShellState>, onSignIn: (() -> Void)? = nil, onSend: ((String, ReplyTarget?) -> Void)? = nil,
-        onLoadOlder: (() -> Void)? = nil, replyPreview: ((String) -> String?)? = nil
+        onLoadOlder: (() -> Void)? = nil, replyPreview: ((String) -> String?)? = nil,
+        attachments: AttachmentServices? = nil
     ) {
         _state = state
         self.onSignIn = onSignIn
         self.onSend = onSend
         self.onLoadOlder = onLoadOlder
         self.replyPreview = replyPreview
+        self.attachmentServices = attachments
     }
 
     public var body: some View {
@@ -74,7 +81,9 @@ public struct ShellView: View {
                 load: state.messageLoad, reply: $state.reply, draft: $state.draft, onSend: onSend,
                 conversation: state.conversation, replyPreview: replyPreview,
                 older: state.older, onLoadOlder: onLoadOlder, typing: state.typing,
-                premiumType: state.premiumType
+                premiumType: state.premiumType,
+                attachmentQueues: $state.attachmentQueues, attachPermission: state.attachPermission,
+                attachmentServices: attachmentServices, attachmentController: attachmentController
             )
                 // No minimum of its own: SwiftUI's `.inspector` adds the floating sidebar's current
                 // width to this column's minimum twice (measured 2026-10-13, macOS 27.0.1,
@@ -117,6 +126,9 @@ public struct ShellView: View {
         .frame(minWidth: T.Size.windowMinWidth, minHeight: T.Size.windowMinHeight)
         .containerBackground(T.Palette.windowMaterial, for: .window)
         .environment(\.discordLocale, Locale(identifier: state.locale))
+        // OA A27, D12a: the whole window is the drop target and dims under the drop card, rail and
+        // sidebar included; the conversation is the open one.
+        .attachmentDropTarget(attachmentController, conversation: state.openTarget ?? "", name: state.header?.name ?? "")
     }
 
     /// DM mode: search; a server: its menu, whose "⌄" is the native toolbar menu indicator

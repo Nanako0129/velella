@@ -533,6 +533,78 @@ enum DesignTokens {
         static let timeAlpha: CGFloat = 0.12
         static let mediaAlpha: CGFloat = 0.14
     }
+
+    // Composer attachments (plan CUA). A separate block at the end, so a merge with other edits to
+    // the enums above stays trivial. Sources: SA = refs/swiftcord-v2-teardown.md "Composer
+    // attachments", OA = refs/discord-ground-truth/attachments.md.
+    enum Attachment {
+        /// The card is 200 x 200 (SA card); the row has 8 between cards and 6 either side (SA row).
+        static let cardSize: CGFloat = 200
+        static let rowSpacing: CGFloat = 8
+        static let rowInset: CGFloat = 6
+        /// A preview sits 6 inside the card, and its corner is the card's less 6, never below 2 (SA).
+        static let previewInset: CGFloat = 6
+        static let previewRadiusMinimum: CGFloat = 2
+        /// The card's corner is concentric with the composer and never below `Radius.composerInnerMinimum`;
+        /// inside this row (8 padding + 6 inset) it is that minimum, so the preview's corner is the
+        /// minimum less the inset, and not below 2.
+        static var previewRadius: CGFloat { max(Radius.composerInnerMinimum - previewInset, previewRadiusMinimum) }
+        /// Three glass circles at the top trailing corner, 4 in (SA remove button; the other two are
+        /// the official toggles, OA A22). 4 between them is not measured.
+        static let actionSize: CGFloat = 28
+        static let actionInset: CGFloat = 4
+        static let actionSpacing: CGFloat = 4
+        static let actionGlyph = Font.system(size: 11, weight: .bold)
+        /// Non-image preview: a 28 pt symbol over the extension in 10 pt bold, 7 apart, at most 72 wide.
+        static let symbol = Font.system(size: 28, weight: .regular)
+        static let symbolExtension = Font.system(size: 10, weight: .bold)
+        static let symbolGap: CGFloat = 7
+        static let symbolExtensionWidth: CGFloat = 72
+        static let extensionMaxLength = 8
+        /// Info strip on `Material.thin`: filename 12 semibold, size 11, 4 apart, 8 / 6 padding.
+        static let name = Font.system(size: 12, weight: .semibold)
+        static let size = Font.system(size: 11)
+        static let stripGap: CGFloat = 4
+        static let stripPaddingH: CGFloat = 8
+        static let stripPaddingV: CGFloat = 6
+        /// A spoilered preview is blurred hard (OA A23: the official CSS radius is 44 px; the capture
+        /// of the spoiler card shows a near-uniform wash), under a black pill.
+        static let spoilerBlur: CGFloat = 44
+        static let spoilerPill = Font.system(size: 13, weight: .heavy)
+        /// "Processing" while a thumbnail is generated (SA): caption, 8 from the spinner.
+        static let processingGap: CGFloat = 8
+
+        /// Sent message's upload card (OA A33): about 430 x 72, an icon, the filename, a thin bar, a cross.
+        static let pendingWidth: CGFloat = 430
+        static let pendingHeight: CGFloat = 72
+        static let pendingRadius: CGFloat = 8
+        static let pendingPadding: CGFloat = 14
+        static let pendingIcon = Font.system(size: 32)
+        static let pendingBarHeight: CGFloat = 4
+        static let pendingGap: CGFloat = 12
+        /// The light document icon of the official card (A33, A30): a light purple.
+        static let documentIcon = Color(red: 0.82, green: 0.82, blue: 1)
+        static let pendingFill = Color.primary.opacity(0.06)
+        static let pendingStroke = Color.primary.opacity(0.1)
+
+        /// Drop overlay (OA A27): the window dims, a blurple card (about 330 x 190) with a dashed inner
+        /// border, three documents on top, the title in bold and a two-line subtitle.
+        static let dim = Color.black.opacity(0.55)
+        static let dropBlurple = Color(red: 0x58 / 255.0, green: 0x65 / 255.0, blue: 0xF2 / 255.0)
+        static let dropWidth: CGFloat = 330
+        static let dropHeight: CGFloat = 190
+        static let dropRadius: CGFloat = 16
+        static let dropBorderInset: CGFloat = 8
+        static let dropDash: [CGFloat] = [6, 5]
+        static let dropTitle = Font.system(size: 17, weight: .bold)
+        static let dropSubtitle = Font.system(size: 12)
+
+        /// Modify sheet (OA A31).
+        static let modifyWidth: CGFloat = 420
+        static let modifyPreview: CGFloat = 120
+        /// The API's limit for an attachment description; the official modal's own limit is not on disk.
+        static let altTextLimit = 1024
+    }
 }
 
 // MARK: Contrast

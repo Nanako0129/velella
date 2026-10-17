@@ -32,6 +32,15 @@ struct MessageArea: View {
     var typing: [String] = []
     /// The user's `premium_type` (nil: Unknown): sets the composer's message-length limit.
     var premiumType: UInt8?
+    /// Composer attachments (plan CUA): every conversation's queue, what the open one allows, and
+    /// core and the file layer behind `AttachmentServices`; nil (fixtures, `--demo`) turns them off.
+    var attachmentQueues: Binding<[String: [QueuedAttachment]]> = .constant([:])
+    var attachPermission: AttachPermission = .unknown
+    var attachmentServices: AttachmentServices?
+    @State private var ownAttachments = AttachmentController()
+    /// Stands in for the column's own controller (tests drive drops and the panel through it).
+    var attachmentController: AttachmentController?
+    private var attachments: AttachmentController { attachmentController ?? ownAttachments }
     @State private var columnWidth: CGFloat = 0
     /// The topmost message row (or divider) in view, kept by SwiftUI as the list scrolls. Binding it
     /// makes the scroll view hold that row at its place when older rows are prepended.
@@ -46,9 +55,31 @@ struct MessageArea: View {
     /// The selection across the column's messages (selection plan N2).
     @State private var selection = SelectionCoordinator()
     @Environment(\.discordLocale) private var discordLocale
+    @Environment(\.openURL) private var openURL
 
     var body: some View {
+        // The controller's unobserved inputs follow this view's, on every update.
+        let _ = attachments.configure(
+            services: attachmentServices, permission: attachPermission, premiumType: premiumType,
+            conversation: conversationID, queues: attachmentQueues)
         Group { content }
+            // The attachment limits' alerts (OA A18, A37): the official copy and "Got It"; the upsell
+            // modal has "Get Nitro" and "View All Nitro Perks", which open the Nitro page (velella has
+            // no store). A native alert needs a way out, which the official modal's cross gave: "Close".
+            .alert(
+                attachments.alert?.title ?? "",
+                isPresented: Binding(get: { attachments.alert != nil }, set: { if !$0 { attachments.alert = nil } })
+            ) {
+                if attachments.alert?.showsUpsell == true {
+                    Button(AttachmentAlert.upsellPrimary) { openURL(MessageLength.nitroURL) }
+                    Button(AttachmentAlert.upsellSecondary) { openURL(MessageLength.nitroURL) }
+                    Button("Close", role: .cancel) {}
+                } else {
+                    Button(AttachmentAlert.dismiss) {}
+                }
+            } message: {
+                Text(verbatim: attachments.alert?.message ?? "")
+            }
             // N2 Model: the coordinator follows the rows in display order, so a selection reaches rows no view shows.
             .onChange(of: messages, initial: true) {
                 selection.locale = discordLocale
@@ -64,6 +95,21 @@ struct MessageArea: View {
                 menu.dismiss()
                 selection.clear()
             }
+    }
+
+    /// What a pending send's cards do: core's calls by the row's id (nil without services).
+    private var uploadActions: UploadRowActions? {
+        attachmentServices.map { services in
+            UploadRowActions(
+                cancel: { id in MainActor.assumeIsolated { services.cancel(id) } },
+                retry: { id in MainActor.assumeIsolated { services.retry(id) } },
+                discard: { id, files in
+                    MainActor.assumeIsolated {
+                        services.discard(id)
+                        files.forEach { services.remove($0.url) }
+                    }
+                })
+        }
     }
 
     /// Opens the menu for `message`, the row under the pointer (C1 Trigger, W1 Trigger): the text
@@ -101,7 +147,9 @@ struct MessageArea: View {
                                     switch entry {
                                     case .divider(_, let date): DateDivider(date: date)
                                     case .row(let message, let startsGroup, let afterDivider):
-                                        MessageRow(message: message, startsGroup: startsGroup, afterDivider: afterDivider) { request in
+                                        MessageRow(
+                                            message: message, startsGroup: startsGroup, afterDivider: afterDivider, uploadActions: uploadActions
+                                        ) { request in
                                             openMenu(message, request)
                                         }
                                             .onAppear { if entry.id == entries.first?.id, older == .idle { onLoadOlder?() } }
@@ -132,7 +180,12 @@ struct MessageArea: View {
             .onChange(of: conversationID) { topID = nil }
             .safeAreaInset(edge: .bottom) {
                 VStack(spacing: 0) {
-                    Composer(reply: $reply, draft: $draft, channelID: conversationID, premiumType: premiumType, onSend: onSend)
+                    Composer(
+                        reply: $reply, draft: $draft, channelID: conversationID, premiumType: premiumType, onSend: onSend,
+                        attachments: Binding(
+                            get: { attachmentQueues.wrappedValue[conversationID] ?? [] },
+                            set: { attachmentQueues.wrappedValue[conversationID] = $0.isEmpty ? nil : $0 }),
+                        attachment: attachments)
                     TypingIndicator(names: typing)
                         .padding(.horizontal, T.Spacing.lg + T.Spacing.md)
                         // Up into the composer's own bottom gutter, which already sits under the card.
@@ -241,11 +294,23 @@ struct MessageRow: View {
     let message: MessageItem
     var startsGroup = true
     var afterDivider = false
+    /// The cards of a pending send with files (plan CUA); nil draws them without actions.
+    var uploadActions: UploadRowActions?
     /// A right-click anywhere on the row (C1 Trigger), with what a text view under it adds (W1).
     var onContextMenu: ((MessageMenuRequest) -> Void)?
     @Environment(\.discordLocale) private var discordLocale
     @Environment(\.selectionColumn) private var column
     @State private var hovered = false
+
+    /// An unconfirmed echo dims whole; one with files dims its text only, so its cards stay legible.
+    struct Dimming: Equatable {
+        var row: Double, body: Double
+    }
+
+    static func dimming(_ message: MessageItem) -> Dimming {
+        guard message.delivery == .pending else { return Dimming(row: 1, body: 1) }
+        return message.upload == nil ? Dimming(row: 0.5, body: 1) : Dimming(row: 1, body: 0.5)
+    }
 
     /// The context the header time formats with (K4); body paragraphs build their own per tick.
     private var renderContext: RenderContext { RenderContext(now: .now, locale: discordLocale) }
@@ -294,6 +359,8 @@ struct MessageRow: View {
             if !message.body.blocks.isEmpty {
                 MarkdownView(content: message.body)
                     .environment(\.textMessage, message.id)
+                    // A send with files dims its text only (OA A33); the cards carry their own state.
+                    .opacity(Self.dimming(message).body)
             }
             // After the text, so a follow-up row (no header) shows it too.
             if message.edited {
@@ -306,6 +373,9 @@ struct MessageRow: View {
                 Label { Text(verbatim: file) } icon: { Image(systemName: "doc") }
                     .font(T.Typography.messageBody)
                     .foregroundStyle(.secondary)
+            }
+            if let upload = message.upload {
+                PendingUploadCards(messageID: message.id, upload: upload, actions: uploadActions).padding(.top, T.Spacing.xs)
             }
             // After the attachments, before the reactions (wave 3 E).
             ForEach(Array(message.embeds.enumerated()), id: \.offset) { _, embed in
@@ -345,7 +415,7 @@ struct MessageRow: View {
         .overlay { if let onContextMenu { MessageMenuTrigger(open: onContextMenu) } }
         .padding(.top, startsGroup && !afterDivider ? M.groupStart : 0)
         // An unconfirmed echo is dimmed until Discord confirms it.
-        .opacity(message.delivery == .pending ? 0.5 : 1)
+        .opacity(Self.dimming(message).row)
     }
 }
 
@@ -409,6 +479,10 @@ struct Composer: View {
     /// Receives the draft and the reply target on Return (`ComposerSubmit`: never blank, never an
     /// IME commit, never over the limit); the reply bar clears with the draft.
     var onSend: ((String, ReplyTarget?) -> Void)?
+    /// The open conversation's queued files (plan CUA).
+    var attachments: Binding<[QueuedAttachment]> = .constant([])
+    /// The gate, the alert and the adds; nil turns attachments off.
+    var attachment: AttachmentController?
     @State private var plusMenuOpen = false
     @State private var windowTick = 0
     @State private var tooLong: MessageLength.TooLong?
@@ -421,6 +495,11 @@ struct Composer: View {
             if let reply {
                 ReplyBar(reply: reply) { self.reply = nil }
                     .transition(.blurReplace(.downUp))
+            }
+            // SA: the row sits inside the card above the input row, entering from the bottom.
+            if !attachments.wrappedValue.isEmpty {
+                AttachmentRow(attachments: attachments) { removed in attachment?.services?.remove(removed.url) }
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
             }
             // Bottom aligned: the buttons stay level with the last line (D1). Each is as tall as one
             // line's row, so on a single line they sit as they did when centred.
@@ -435,7 +514,7 @@ struct Composer: View {
                 .frame(height: T.Size.composerRow)
                 .help("Add to message")
                 .popover(isPresented: $plusMenuOpen, arrowEdge: .bottom) {
-                    PlusMenu { plusMenuOpen = false }
+                    PlusMenu(canUpload: attachment?.enabled == true, onUpload: uploadFile) { plusMenuOpen = false }
                 }
 
                 input
@@ -455,6 +534,8 @@ struct Composer: View {
         // the old channel left behind does not slide out in the new one.
         .transaction(value: channelID) { $0.animation = nil }
         .animation(T.Motion.composer, value: reply != nil)
+        // D6: the same spring, keyed on the attachment count.
+        .animation(T.Motion.composer, value: attachments.wrappedValue.count)
         .padding(T.Spacing.sm)
         .containerShape(RoundedRectangle(cornerRadius: T.Radius.composer, style: .continuous))
         .glassEffect(.regular, in: .rect(cornerRadius: T.Radius.composer))
@@ -487,7 +568,9 @@ struct Composer: View {
             ZStack(alignment: .topLeading) {
                 ComposerEditor(
                     text: $draft, windowTick: $windowTick, label: "Message", onSubmit: submit,
-                    onCancelReply: reply == nil ? nil : { reply = nil }
+                    onCancelReply: reply == nil ? nil : { reply = nil },
+                    // Files, images and long text attach only where attaching is allowed (OA A26, CU-10).
+                    onPaste: attachment?.enabled == true ? { [channelID] in attachment?.paste($0, conversation: channelID) ?? false } : nil
                 )
                 if draft.isEmpty {
                     Text("Message")
@@ -512,12 +595,37 @@ struct Composer: View {
         }
     }
 
-    /// Return, from the editor, which has already left marked text to the input method.
+    /// Return, from the editor, which has already left marked text to the input method. Queued files
+    /// send with the draft, even a blank one (OA A11); core's limits can refuse, keeping everything.
     private func submit() {
-        let outcome = ComposerSubmit.submit(&draft, reply: &reply, hasMarkedText: false, limit: limit, onSend: onSend)
-        if case .tooLong(let length, let limit) = outcome {
+        var files = attachments.wrappedValue
+        let services = attachment?.services
+        let conversation = channelID
+        let outcome = ComposerSubmit.submit(
+            &draft, reply: &reply, attachments: &files, hasMarkedText: false, limit: limit, onSend: onSend,
+            onSendFiles: services.map { services in
+                { text, files, target in
+                    MainActor.assumeIsolated {
+                        services.send(AttachmentSendRequest(conversation: conversation, text: text, files: files, reply: target))
+                    }
+                }
+            })
+        if files != attachments.wrappedValue { attachments.wrappedValue = files }
+        switch outcome {
+        case .tooLong(let length, let limit):
             tooLong = MessageLength.tooLong(length: length, limit: limit, premiumType: premiumType)
+        case .attachmentLimit(let limit):
+            attachment?.alert = AttachmentAlert(for: limit, premiumType: premiumType)
+        case .sent, .ignored:
+            break
         }
+    }
+
+    /// "Upload a File": the panel, then the files join this conversation's queue.
+    private func uploadFile() {
+        plusMenuOpen = false
+        let conversation = channelID
+        Task { await attachment?.uploadFile(conversation: conversation) }
     }
 }
 
@@ -614,10 +722,12 @@ struct ReplyBar: View {
 /// popover material rather than a narrow native menu (user decision 2026-10-13). Entries only
 /// dismiss for now; their actions arrive with the features they open.
 struct PlusMenu: View {
+    /// "Upload a File" exists only where attaching is allowed (plan CUA, OA A26).
+    var canUpload = false
+    var onUpload: () -> Void = {}
     let dismiss: () -> Void
 
     private let entries: [(title: String, symbol: String)] = [
-        ("Upload a File", "arrow.up.doc"),
         ("Create Thread", "bubble.left.and.text.bubble.right"),
         ("Use Apps", "square.grid.2x2"),
         ("Create Poll", "chart.bar.xaxis"),
@@ -625,6 +735,7 @@ struct PlusMenu: View {
 
     var body: some View {
         VStack(spacing: T.Spacing.xs) {
+            if canUpload { PlusMenuRow(title: "Upload a File", symbol: "arrow.up.doc", action: onUpload) }
             ForEach(entries, id: \.title) { entry in
                 PlusMenuRow(title: entry.title, symbol: entry.symbol, action: dismiss)
             }

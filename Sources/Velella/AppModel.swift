@@ -49,12 +49,19 @@ final class AppModel {
     /// Bumped by every `openMessages`; only snapshots of the latest subscription are applied, so a
     /// late one from an earlier visit to the same channel (X, Y, back to X) is dropped too.
     @ObservationIgnored private var messagesOpen: UInt64 = 0
+    /// The sends with files this run started (composer plan CUA): which temp files go when a send's
+    /// row leaves, and which cancelled rows are ours to put back in the composer.
+    @ObservationIgnored private var pendingSends = PendingSends()
+    /// ATTACH_FILES' bit number in core's permission table (menu plan F1: the one list bits are tested against).
+    @ObservationIgnored private lazy var attachFilesBit: UInt8? = permissionTable().first { $0.name == "ATTACH_FILES" }?.bit
 
     init(demo: Bool) {
         isDemo = demo
         Self.configureLaunchIdentity(demo: demo)
         shell = demo ? .demo : .signedOut
         if !demo {
+            // CU-1: files a previous run synthesized and left behind.
+            AttachmentFiles.sweep()
             observeActivity()
             restore()
         }
@@ -246,6 +253,7 @@ final class AppModel {
         channelsGuild = nil
         guildNames = [:]
         members.teardown()
+        discardAttachmentFiles()
         messagesSub = nil
         messagesChannel = nil
         messagesGuild = nil
@@ -254,6 +262,7 @@ final class AppModel {
         shell.messageLoad = .idle
         shell.older = .idle
         shell.typing = []
+        shell.attachPermission = .unknown
         // A reply target belongs to the conversation it was picked in.
         shell.reply = nil
     }
@@ -299,6 +308,118 @@ final class AppModel {
         _ = handle.sendMessage(channelId: channel, content: text, replyTo: ReplyTarget.replyID(target, sendingTo: channel))
     }
 
+    // MARK: Attachments (composer plan CUA)
+
+    /// What the composer's attachments call: core's CU surface and `AttachmentFiles` (CU-1, CU-6).
+    @ObservationIgnored lazy var attachmentServices = AttachmentServices(
+        identity: { url in
+            AttachmentFiles.identity(of: url).map {
+                QueuedFileIdentity(path: $0.path(), device: $0.device(), inode: $0.inode(), size: $0.size(), mtimeNs: $0.mtimeNs())
+            }
+        },
+        write: { try AttachmentFiles.write($0, named: $1) },
+        remove: { AttachmentFiles.remove($0) },
+        makeDirectory: {
+            // CU-1: the same `<root>/<UUID>/` shape `AttachmentFiles.write` makes, for received promises.
+            let directory = AttachmentFiles.root.appendingPathComponent(UUID().uuidString, isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            return directory
+        },
+        limits: { [unowned self] conversation, sizes, stage in
+            guard let handle, let channel = UInt64(conversation) else { return nil }
+            return handle.attachmentLimits(channelId: channel, sizes: sizes, at: stage == .add ? .add : .send).map(Self.limit)
+        },
+        conversion: { [unowned self] kind in
+            guard let handle else { return .off }
+            switch handle.imageConversionConfig(kind: kind == .heic ? .heic : .jxr) {
+            case .enabled(let quality, let maxFileSizeBytes): return .enabled(quality: quality, maxFileSizeBytes: maxFileSizeBytes)
+            case .unknown, .disabled: return .off
+            }
+        },
+        send: { [unowned self] request in sendAttachments(request) },
+        cancel: { [unowned self] id in _ = UInt64(id).map { handle?.cancelUpload(nonce: $0) } },
+        retry: { [unowned self] id in _ = UInt64(id).map { handle?.retryUpload(nonce: $0) } },
+        discard: { [unowned self] id in
+            // The UI deletes the files (it has the row's descriptors); here the send is forgotten.
+            _ = UInt64(id).map { handle?.discardUpload(nonce: $0) }
+            _ = pendingSends.take(id: id)
+        }
+    )
+
+    /// Files with the draft's text (or none), or Shift-drop's instant send, to `request.conversation`.
+    /// Core checks the permission and the limits again and refuses what it must.
+    private func sendAttachments(_ request: AttachmentSendRequest) -> AttachmentSendOutcome {
+        guard let handle, let channel = UInt64(request.conversation) else { return .refused }
+        let descriptors = request.files.map { file in
+            AttachmentDescriptor(
+                file: UploadFile(
+                    path: file.file.path, device: file.file.device, inode: file.file.inode, size: file.file.size, mtimeNs: file.file.mtimeNs),
+                filename: file.filename, description: file.altText, spoiler: file.spoiler, contentType: file.contentType,
+                originalMd5: file.originalMD5)
+        }
+        let result = handle.sendWithAttachments(
+            channelId: channel, content: request.text, attachments: descriptors,
+            replyTo: ReplyTarget.replyID(request.reply, sendingTo: channel), instant: request.instant)
+        switch result {
+        case .started(let nonce):
+            pendingSends.begin(id: String(nonce), conversation: request.conversation, paths: request.files.map(\.file.path))
+            return .started
+        case .limit(let error): return .limit(Self.limit(error))
+        case .noFiles, .notAllowed, .notReady, .notOpen: return .refused
+        }
+    }
+
+    private static func limit(_ error: AttachmentLimitError) -> AttachmentLimit {
+        switch error {
+        case .tooManyFiles(let limit): .tooManyFiles(limit: Int(limit))
+        case .emptyFile: .emptyFile
+        case .fileTooLarge(let limit): .fileTooLarge(limit: limit)
+        case .totalTooLarge(let limit): .totalTooLarge(limit: limit)
+        }
+    }
+
+    /// A pending send's row as the UI draws it: core's descriptors, progress and outcome, field for field.
+    private static func upload(_ upload: PendingUpload) -> PendingUploadItem {
+        let state: PendingUploadItem.State = switch upload.outcome {
+        case .sending: .sending
+        case .failed: .failed
+        case .cancelled: .cancelled
+        }
+        return PendingUploadItem(
+            files: upload.files.map { file in
+                let descriptor = file.descriptor, identity = descriptor.file()
+                return PendingUploadItem.File(
+                    attachment: QueuedAttachment(
+                        file: QueuedFileIdentity(
+                            path: identity.path(), device: identity.device(), inode: identity.inode(), size: identity.size(),
+                            mtimeNs: identity.mtimeNs()),
+                        filename: descriptor.filename(), altText: descriptor.altText(), spoiler: descriptor.spoiler(),
+                        contentType: descriptor.contentType(), originalMD5: descriptor.originalMd5()),
+                    sent: file.sent)
+            },
+            replyTo: upload.replyTo, instant: upload.instant, state: state)
+    }
+
+    /// What the open conversation lets this user attach: ATTACH_FILES, always in a DM, Unknown until
+    /// core knows (which hides the upload entries).
+    private func refreshAttachPermission() {
+        var permission = AttachPermission.unknown
+        if let handle, let channel = messagesChannel {
+            switch handle.channelPermissions(channelId: channel) {
+            case .private: permission = .allowed
+            case .bits(let bits): permission = attachFilesBit.map { AttachPermission(bits: bits, attachBit: $0) } ?? .unknown
+            case .unknown: break
+            }
+        }
+        if shell.attachPermission != permission { shell.attachPermission = permission }
+    }
+
+    /// Sign-out, a new session: every temp file still held by a queue or a pending send goes (CU-1).
+    private func discardAttachmentFiles() {
+        for file in shell.takeAllAttachments() { AttachmentFiles.remove(file.url) }
+        for path in pendingSends.takeAll() { AttachmentFiles.remove(URL(fileURLWithPath: path)) }
+    }
+
     /// Core's one-line reply preview of a buffered message of the open conversation (spoilers as
     /// the placeholder), flattened now; nil when it is not buffered.
     func replyPreview(_ messageID: String) -> String? {
@@ -327,12 +448,16 @@ final class AppModel {
         shell.typing = []
         // A reply target belongs to the conversation it was picked in.
         shell.reply = nil
-        guard let target, let handle, let generation else { return }
+        guard let target, let handle, let generation else {
+            shell.attachPermission = .unknown
+            return
+        }
         messagesChannel = target
         // `syncSelection` ran first for a rail change, so this is the open target's guild; nil in
         // DM mode, where the rail entry is not a guild.
         messagesGuild = shell.isDMMode ? nil : channelsGuild
         shell.messageLoad = .loading
+        refreshAttachPermission()
         messagesSub = handle.subscribeMessages(
             channelId: target,
             listener: MessageSnapshots(model: self, generation: generation, open: messagesOpen)
@@ -342,7 +467,7 @@ final class AppModel {
     fileprivate func apply(messages snapshot: MessagesSnapshot, open: UInt64, generation gen: UInt64) {
         // A late snapshot of a dropped subscription must not fill another conversation.
         guard gen == generation, open == messagesOpen else { return }
-        shell.messages = snapshot.rows.map { row in
+        var items = snapshot.rows.map { row in
             MessageItem.live(
                 id: row.id, authorId: row.authorId, authorName: row.authorName, authorColor: row.authorColor,
                 avatarURL: row.authorAvatarUrl, timestampMs: row.timestampMs, content: row.content,
@@ -350,9 +475,20 @@ final class AppModel {
                 files: row.files, replyAuthor: row.reply?.authorName, replyContent: row.reply?.content,
                 pending: row.pending, failure: row.failure,
                 reactions: row.reactions.map { ($0.name, $0.url, $0.count, $0.me) },
-                embeds: row.embeds.map { Self.embed($0, row: row) }, imageSpoilers: row.images.map(\.spoiler)
+                embeds: row.embeds.map { Self.embed($0, row: row) }, imageSpoilers: row.images.map(\.spoiler),
+                upload: row.upload.map(Self.upload)
             )
         }
+        // Cancelled sends of ours go back to the composer and their rows are discarded; the files of
+        // sends whose row left (confirmed) are deleted (D14a, CU-1).
+        if let channel = messagesChannel {
+            let result = shell.reconcileUploads(conversation: String(channel), rows: items, sends: &pendingSends)
+            result.discard.forEach { id in _ = UInt64(id).map { handle?.discardUpload(nonce: $0) } }
+            result.deletePaths.forEach { AttachmentFiles.remove(URL(fileURLWithPath: $0)) }
+            items.removeAll { $0.upload?.state == .cancelled }
+        }
+        shell.messages = items
+        refreshAttachPermission()
         // With the rows, never apart from them: the menu builds a row's link from these.
         shell.conversation = ConversationIDs(channel: messagesChannel, guild: messagesGuild)
         shell.typing = snapshot.typing

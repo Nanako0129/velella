@@ -463,6 +463,15 @@ func footprint() -> UInt64 {
     #expect(!FileManager.default.fileExists(atPath: AttachmentFiles.root.path))
 }
 
+/// The composer queues a file by `identity(of:)`'s resolved path, which spells the system temporary
+/// directory as `/private/var/...`; removing by that path must still delete the directory (CUA).
+@Test func aSynthesizedFileIsRemovedByItsResolvedPath() throws {
+    let written = try AttachmentFiles.write(Data("pasted".utf8), named: "message.txt")
+    let identity = try #require(AttachmentFiles.identity(of: written))
+    AttachmentFiles.remove(URL(fileURLWithPath: identity.path()))
+    #expect(!FileManager.default.fileExists(atPath: written.deletingLastPathComponent().path))
+}
+
 // MARK: Redaction (CU-7)
 
 @Test func nothingThatCarriesAPathNameOrAltTextPrintsIt() throws {

@@ -196,6 +196,9 @@ public struct MessageItem: Identifiable, Hashable, Sendable {
     public var reactions: [ReactionItem]
     /// At most 10, under the attachments (wave 3 E).
     public var embeds: [EmbedItem]
+    /// A send with files not yet confirmed (composer plan CUA): the row draws upload cards, and
+    /// core's echo row is the only source of its progress and outcome.
+    public var upload: PendingUploadItem?
     /// Without a `body`, `text` shows as one plain paragraph. Without an `authorId` (fixtures,
     /// previews) the name stands in for it.
     public init(
@@ -203,14 +206,14 @@ public struct MessageItem: Identifiable, Hashable, Sendable {
         body: MessageBody? = nil,
         displayNameStyle: DisplayNameStyle? = nil, images: [ImageAttachment] = [], files: [String] = [],
         reply: ReplyPreview? = nil, edited: Bool = false, delivery: Delivery = .sent, reactions: [ReactionItem] = [],
-        embeds: [EmbedItem] = []
+        embeds: [EmbedItem] = [], upload: PendingUploadItem? = nil
     ) {
         self.id = id; self.authorId = authorId ?? authorName; self.authorName = authorName; self.authorColor = authorColor
         self.avatar = avatar; self.timestamp = timestamp; self.text = text
         self.body = body ?? MessageBody(text: text)
         self.displayNameStyle = displayNameStyle; self.images = images; self.files = files
         self.reply = reply; self.edited = edited; self.delivery = delivery; self.reactions = reactions
-        self.embeds = embeds
+        self.embeds = embeds; self.upload = upload
     }
 }
 
@@ -239,7 +242,7 @@ public extension MessageItem {
         content: String, body: MessageBody, edited: Bool, images: [(url: String, width: UInt32, height: UInt32)],
         files: [String], replyAuthor: String?, replyContent: String?, pending: Bool, failure: String?,
         reactions: [(name: String, url: String?, count: UInt32, me: Bool)] = [],
-        embeds: [EmbedItem] = [], imageSpoilers: [Bool] = []
+        embeds: [EmbedItem] = [], imageSpoilers: [Bool] = [], upload: PendingUploadItem? = nil
     ) -> MessageItem {
         MessageItem(
             id: String(id), authorId: String(authorId), authorName: authorName, authorColor: authorColor.map { RGB(rgb: $0) },
@@ -255,7 +258,7 @@ public extension MessageItem {
             edited: edited,
             delivery: failure.map(Delivery.failed) ?? (pending ? .pending : .sent),
             reactions: reactions.map { ReactionItem(name: $0.name, imageURL: $0.url.flatMap { URL(string: $0) }, count: $0.count, me: $0.me) },
-            embeds: embeds
+            embeds: embeds, upload: upload
         )
     }
 }
@@ -279,6 +282,33 @@ public enum ComposerSubmit {
         case ignored
         /// Over the limit (official validator MESSAGE_TOO_LONG): nothing was sent and the draft is kept.
         case tooLong(length: Int, limit: Int)
+        /// Core's attachment limits refused the send: the draft, the reply and the files are kept.
+        case attachmentLimit(AttachmentLimit)
+    }
+
+    /// `submit` for a composer holding queued files (composer plan CUA, OA A11): a Return sends even
+    /// with a blank draft, the files going through `onSendFiles`. Nothing is cleared unless core
+    /// started the send (`.started`); the text length rule is the plain submit's. Without files this
+    /// is the plain submit.
+    @discardableResult
+    public static func submit(
+        _ draft: inout String, reply: inout ReplyPreview?, attachments: inout [QueuedAttachment], hasMarkedText: Bool,
+        limit: Int = .max, onSend: ((String, ReplyTarget?) -> Void)?,
+        onSendFiles: ((String, [QueuedAttachment], ReplyTarget?) -> AttachmentSendOutcome)?
+    ) -> Outcome {
+        guard !attachments.isEmpty else { return submit(&draft, reply: &reply, hasMarkedText: hasMarkedText, limit: limit, onSend: onSend) }
+        guard let onSendFiles, !hasMarkedText else { return .ignored }
+        let length = MessageLength.length(draft)
+        if length > limit { return .tooLong(length: length, limit: limit) }
+        switch onSendFiles(draft, attachments, reply?.target) {
+        case .started:
+            draft = ""
+            reply = nil
+            attachments = []
+            return .sent
+        case .limit(let limit): return .attachmentLimit(limit)
+        case .refused: return .ignored
+        }
     }
 
     /// `submit` for a composer that may be replying: the send carries the reply's whole target
@@ -534,6 +564,10 @@ public struct ShellState: Equatable, Sendable {
     /// The user's `premium_type` from core's `self_state()` (nil: Unknown, before READY); the
     /// composer's message-length limit follows it (`MessageLength.limit`).
     public var premiumType: UInt8?
+    /// Files queued in each conversation's composer (`openTarget`), kept like the drafts.
+    public var attachmentQueues: [String: [QueuedAttachment]] = [:]
+    /// What the open conversation allows (ATTACH_FILES); Unknown until core answers.
+    public var attachPermission: AttachPermission = .unknown
 
     public init(
         rail: [RailItem] = [], selectedRailID: String? = nil, serverName: String? = nil,
@@ -574,11 +608,328 @@ public struct ShellState: Equatable, Sendable {
         set { if let openTarget { drafts[openTarget] = newValue.isEmpty ? nil : newValue } }
     }
 
+    /// The open conversation's queued files.
+    public var attachmentQueue: [QueuedAttachment] {
+        get { openTarget.flatMap { attachmentQueues[$0] } ?? [] }
+        set { if let openTarget { attachmentQueues[openTarget] = newValue.isEmpty ? nil : newValue } }
+    }
+
     public var header: ChannelHeader? {
         if isDMMode {
             return dms.first { $0.id == selectedDMID }.map { ChannelHeader(name: $0.name, kind: nil) }
         }
         return categories.flatMap(\.channels).flatMap { [$0] + $0.threads }.first { $0.id == selectedChannelID }
             .map { ChannelHeader(name: $0.name, topic: $0.topic, kind: $0.kind) }
+    }
+}
+
+// MARK: Attachments (composer plan CUA)
+
+/// An attached file's identity, recorded when it was attached (CU-6): the resolved path and
+/// (device, inode, size, mtime), compared again when the upload opens the file.
+public struct QueuedFileIdentity: Hashable, Sendable {
+    public var path: String
+    public var device: UInt64, inode: UInt64, size: UInt64, mtimeNs: Int64
+    public init(path: String, device: UInt64, inode: UInt64, size: UInt64, mtimeNs: Int64) {
+        self.path = path; self.device = device; self.inode = inode; self.size = size; self.mtimeNs = mtimeNs
+    }
+}
+
+/// One file queued in a composer, or one file of a pending send: nothing is uploaded until Return (D10).
+public struct QueuedAttachment: Identifiable, Hashable, Sendable {
+    public var id: UUID
+    public var file: QueuedFileIdentity
+    /// The name the message shows (Modify edits it); the upload slot keeps the file's own name.
+    public var filename: String
+    /// Alt text; sent whenever set, `""` included (OA A10).
+    public var altText: String?
+    public var spoiler: Bool
+    /// The original's MIME type, `""` when unknown (CU-5).
+    public var contentType: String
+    /// A converted HEIC or JXR's original MD5, lowercase hex (D16a).
+    public var originalMD5: String?
+
+    public init(
+        id: UUID = UUID(), file: QueuedFileIdentity, filename: String? = nil, altText: String? = nil, spoiler: Bool = false,
+        contentType: String = "", originalMD5: String? = nil
+    ) {
+        self.id = id; self.file = file
+        self.filename = filename ?? URL(fileURLWithPath: file.path).lastPathComponent
+        self.altText = altText; self.spoiler = spoiler; self.contentType = contentType; self.originalMD5 = originalMD5
+    }
+
+    public var url: URL { URL(fileURLWithPath: file.path) }
+    public var size: UInt64 { file.size }
+}
+
+/// What the open conversation lets the user attach (OA A26): ATTACH_FILES in a guild channel, always
+/// in a DM. Unknown (before core has the answer) hides the upload entries, as menu S-6 does.
+public enum AttachPermission: Equatable, Sendable {
+    case allowed, denied, unknown
+
+    public var permitsAttaching: Bool { self == .allowed }
+
+    /// A guild channel's permission bits; `attachBit` is ATTACH_FILES' number in the official table.
+    public init(bits: UInt64, attachBit: UInt8) {
+        self = bits & (1 << UInt64(attachBit)) != 0 ? .allowed : .denied
+    }
+}
+
+/// A send with files, as the message row draws it (the single source is core's echo row).
+public struct PendingUploadItem: Hashable, Sendable {
+    public struct File: Hashable, Sendable {
+        public var attachment: QueuedAttachment
+        /// Bytes the upload host has.
+        public var sent: UInt64
+        public init(attachment: QueuedAttachment, sent: UInt64) { self.attachment = attachment; self.sent = sent }
+        /// 0...1, for the progress bar.
+        public var fraction: Double { attachment.size == 0 ? 0 : min(1, Double(sent) / Double(attachment.size)) }
+    }
+    public enum State: Hashable, Sendable { case sending, failed, cancelled }
+
+    public var files: [File]
+    public var replyTo: UInt64?
+    public var instant: Bool
+    public var state: State
+    public init(files: [File], replyTo: UInt64? = nil, instant: Bool = false, state: State) {
+        self.files = files; self.replyTo = replyTo; self.instant = instant; self.state = state
+    }
+}
+
+/// The sends this run started, by their row's id: which conversation, and which files to delete once
+/// the row is gone (CU-1: sent, discarded or torn down; a cancelled send's files go back to the composer).
+public struct PendingSends: Sendable {
+    private struct Send { var conversation: String; var paths: [String]; var seen = false }
+    private var sends: [String: Send] = [:]
+    public init() {}
+
+    public mutating func begin(id: String, conversation: String, paths: [String]) {
+        sends[id] = Send(conversation: conversation, paths: paths)
+    }
+
+    /// The paths of send `id`, forgotten (a discarded failed send).
+    public mutating func take(id: String) -> [String] { sends.removeValue(forKey: id)?.paths ?? [] }
+
+    /// Every tracked path (sign-out, teardown).
+    public mutating func takeAll() -> [String] {
+        defer { sends = [:] }
+        return sends.values.flatMap(\.paths)
+    }
+
+    /// The tracked sends of `conversation` whose row was in an earlier snapshot and is not in `rows`:
+    /// confirmed, or discarded elsewhere. Their paths, forgotten. A send never seen yet is kept: a
+    /// snapshot taken before it began can still arrive.
+    mutating func finished(conversation: String, rows: [MessageItem]) -> [String] {
+        let present = Set(rows.map(\.id))
+        var gone: [String] = []
+        for (id, send) in sends where send.conversation == conversation {
+            if present.contains(id) {
+                sends[id]?.seen = true
+            } else if send.seen {
+                gone.append(contentsOf: send.paths)
+                sends[id] = nil
+            }
+        }
+        return gone
+    }
+
+    func tracks(_ id: String) -> Bool { sends[id] != nil }
+}
+
+public extension ShellState {
+    /// Applies a fresh snapshot of `conversation`'s rows to the sends this run started (CU Flow, D14a):
+    /// a cancelled send's text, reply and files go back to the composer (its row is then discarded);
+    /// the files of a send whose row left (confirmed) are returned for deletion. Rows of sends this
+    /// run did not start are left alone.
+    mutating func reconcileUploads(
+        conversation: String, rows: [MessageItem], sends: inout PendingSends
+    ) -> (discard: [String], deletePaths: [String]) {
+        var discard: [String] = []
+        for row in rows where row.upload?.state == .cancelled && sends.tracks(row.id) {
+            _ = sends.take(id: row.id)
+            restoreCancelled(row, conversation: conversation)
+            discard.append(row.id)
+        }
+        return (discard, sends.finished(conversation: conversation, rows: rows))
+    }
+
+    /// D14a: puts a cancelled send's files first in the queue, its text before whatever was typed
+    /// since, and its reply back when none is set and the row still shows it.
+    mutating func restoreCancelled(_ message: MessageItem, conversation: String) {
+        guard let upload = message.upload else { return }
+        attachmentQueues[conversation, default: []].insert(contentsOf: upload.files.map(\.attachment), at: 0)
+        if !message.text.isEmpty {
+            let typed = drafts[conversation] ?? ""
+            drafts[conversation] = typed.isEmpty ? message.text : message.text + "\n" + typed
+        }
+        if reply == nil, let id = upload.replyTo, let preview = message.reply {
+            reply = ReplyPreview(authorName: preview.authorName, segments: preview.segments, messageID: String(id), channelID: conversation)
+        }
+    }
+
+    /// Every queued file, removed (sign-out, teardown).
+    mutating func takeAllAttachments() -> [QueuedAttachment] {
+        defer { attachmentQueues = [:] }
+        return attachmentQueues.values.flatMap { $0 }
+    }
+}
+
+// MARK: Attachment services (composer plan CUA)
+
+/// The limit a set of files breaks (core's `attachment_limits`); the composer shows the official
+/// alert for each (OA A18, A37).
+public enum AttachmentLimit: Equatable, Sendable {
+    case tooManyFiles(limit: Int)
+    case emptyFile
+    case fileTooLarge(limit: UInt64)
+    case totalTooLarge(limit: UInt64)
+}
+
+/// When a limits check runs (OA A36): on add, an account with premium is checked only for count and
+/// emptiness; at send, every account is checked in full.
+public enum LimitStage: Sendable { case add, send }
+
+/// The outcome of asking core to send files.
+public enum AttachmentSendOutcome: Equatable, Sendable {
+    /// The send is under way: its echo row appears in the message list.
+    case started
+    case limit(AttachmentLimit)
+    /// Core sent nothing (no permission, not ready, not the open channel, no files).
+    case refused
+}
+
+/// HEIC and JXR are converted to JPEG before upload exactly when the account's experiment says so (D16a).
+public enum ConvertibleKind: Sendable { case heic, jxr }
+
+public enum ImageConversionSetting: Equatable, Sendable {
+    /// Disabled or not yet known: the original is uploaded.
+    case off
+    case enabled(quality: UInt8, maxFileSizeBytes: UInt64)
+}
+
+/// One send of files for core: the conversation is the one the files were attached to, captured when
+/// the user acted (a drop, a Return), never read later.
+public struct AttachmentSendRequest: Sendable {
+    public var conversation: String
+    public var text: String
+    public var files: [QueuedAttachment]
+    public var reply: ReplyTarget?
+    /// Shift-drop: empty text, context location `instant_upload` (OA A35).
+    public var instant: Bool
+    public init(conversation: String, text: String, files: [QueuedAttachment], reply: ReplyTarget? = nil, instant: Bool = false) {
+        self.conversation = conversation; self.text = text; self.files = files; self.reply = reply; self.instant = instant
+    }
+}
+
+/// What the composer's attachments need from outside VelellaUI, which has no FFI: the app puts core
+/// and `AttachmentFiles` behind these (the file functions are `AttachmentFiles.identity`, `write` and
+/// `remove`, CU-1 and CU-6).
+public struct AttachmentServices: Sendable {
+    /// CU-6: the identity of a regular file (links resolved); nil for anything else.
+    public var identity: @Sendable (URL) -> QueuedFileIdentity?
+    /// CU-1: writes `<temporary>/velella-attachments/<UUID>/<name>`, never over another file.
+    public var write: @Sendable (Data, String) throws -> URL
+    /// Deletes a synthesized file with its directory; leaves any other file alone.
+    public var remove: @Sendable (URL) -> Void
+    /// CU-1 for received file promises: creates a fresh `<temporary>/velella-attachments/<UUID>/` and
+    /// returns it; `remove` of any file inside it deletes it again.
+    public var makeDirectory: @Sendable () throws -> URL
+    public var limits: @MainActor @Sendable (_ conversation: String, _ sizes: [UInt64], _ stage: LimitStage) -> AttachmentLimit?
+    public var conversion: @MainActor @Sendable (ConvertibleKind) -> ImageConversionSetting
+    public var send: @MainActor @Sendable (AttachmentSendRequest) -> AttachmentSendOutcome
+    /// Cancel, retry and discard act on a pending row by its id.
+    public var cancel: @MainActor @Sendable (String) -> Void
+    public var retry: @MainActor @Sendable (String) -> Void
+    public var discard: @MainActor @Sendable (String) -> Void
+
+    public init(
+        identity: @escaping @Sendable (URL) -> QueuedFileIdentity?,
+        write: @escaping @Sendable (Data, String) throws -> URL,
+        remove: @escaping @Sendable (URL) -> Void,
+        makeDirectory: @escaping @Sendable () throws -> URL,
+        limits: @escaping @MainActor @Sendable (String, [UInt64], LimitStage) -> AttachmentLimit?,
+        conversion: @escaping @MainActor @Sendable (ConvertibleKind) -> ImageConversionSetting,
+        send: @escaping @MainActor @Sendable (AttachmentSendRequest) -> AttachmentSendOutcome,
+        cancel: @escaping @MainActor @Sendable (String) -> Void,
+        retry: @escaping @MainActor @Sendable (String) -> Void,
+        discard: @escaping @MainActor @Sendable (String) -> Void
+    ) {
+        self.identity = identity; self.write = write; self.remove = remove; self.makeDirectory = makeDirectory; self.limits = limits
+        self.conversion = conversion; self.send = send; self.cancel = cancel; self.retry = retry; self.discard = discard
+    }
+}
+
+/// The official alert copy for each limit (OA A18, A37), read from the web client's upload-error path
+/// (`openUploadError`): a per-file limit for anyone but a Nitro user (`premium_type` 2) opens the
+/// upsell modal, every other case the plain one with a single "Got It".
+public struct AttachmentAlert: Equatable, Sendable {
+    public var title: String
+    public var message: String
+    /// The Nitro upsell modal: "Get Nitro" and "View All Nitro Perks" (both lead to the Nitro page,
+    /// velella having no store) instead of "Got It".
+    public var showsUpsell: Bool
+
+    public static let tooPowerful = "Your files are too powerful"
+    /// The upsell modal's title (`9C+41g`) and its two buttons (`pj0XBN`, `ZnqyZ2`); the primary label
+    /// is the default one (a trial or discount replaces it for some accounts).
+    public static let upsellTitle = "Uh oh, this file exceeds the size limit."
+    public static let upsellPrimary = "Get Nitro"
+    public static let upsellSecondary = "View All Nitro Perks"
+    /// The plain modal's only button (`NX+WJN`).
+    public static let dismiss = "Got It"
+    /// What the upsell says a Nitro user may upload (`getMaxFileSizeForPremiumType(TIER_2)`): 500 MB.
+    /// Unverified: under the 1 GiB rollout experiment the official client says "1GB", which the UI
+    /// does not know (core's per-account answer is not passed this far).
+    public static let nitroLimit: UInt64 = 524_288_000
+
+    /// humanize.js `filesize(bytes)`, which the plain modals use (`453771.Hb`, module 796873):
+    /// 1024-based, "bytes" below 1024 with no decimals, else two decimals, a space and KB/MB/GB/TB,
+    /// and "," between thousands. 500 MB reads "500.00 MB", 1 GiB "1.00 GB".
+    static func size(_ bytes: UInt64) -> String {
+        if bytes == 0 { return "0 bytes" }
+        let units = ["bytes", "KB", "MB", "GB", "TB", "PB"]
+        let value = Double(bytes)
+        let unit = units.indices.first { value < pow(1024, Double($0 + 1)) } ?? units.count - 1
+        let decimals = unit == 0 ? 0 : 2
+        let fixed = String(format: "%.\(decimals)f", value / pow(1024, Double(unit)))
+        let parts = fixed.split(separator: ".", maxSplits: 1)
+        var integer = String(parts[0])
+        var grouped = ""
+        while integer.count > 3 {
+            grouped = "," + integer.suffix(3) + grouped
+            integer.removeLast(3)
+        }
+        let fraction = parts.count > 1 ? "." + parts[1] : ""
+        return integer + grouped + fraction + " " + units[unit]
+    }
+
+    /// The official `formatFileSize(bytes / 1024, {useKibibytes: true})` the upsell uses, with no
+    /// `useSpace` (so no space): whole MB rounded up, and from 1024 MB whole GB. 20 MiB is "20MB".
+    static func upsellSize(_ bytes: UInt64) -> String {
+        let megabytes = Int((Double(bytes) / 1024 / 1024).rounded(.up))
+        return megabytes < 1024 ? "\(megabytes)MB" : "\(Int((Double(megabytes) / 1024).rounded()))GB"
+    }
+
+    public init(for limit: AttachmentLimit, premiumType: UInt8?) {
+        switch limit {
+        case .fileTooLarge(let max) where premiumType != 2:
+            // `+R2TzS` with maxSize = the effective limit and premiumMaxSize = TIER_2's.
+            self.init(
+                title: Self.upsellTitle,
+                message: "The max file size is \(Self.upsellSize(max)). Upgrade to Discord Nitro to upload files up to \(Self.upsellSize(Self.nitroLimit)).",
+                showsUpsell: true)
+        case .fileTooLarge(let max):
+            self.init(title: Self.tooPowerful, message: "Max file size is \(Self.size(max)) please.", showsUpsell: false)
+        case .totalTooLarge(let max):
+            self.init(title: Self.tooPowerful, message: "Total message size must be less than \(Self.size(max))", showsUpsell: false)
+        case .emptyFile:
+            self.init(title: "Upload Failed", message: "File cannot be empty", showsUpsell: false)
+        case .tooManyFiles(let limit):
+            self.init(title: "Too many uploads!", message: "You can only upload \(limit) files at a time!", showsUpsell: false)
+        }
+    }
+
+    init(title: String, message: String, showsUpsell: Bool) {
+        self.title = title; self.message = message; self.showsUpsell = showsUpsell
     }
 }
