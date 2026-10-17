@@ -353,6 +353,16 @@ private func queued(_ name: String, size: UInt64 = 10, contentType: String = "",
     #expect(AttachmentAlert.upsellSize(1_610_612_736) == "2GB")
 }
 
+/// humanize.js `filesize`, the plain modals' format (`453771.Hb`), computed by hand from its rules.
+@Test func thePlainModalsFormatSizesAsHumanizeFilesizeDoes() {
+    let vectors: [(UInt64, String)] = [
+        (0, "0 bytes"), (512, "512 bytes"), (1_024, "1.00 KB"), (1_536, "1.50 KB"),
+        (10_485_760, "10.00 MB"), (20_971_520, "20.00 MB"), (52_428_800, "50.00 MB"),
+        (524_288_000, "500.00 MB"), (1_073_741_824, "1.00 GB"), (1_073_741_823, "1,024.00 MB"),
+    ]
+    for (bytes, text) in vectors { #expect(AttachmentAlert.size(bytes) == text, "\(bytes)") }
+}
+
 @Test func eachLimitHasTheOfficialAlertCopy() {
     let upsell = "The max file size is %@. Upgrade to Discord Nitro to upload files up to 500MB."
     let cases: [(UInt8?, AttachmentLimit, String, String, Bool)] = [
@@ -361,10 +371,10 @@ private func queued(_ name: String, size: UInt64 = 10, contentType: String = "",
         (1, .fileTooLarge(limit: 52_428_800), "Uh oh, this file exceeds the size limit.", String(format: upsell, "50MB"), true),
         (3, .fileTooLarge(limit: 52_428_800), "Uh oh, this file exceeds the size limit.", String(format: upsell, "50MB"), true),
         // A Nitro user gets the plain modal.
-        (2, .fileTooLarge(limit: 524_288_000), "Your files are too powerful", "Max file size is 500 MB please.", false),
+        (2, .fileTooLarge(limit: 524_288_000), "Your files are too powerful", "Max file size is 500.00 MB please.", false),
         // The total has no upsell for anyone (the official call passes no showPremiumUpsell).
-        (nil, .totalTooLarge(limit: 524_288_000), "Your files are too powerful", "Total message size must be less than 500 MB", false),
-        (2, .totalTooLarge(limit: 1_073_741_824), "Your files are too powerful", "Total message size must be less than 1 GB", false),
+        (nil, .totalTooLarge(limit: 524_288_000), "Your files are too powerful", "Total message size must be less than 500.00 MB", false),
+        (2, .totalTooLarge(limit: 1_073_741_824), "Your files are too powerful", "Total message size must be less than 1.00 GB", false),
         (2, .emptyFile, "Upload Failed", "File cannot be empty", false),
         (nil, .tooManyFiles(limit: 10), "Too many uploads!", "You can only upload 10 files at a time!", false),
     ]
@@ -396,7 +406,7 @@ private func queued(_ name: String, size: UInt64 = 10, contentType: String = "",
             #expect(rig.model.opened == [MessageLength.nitroURL])
         } else {
             #expect(shown.contains("Your files are too powerful") && shown.contains("Got It"), "\(shown)")
-            #expect(shown.contains { $0.hasPrefix("Max file size is 10 MB please.") }, "\(shown)")
+            #expect(shown.contains { $0.hasPrefix("Max file size is 10.00 MB please.") }, "\(shown)")
             #expect(!shown.contains("Get Nitro") && !shown.contains("View All Nitro Perks"), "\(shown)")
         }
         if let sheet = rig.window.attachedSheet { rig.window.endSheet(sheet) }
@@ -738,6 +748,17 @@ private final class PromiseStub: FilePromiseSource, @unchecked Sendable {
     #expect(rig.fake.files.synthesized.count == 1, "only the converted file's directory remains")
 }
 
+/// One promise delivering two files into one directory, one of them replaced by its conversion:
+/// deleting the replaced original must leave the queued sibling in place (CUA verifier F2).
+@MainActor @Test func aConvertedFileOfAMultiFilePromiseDoesNotTakeItsQueuedSiblingWithIt() async throws {
+    let rig = await Rig()
+    rig.fake.conversion = .enabled(quality: 70, maxFileSizeBytes: 20_971_520)
+    let heic = try jpegWithOrientation(width: 30, height: 20, orientation: 1)
+    await rig.controller.dropped([], promises: [PromiseStub([("IMG_9.HEIC", heic), ("notes.txt", Data("n".utf8))])], shift: false, conversation: "1")
+    #expect(rig.queue.map(\.filename) == ["IMG_9.jpg", "notes.txt"])
+    #expect(rig.queue.map { FileManager.default.fileExists(atPath: $0.url.path) } == [true, true], "both queued files still exist")
+}
+
 @MainActor @Test func aShiftDropOfAPromiseSendsTheReceivedFileAtOnce() async throws {
     let rig = await Rig()
     rig.model.draft = "kept"
@@ -988,7 +1009,7 @@ private final class PromiseStub: FilePromiseSource, @unchecked Sendable {
     await settle(rig.host)
     #expect(rig.model.draft == "caption" && rig.queue.map(\.filename) == ["a.txt"])
     let shown = await rig.alertTexts()
-    #expect(shown.contains { $0.hasPrefix("Total message size must be less than 500 MB") } && shown.contains("Got It"), "\(shown)")
+    #expect(shown.contains { $0.hasPrefix("Total message size must be less than 500.00 MB") } && shown.contains("Got It"), "\(shown)")
     if let sheet = rig.window.attachedSheet { rig.window.endSheet(sheet) }
 }
 

@@ -882,9 +882,25 @@ public struct AttachmentAlert: Equatable, Sendable {
     /// does not know (core's per-account answer is not passed this far).
     public static let nitroLimit: UInt64 = 524_288_000
 
-    /// `filesize()` as the plain modals format it (binary units): 10 MiB reads "10 MB".
+    /// humanize.js `filesize(bytes)`, which the plain modals use (`453771.Hb`, module 796873):
+    /// 1024-based, "bytes" below 1024 with no decimals, else two decimals, a space and KB/MB/GB/TB,
+    /// and "," between thousands. 500 MB reads "500.00 MB", 1 GiB "1.00 GB".
     static func size(_ bytes: UInt64) -> String {
-        ByteCountFormatter.string(fromByteCount: Int64(clamping: bytes), countStyle: .binary)
+        if bytes == 0 { return "0 bytes" }
+        let units = ["bytes", "KB", "MB", "GB", "TB", "PB"]
+        let value = Double(bytes)
+        let unit = units.indices.first { value < pow(1024, Double($0 + 1)) } ?? units.count - 1
+        let decimals = unit == 0 ? 0 : 2
+        let fixed = String(format: "%.\(decimals)f", value / pow(1024, Double(unit)))
+        let parts = fixed.split(separator: ".", maxSplits: 1)
+        var integer = String(parts[0])
+        var grouped = ""
+        while integer.count > 3 {
+            grouped = "," + integer.suffix(3) + grouped
+            integer.removeLast(3)
+        }
+        let fraction = parts.count > 1 ? "." + parts[1] : ""
+        return integer + grouped + fraction + " " + units[unit]
     }
 
     /// The official `formatFileSize(bytes / 1024, {useKibibytes: true})` the upsell uses, with no

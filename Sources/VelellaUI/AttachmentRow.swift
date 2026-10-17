@@ -161,9 +161,20 @@ final class AttachmentController {
         }
         let entries = await AttachmentIntake.entries(for: files, services: services)
         // A received file that did not become an entry (not a regular file, or replaced by its
-        // conversion) is no one's: it goes with its directory.
+        // conversion) is no one's. One promise can deliver several files into one directory, so a
+        // file whose directory still holds a queued sibling is deleted alone; otherwise it goes with
+        // its directory.
         let kept = Set(entries.map(\.file.path))
-        for url in received where !kept.contains(url.resolvingSymlinksInPath().path) { services.remove(url) }
+        let keptDirectories = Set(entries.map { URL(fileURLWithPath: $0.file.path).deletingLastPathComponent().path })
+        for url in received {
+            let resolved = url.resolvingSymlinksInPath()
+            guard !kept.contains(resolved.path) else { continue }
+            if keptDirectories.contains(resolved.deletingLastPathComponent().path) {
+                try? FileManager.default.removeItem(at: resolved)
+            } else {
+                services.remove(url)
+            }
+        }
         guard !entries.isEmpty else { return }
         guard shift else { return admit(entries, to: conversation) }
         if let limit = services.limits(conversation, entries.map(\.size), .add) { return refuse(entries, limit) }
