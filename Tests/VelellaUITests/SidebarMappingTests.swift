@@ -13,7 +13,7 @@ import Testing
 @Test func folderColorIntegersBecomeRGB() {
     #expect(RGB(rgb: 0xFF0000) == RGB(1, 0, 0))
     #expect(RGB(rgb: 0x000080) == RGB(0, 0, 128.0 / 255))
-    #expect(RGB.defaultFolder == RGB(rgb: 0x5865F2))
+    #expect(RGB.defaultFolder == RGB(rgb: 0x8E8E93), "Swiftcord's grey for a folder without a colour")
 }
 
 private func guild(_ id: String, unread: Bool = false, mentions: Int = 0, muted: Bool = false) -> RailGuild {

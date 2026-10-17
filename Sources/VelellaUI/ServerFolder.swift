@@ -4,8 +4,8 @@
 // luminanceToAlpha inverse-mask backdrop replaced by Swiftcord v2's GuildFolderBackground (a
 // 54 pt panel, folder colour at 0.1, 1 pt separator border, continuous corner 18); folder tile and
 // preview grid sized as v2's GuildRailRow / GuildRailArtwork (refs/swiftcord-v2-teardown.md, kept out of git);
-// UserDefaults persistence and the hover popover dropped (open state is local, name is a
-// `.help`); CachedAsyncImage/SwiftyGif thumbs replaced by `AvatarGlyph`.
+// the hover popover dropped (name is a `.help`); CachedAsyncImage/SwiftyGif thumbs replaced by
+// `AvatarGlyph`.
 
 import SwiftUI
 
@@ -16,7 +16,17 @@ struct ServerFolder: View {
     let folder: RailFolder
     @Binding var selectedID: String?
     @State private var hovered = false
-    @State private var open = false
+    /// Remembered per folder across launches, as Swiftcord keeps it and the official client keeps
+    /// its expanded folders locally: a folder the user left open opens open (user, 2026-10-17).
+    @AppStorage private var open: Bool
+
+    init(folder: RailFolder, selectedID: Binding<String?>) {
+        self.folder = folder
+        self._selectedID = selectedID
+        self._open = AppStorage(wrappedValue: false, Self.openKey(folder.id))
+    }
+
+    static func openKey(_ folderID: String) -> String { "railFolderOpen.\(folderID)" }
 
     var body: some View {
         VStack(spacing: T.Size.railRowSpacing) {

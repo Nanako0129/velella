@@ -16,8 +16,9 @@ extension RGB {
         )
     }
 
-    /// Folder color when the account set none: Discord's default blurple (0x5865F2).
-    public static let defaultFolder = RGB(rgb: 0x5865F2)
+    /// Folder color when the account set none: Swiftcord v2's SwiftUI `.gray` (0x8E8E93;
+    /// refs/swiftcord-v2-teardown.md, 資料夾), as the user asked (2026-10-17) over Discord's blurple.
+    public static let defaultFolder = RGB(rgb: 0x8E8E93)
 }
 
 extension RailDM {
