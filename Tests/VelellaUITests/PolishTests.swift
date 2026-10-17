@@ -38,6 +38,14 @@ private let tipSize = CGSize(width: 120, height: 33)
     #expect(TooltipPlacement.origin(size: tipSize, source: CGRect(x: 300, y: 10, width: 40, height: 18), container: tiny).y == 8)
 }
 
+/// The toolbar title's tip (v2, l-guild-name-hover-frost.png): always below, even with room above
+/// or no container at all.
+@Test func aBottomEdgeTooltipSitsBelowItsSourceWhateverIsAbove() {
+    let source = CGRect(x: 300, y: 400, width: 40, height: 18)
+    #expect(TooltipPlacement.origin(size: tipSize, source: source, container: column, edge: .bottom).y == source.maxY + 6)
+    #expect(TooltipPlacement.origin(size: tipSize, source: source, container: TooltipSpace.unbounded, edge: .bottom).y == source.maxY + 6)
+}
+
 @Test func tooltipSizesAreTruncatedToWholePoints() {
     let origin = TooltipPlacement.origin(size: CGSize(width: 120.9, height: 33.9), source: CGRect(x: 300, y: 400, width: 40, height: 18), container: column)
     #expect(origin == CGPoint(x: 320 - 60, y: 400 - 33 - 6))

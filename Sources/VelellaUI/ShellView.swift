@@ -150,6 +150,9 @@ public struct ShellView: View {
         if let title = state.isDMMode ? "Direct Messages" : state.serverName {
             Text(title).font(T.Typography.toolbarTitle).lineLimit(1)
                 .frame(maxWidth: max(0, sidebarWidth - T.Size.sidebarToolbarReserved), alignment: .leading)
+                // v2 names the column in its glass tip on hover, below the title (the user's
+                // capture, 2026-10-17).
+                .tooltip(title, edge: .bottom)
         }
     }
 }

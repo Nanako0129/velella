@@ -29,11 +29,14 @@ enum TooltipPlacement {
     /// Where v2 puts a tooltip of `size` for a `source` rect (all in one coordinate space), as
     /// 0x102a07570 does: sizes truncated to whole points; centred on the source and clamped to
     /// the container inset by `containerInset`; above by `spacing`, else below, else the container top.
-    static func origin(size: CGSize, source: CGRect, container: CGRect) -> CGPoint {
+    static func origin(size: CGSize, source: CGRect, container: CGRect, edge: VerticalEdge = .top) -> CGPoint {
         let area = container.insetBy(dx: TooltipStyle.containerInset, dy: TooltipStyle.containerInset)
         let width = size.width.rounded(.towardZero), height = size.height.rounded(.towardZero)
         let centred = max(source.midX - width / 2, area.minX)
         let x = min(centred, max(area.maxX - width, area.minX))
+        // A source at the window's top (the toolbar title) has no room above: v2 shows its tip below
+        // (the user's capture l-guild-name-hover-frost.png, 2026-10-17).
+        if edge == .bottom { return CGPoint(x: x, y: source.maxY + TooltipStyle.spacing) }
         var y = source.minY - height - TooltipStyle.spacing
         if y < area.minY { y = min(source.maxY + TooltipStyle.spacing, area.maxY - height) }
         return CGPoint(x: x, y: max(y, area.minY))
@@ -111,6 +114,7 @@ private struct TooltipSurfaceModifier: ViewModifier {
 struct TooltipRequest: Equatable {
     var text: String
     var rect: CGRect?
+    var edge: VerticalEdge = .top
 }
 
 /// Draws `request` over the host without taking layout space or hits.
@@ -129,8 +133,8 @@ private struct TooltipOverlay: ViewModifier {
                         let source = request.rect ?? CGRect(origin: .zero, size: host.size)
                         Color.clear.overlay(alignment: .topLeading) {
                             TooltipBubble(text: request.text)
-                                .alignmentGuide(.leading) { d in -TooltipPlacement.origin(size: d.size, source: source, container: area).x }
-                                .alignmentGuide(.top) { d in -TooltipPlacement.origin(size: d.size, source: source, container: area).y }
+                                .alignmentGuide(.leading) { d in -TooltipPlacement.origin(size: d.size, source: source, container: area, edge: request.edge).x }
+                                .alignmentGuide(.top) { d in -TooltipPlacement.origin(size: d.size, source: source, container: area, edge: request.edge).y }
                                 .transition(.opacity)
                         }
                     }
@@ -149,17 +153,19 @@ extension View {
     /// Shows `request` as the v2 tooltip (the paragraph picks runs itself).
     func tooltipOverlay(_ request: TooltipRequest?) -> some View { modifier(TooltipOverlay(request: request)) }
 
-    /// A v2 tooltip on the whole view while the pointer is on it.
-    func tooltip(_ text: String) -> some View { modifier(HoverTooltip(text: text)) }
+    /// A v2 tooltip on the whole view while the pointer is on it; `edge: .bottom` always puts it
+    /// below (a source with no room above).
+    func tooltip(_ text: String, edge: VerticalEdge = .top) -> some View { modifier(HoverTooltip(text: text, edge: edge)) }
 }
 
 private struct HoverTooltip: ViewModifier {
     let text: String
+    var edge: VerticalEdge = .top
     @State private var shown = false
 
     func body(content: Content) -> some View {
         content
             .onHover { shown = $0 }
-            .tooltipOverlay(shown ? TooltipRequest(text: text, rect: nil) : nil)
+            .tooltipOverlay(shown ? TooltipRequest(text: text, rect: nil, edge: edge) : nil)
     }
 }
