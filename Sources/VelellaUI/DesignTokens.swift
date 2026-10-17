@@ -405,9 +405,8 @@ enum DesignTokens {
         /// Channel-button fills: selected and hovered.
         static let channelSelectedFill = Color.gray.opacity(0.3)
         static let channelHoverFill = Color.gray.opacity(0.2)
-        /// Rail icon fills: idle and active (hover/selected) when the icon has no artwork.
+        /// Rail tile behind initials and symbols when idle (an icon with artwork has no tile).
         static let railIconIdleFill = Color.gray.opacity(0.25)
-        static let railIconActiveFill = Color.gray.opacity(0.35)
         /// Backdrop of the mini thumbs in a collapsed folder.
         static let folderThumbFill = Color.gray.opacity(0.15)
         /// Open folder's glyph square, idle and hover (legacy values; b-rail-folder.png shows the

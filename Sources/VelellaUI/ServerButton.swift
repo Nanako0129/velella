@@ -76,8 +76,15 @@ struct ServerButtonStyle: ButtonStyle {
 
     private var active: Bool { hovered || selected }
 
+    private var hasArtwork: Bool {
+        if case .url = icon { return true }
+        return false
+    }
+
+    /// Artwork fills the squircle edge to edge with nothing behind it, so its transparent pixels
+    /// show the rail (Swiftcord v2, user's capture 2026-10-17); initials and symbols sit on a tile.
     private var fill: Color {
-        if case .url = icon { return active ? T.Palette.railIconActiveFill : T.Palette.railIconIdleFill }
+        if hasArtwork { return .clear }
         return active ? Color.accentColor : T.Palette.railIconIdleFill
     }
 
@@ -88,7 +95,7 @@ struct ServerButtonStyle: ButtonStyle {
                                             T.Typography.railInitialsMinSize)),
             symbolFont: T.Typography.railSymbol
         )
-        .padding(T.Spacing.xs)
+        .padding(hasArtwork ? 0 : T.Spacing.xs)
         .frame(width: T.Size.railIcon, height: T.Size.railIcon)
         .foregroundStyle(active ? Color.white : Color.primary)
         .background(fill)
