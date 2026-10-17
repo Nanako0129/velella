@@ -167,6 +167,11 @@ enum FilePromises {
                 switch result {
                 case .failure:
                     gate.finish(nil)
+                case .success(let url) where !isDirectChild(url, of: directory):
+                    // AppKit names a promised file by its base name in the destination; anything else
+                    // (a nested path, another directory, "." or "..") fails the promise, so the
+                    // cleanup in `dropped` only ever sees direct children of this directory.
+                    gate.finish(nil)
                 case .success(let url):
                     let (urls, reports) = arrived.update { state in
                         state.urls.append(url)
@@ -185,6 +190,13 @@ enum FilePromises {
         // Any file of the directory removes it, with the files already written.
         services.remove(directory.appendingPathComponent("promise"))
         return []
+    }
+
+    /// True when `url` names an entry directly inside `directory`, compared without resolving links.
+    static func isDirectChild(_ url: URL, of directory: URL) -> Bool {
+        let name = url.lastPathComponent
+        guard !name.isEmpty, name != ".", name != "..", !name.contains("/") else { return false }
+        return url.deletingLastPathComponent().standardizedFileURL.path == directory.standardizedFileURL.path
     }
 
     /// Resumes its continuation once, whoever finishes first (a report, a failure, the timeout).

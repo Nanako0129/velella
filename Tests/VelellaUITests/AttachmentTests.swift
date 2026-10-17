@@ -797,6 +797,44 @@ private final class SymlinkPromise: FilePromiseSource, @unchecked Sendable {
     }
 }
 
+/// A promise that reports whatever URL it is told to (a nested path, one outside its directory, a dot
+/// name), after creating a file there when it can: out of AppKit's contract, so it must fail the
+/// promise and delete nothing outside (CUA re-verifier A1).
+private final class ReportingPromise: FilePromiseSource, @unchecked Sendable {
+    let make: @Sendable (URL) -> URL
+    init(_ make: @escaping @Sendable (URL) -> URL) { self.make = make }
+    var count: Int { 1 }
+    func receive(into directory: URL, report: @escaping @Sendable (Result<URL, any Error>) -> Void) {
+        let url = make(directory)
+        DispatchQueue.global().async {
+            try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try? Data("x".utf8).write(to: url)
+            report(.success(url))
+        }
+    }
+}
+
+@MainActor @Test func aPromiseReportingAnythingButADirectChildFailsAndDeletesNothingOutside() async throws {
+    let victim = FileManager.default.temporaryDirectory.appendingPathComponent("velella-victim-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: victim, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: victim) }
+    let outsider = victim.appendingPathComponent("keep.txt")
+    try Data("keep".utf8).write(to: outsider)
+    let cases: [(String, @Sendable (URL) -> URL)] = [
+        ("nested", { $0.appendingPathComponent("sub/a.txt") }),
+        ("outside", { _ in outsider }),
+        ("dot", { $0.appendingPathComponent(".") }),
+        ("dot-dot", { $0.appendingPathComponent("..") }),
+    ]
+    for (label, make) in cases {
+        let rig = await Rig()
+        await rig.controller.dropped([], promises: [ReportingPromise(make)], shift: false, conversation: "1")
+        #expect(rig.queue.isEmpty, "\(label): nothing is added")
+        #expect(FileManager.default.fileExists(atPath: outsider.path), "\(label): the file outside survives")
+    }
+    #expect(FilePromises.isDirectChild(URL(fileURLWithPath: "/tmp/d/a.txt"), of: URL(fileURLWithPath: "/tmp/d")))
+}
+
 @MainActor @Test func aShiftDropOfAPromiseSendsTheReceivedFileAtOnce() async throws {
     let rig = await Rig()
     rig.model.draft = "kept"
