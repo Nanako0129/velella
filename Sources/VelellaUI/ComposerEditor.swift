@@ -139,6 +139,14 @@ final class ComposerTextView: NSTextView {
     /// What a paste reads; tests give it their own board.
     var pasteboard: NSPasteboard = .general
 
+    /// AppKit enables Paste only for types this plain-text view reads, which leaves out PNG and TIFF,
+    /// so a board holding just an image (a copied screenshot) disabled ⌘V and never reached `paste(_:)`
+    /// (user's live check, 2026-10-17). Paste is enabled whenever the composer would take the board.
+    override func validateUserInterfaceItem(_ item: any NSValidatedUserInterfaceItem) -> Bool {
+        if item.action == #selector(paste(_:)), onPaste != nil, PasteContent(pasteboard) != nil { return true }
+        return super.validateUserInterfaceItem(item)
+    }
+
     /// Files, an image or a long text become attachments when the composer takes them; anything else
     /// is plain text, whatever the pasteboard carries.
     override func paste(_ sender: Any?) {

@@ -942,6 +942,28 @@ private final class ReportingPromise: FilePromiseSource, @unchecked Sendable {
     #expect(item.url.deletingLastPathComponent().deletingLastPathComponent().resolvingSymlinksInPath().path == rig.fake.files.root.resolvingSymlinksInPath().path, "CU-1: <root>/<UUID>/image.png")
 }
 
+/// The live failure (2026-10-17): with only an image on the board, AppKit disabled Paste for the
+/// plain-text editor, so ⌘V never reached `paste(_:)`. The Edit menu's Paste item is validated here
+/// as the menu would, then performed on the editor.
+@MainActor @Test func pasteStaysEnabledForAnImageOnlyBoardAndAttachesIt() async throws {
+    let rig = await Rig()
+    let bytes = try #require(encoded(png(width: 6, height: 4), as: .png))
+    let pasted = board()
+    pasted.setData(bytes, forType: .png)
+    let editor = rig.editor
+    editor.pasteboard = pasted
+    rig.window.makeFirstResponder(editor)
+    let item = NSMenuItem(title: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+    #expect(editor.validateUserInterfaceItem(item), "Paste is enabled for an image-only board")
+    // The offscreen test window is not key, so the action goes to the editor directly.
+    #expect(NSApp.sendAction(#selector(NSText.paste(_:)), to: editor, from: item))
+    await settle(rig.host)
+    #expect(rig.queue.map(\.filename) == ["image.png"])
+    // Without the composer taking attachments, validation is AppKit's own: nothing readable, disabled.
+    editor.onPaste = nil
+    #expect(!editor.validateUserInterfaceItem(item), "an image-only board stays disabled when attaching is off")
+}
+
 @MainActor @Test func aPastedTIFFIsEncodedToPNG() async throws {
     let rig = await Rig()
     let tiff = try #require(encoded(png(width: 6, height: 4), as: .tiff))
