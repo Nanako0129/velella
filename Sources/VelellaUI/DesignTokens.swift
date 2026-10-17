@@ -189,10 +189,10 @@ enum DesignTokens {
         /// both sides. The "+" and the glyphs each take this height, so aligned to the last line
         /// of a multi-line input (D1) they sit exactly where they sat centred on the single line.
         static let composerRow: CGFloat = composerHeight - 2 * Spacing.sm
-        /// Editor insets above and below the text: (`composerRow` - the 13 pt body's ~16 pt line) / 2,
-        /// so a single line is centred in `composerRow` as the old text field was, and the
-        /// placeholder aligns to the same top.
-        static let composerInputInset: CGFloat = 10
+        /// Editor insets above and below the text: (`composerRow` - the 15 pt composer font's ~18 pt
+        /// line) / 2, so a single line stays centred in `composerRow` and the card stays 52 pt, and
+        /// the placeholder aligns to the same top.
+        static let composerInputInset: CGFloat = 9
         /// The editor's height limit (plan D2, Swiftcord v2): `composerMaxHeight`, or half the
         /// window's safe-area height when that is smaller; `composerNoWindowHeight` stands in for
         /// that half before the view has a window.
@@ -286,9 +286,13 @@ enum DesignTokens {
         static let footerName = Font.system(size: 13, weight: .semibold)
         static let footerUsername = Font.system(size: 11)
         static let badge = Font.caption2.weight(.bold)
-        static let composer = Font.body
-        /// The same font for the AppKit editor (`.body` is 13 pt on macOS).
-        static var composerAppKit: NSFont { .preferredFont(forTextStyle: .body) }
+        /// Composer text: Swiftcord v2's `systemFont(ofSize: 15)` (refs/swiftcord-v2-teardown.md,
+        /// composer `makeUIView`); the user's side-by-side capture measured 15 pt glyphs there against
+        /// velella's 13 pt body (2026-10-17, g-composer-text-size.png).
+        static let composer = Font.system(size: composerSize)
+        static let composerSize: CGFloat = 15
+        /// The same font for the AppKit editor.
+        static var composerAppKit: NSFont { .systemFont(ofSize: composerSize) }
         /// Character counter and its upsell line.
         static let composerCounter = Font.system(size: 12)
         /// Composer glyphs and reply bar, from Swiftcord v2's rendered composer (user's capture,

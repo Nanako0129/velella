@@ -149,8 +149,9 @@ private func lines(_ n: Int) -> String { (1...n).map { "line \($0)" }.joined(sep
     #expect(ComposerRules.heightLimit(windowSafeHeight: 640) == 320)
     #expect(ComposerRules.heightLimit(windowSafeHeight: nil) == 160)
     #expect(ComposerRules.height(contentMaxY: 0, limit: 320) == DesignTokens.Size.composerRow)
-    #expect(ComposerRules.height(contentMaxY: 100.2, limit: 320) == 121)
-    #expect(ComposerRules.height(contentMaxY: 100.006, limit: 320) == 120, "layout noise of 0.006 adds no point")
+    let insets = 2 * DesignTokens.Size.composerInputInset
+    #expect(ComposerRules.height(contentMaxY: 100.2, limit: 320) == 101 + insets)
+    #expect(ComposerRules.height(contentMaxY: 100.006, limit: 320) == 100 + insets, "layout noise of 0.006 adds no point")
     #expect(ComposerRules.height(contentMaxY: 1000, limit: 200) == 200)
     // A window too small for one line still gets one line.
     #expect(ComposerRules.height(contentMaxY: 1000, limit: 10) == DesignTokens.Size.composerRow)
