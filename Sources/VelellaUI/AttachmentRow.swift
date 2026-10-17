@@ -161,16 +161,17 @@ final class AttachmentController {
         }
         let entries = await AttachmentIntake.entries(for: files, services: services)
         // A received file that did not become an entry (not a regular file, or replaced by its
-        // conversion) is no one's. One promise can deliver several files into one directory, so a
-        // file whose directory still holds a queued sibling is deleted alone; otherwise it goes with
-        // its directory.
+        // conversion) is no one's. One promise can deliver several files into one directory, so when
+        // that directory still holds a received file that is queued, the leftover is deleted alone;
+        // otherwise it goes with its directory through `remove`, which never leaves CU-1's root.
+        // Both decisions use the URL as received inside the promise directory, never a resolved
+        // one: a received symlink is removed itself and its target is never touched.
         let kept = Set(entries.map(\.file.path))
-        let keptDirectories = Set(entries.map { URL(fileURLWithPath: $0.file.path).deletingLastPathComponent().path })
-        for url in received {
-            let resolved = url.resolvingSymlinksInPath()
-            guard !kept.contains(resolved.path) else { continue }
-            if keptDirectories.contains(resolved.deletingLastPathComponent().path) {
-                try? FileManager.default.removeItem(at: resolved)
+        let isKept: (URL) -> Bool = { kept.contains($0.resolvingSymlinksInPath().path) }
+        let keptDirectories = Set(received.filter(isKept).map { $0.deletingLastPathComponent().standardizedFileURL.path })
+        for url in received where !isKept(url) {
+            if keptDirectories.contains(url.deletingLastPathComponent().standardizedFileURL.path) {
+                try? FileManager.default.removeItem(at: url)
             } else {
                 services.remove(url)
             }

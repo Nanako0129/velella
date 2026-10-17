@@ -759,6 +759,44 @@ private final class PromiseStub: FilePromiseSource, @unchecked Sendable {
     #expect(rig.queue.map { FileManager.default.fileExists(atPath: $0.url.path) } == [true, true], "both queued files still exist")
 }
 
+/// A promise that writes symlinks to files and a folder outside its directory (CUA re-verifier F5):
+/// leftovers are removed by the received link, never by its target.
+private final class SymlinkPromise: FilePromiseSource, @unchecked Sendable {
+    let links: [(String, URL)]
+    init(_ links: [(String, URL)]) { self.links = links }
+    var count: Int { links.count }
+    func receive(into directory: URL, report: @escaping @Sendable (Result<URL, any Error>) -> Void) {
+        let links = links
+        DispatchQueue.global().async {
+            for (name, target) in links {
+                let url = directory.appendingPathComponent(name)
+                try? FileManager.default.createSymbolicLink(at: url, withDestinationURL: target)
+                report(.success(url))
+            }
+        }
+    }
+}
+
+@MainActor @Test func promisedSymlinksNeverLeadToDeletingTheirTargets() async throws {
+    let rig = await Rig()
+    rig.fake.conversion = .enabled(quality: 70, maxFileSizeBytes: 20_971_520)
+    let victim = FileManager.default.temporaryDirectory.appendingPathComponent("velella-victim-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: victim.appendingPathComponent("folder"), withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: victim) }
+    try Data("a".utf8).write(to: victim.appendingPathComponent("a.txt"))
+    try jpegWithOrientation(width: 30, height: 20, orientation: 1).write(to: victim.appendingPathComponent("b.HEIC"))
+    try Data("x".utf8).write(to: victim.appendingPathComponent("folder/inside.txt"))
+    let promise = SymlinkPromise([
+        ("a.txt", victim.appendingPathComponent("a.txt")),
+        ("b.HEIC", victim.appendingPathComponent("b.HEIC")),
+        ("folder", victim.appendingPathComponent("folder")),
+    ])
+    await rig.controller.dropped([], promises: [promise], shift: false, conversation: "1")
+    for name in ["a.txt", "b.HEIC", "folder", "folder/inside.txt"] {
+        #expect(FileManager.default.fileExists(atPath: victim.appendingPathComponent(name).path), "\(name) outside the temp root survives")
+    }
+}
+
 @MainActor @Test func aShiftDropOfAPromiseSendsTheReceivedFileAtOnce() async throws {
     let rig = await Rig()
     rig.model.draft = "kept"
