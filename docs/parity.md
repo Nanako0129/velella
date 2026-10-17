@@ -68,14 +68,14 @@
 |---|---|---|---|---|
 | Home 與 DM 入口 | 頂端 Home / Direct Messages 按鈕，開啟 DM 列表與 Friends；從伺服器按 Ctrl+1 回到 Home | 部分 | 未排 | 有 DM 入口與未讀總數，沒有 Home 頁（status：missing Home） |
 | Favorites 伺服器圖示與檢視 | Nitro 實驗（2026）；收錄文字/語音/論壇頻道與 DM（不含討論串），可自建分類 | 未做 | 未排 | 實驗功能 |
-| 伺服器圖示與提示 | 方形圓角圖示、動態圖示需 Boost Level 1；hover 顯示名稱與類型徽章（Community、Discoverable、Partnered、Verified）；選取/hover 指示條 | 部分 | 未排 | 圖示、選取、hover 條完成；類型徽章 tooltip 未做 |
+| 伺服器圖示與提示 | 方形圓角圖示、動態圖示需 Boost Level 1；hover 顯示名稱與類型徽章（Community、Discoverable、Partnered、Verified）；選取/hover 指示條 | 部分 | 未排 | 圖示填滿圓角方形、透明保持透明（同 Swiftcord，2026-10-17）、選取與 hover 條完成；伺服器名稱 hover 的玻璃提示框只做在側欄標題；類型徽章 tooltip 未做 |
 | 未讀與提及標記 | 未讀指示、紅色提及計數（@username、@role、@everyone、@here）、靜音伺服器狀態（無未讀，仍顯示提及） | 完成 | 未排 | 未讀指示的靜音細節為 unconfirmed |
 | 伺服器重新排序 | 拖曳排序（資料夾同理）；鍵盤排序（Ctrl/Cmd+D 舉起、方向鍵移動、Space/Enter 放下） | 未做 | 未排 | 目前排序來源未追蹤（status：partial） |
 | 伺服器導覽快捷鍵 | Cmd+Option+Up/Down 切換伺服器；Shift+Esc 標記伺服器已讀 | 未做 | 未排 | 另見 Keyboard shortcuts |
 | 側欄捲動與語音浮窗 | 側欄可捲動、底部 Discover 完全可達（2026 修正）；通話中伺服器側欄的語音 popover | 部分 | 未排 | 可捲動；語音 popover 為 unconfirmed 且語音未做 |
 | Student Hubs 入口 | 左下角 Explore Public Servers，找學校的 Student Hub | 未做 | 未排 | |
 | 側欄底部其他入口 | Download Apps 按鈕、Nitro / Shop 入口（位於 Home 側欄而非 rail） | 未做 | 未排 | 兩項皆 unconfirmed；桌面版無下載 App 的意義 |
-| 資料夾顯示與展開 | 資料夾預覽、展開/收合（螢幕閱讀器朗讀展開狀態）、資料夾通知徽章、顏色 | 完成 | 未排 | 資料夾於 READY 後不更新（status：partial 的一部分），展開動作 unconfirmed |
+| 資料夾顯示與展開 | 資料夾預覽、展開/收合（螢幕閱讀器朗讀展開狀態）、資料夾通知徽章、顏色 | 完成 | 未排 | 展開狀態依資料夾記住（2026-10-17）；沒有顏色的資料夾用 Swiftcord 的灰色（使用者決定，官方為 blurple）；資料夾於 READY 後不更新（status：partial 的一部分） |
 | 資料夾建立與編輯 | 拖曳伺服器到另一個伺服器上停留後建立；無障礙動作建立；拖入/拖出；每個資料夾最多 100 個伺服器；資料夾不能合併；行動版長按移動 | 未做 | 未排 | |
 | 資料夾選單與設定 | 右鍵 Folder Settings、Mark Server Folder as Read；設定對話框可改名與顏色（id、name、color） | 未做 | 未排 | 設定對話框為 unconfirmed |
 | 新增伺服器 | 底部「+」按鈕（Ctrl/Cmd+Shift+N）；Create My Own（For a club or community / For me and my friends）；範本建立與範本連結預覽；邀請碼欄位；Quick Switcher 貼邀請連結加入 | 未做 | 未排 | |
@@ -248,20 +248,20 @@
 ## Composer
 | 功能群組 | 官方行為摘要 | velella 狀態 | 排程 | 備註 |
 |---|---|---|---|---|
-| 輸入框基礎 | 富文字輸入框（即時 markdown 預覽：劇透底色、程式碼區塊偵測）；占位文字「Message #channel / @user」（unconfirmed）；Enter 送出與 Shift+Enter 換行；拼字檢查；Home/End 鍵（2026） | 部分 | 未排 | 純文字欄位、Return 送出完成；其餘未做 |
+| 輸入框基礎 | 富文字輸入框（即時 markdown 預覽：劇透底色、程式碼區塊偵測）；占位文字「Message #channel / @user」（unconfirmed）；Enter 送出與 Shift+Enter 換行；拼字檢查；Home/End 鍵（2026） | 部分 | 未排 | 多行輸入框（composer CG，2026-10-17）：依 Swiftcord 長高到 min(320 pt, 半個視窗)、Shift+Return 換行、程式碼區塊內 Return 換行、Esc 取消回覆、拼字檢查、字級 15 pt；即時 markdown 預覽、占位文字帶頻道名、Home/End 未做 |
 | 草稿 | 切換頻道時保留未送文字（unconfirmed）；討論串另計 | 完成 | 未排 | 每頻道草稿 |
-| 字數限制 | 2000 字（Nitro 4000），接近上限出現計數器 | 未做 | 未排 | |
+| 字數限制 | 2000 字（Nitro 4000），接近上限出現計數器 | 部分 | 未排 | composer CG：上限依 premium_type、UTF-16 計數、剩 10% 顯示官方計數文字、超過擋下送出並跳官方提示（Nitro）；非 Nitro 的升級視窗版面不在本機（官方 chunk 404），以原生提示顯示官方文案 |
 | 格式快捷鍵與劇透按鈕 | Cmd+B/I/U、選取文字時的浮動格式工具列（unconfirmed）；選取後點眼睛圖示變劇透 | 未做 | 未排 | |
 | 自動完成：提及與頻道 | @ 提及（成員、角色、@everyone/@here、@time、@game，2026）；# 頻道（含討論串，unconfirmed） | 未做 | 未排 | |
 | 自動完成：emoji 與貼圖 | : 觸發 emoji 建議（依使用頻率、膚色）、輸入時的貼圖建議（Up 進入、左右選擇、Enter） | 未做 | 未排 | emoji 自動完成與 P1 的選擇器不同 |
 | 斜線指令 | / 指令選擇器（內建與 App 指令、App 圖示列、frecency、選項 chip）；內建指令 /tts、/spoiler、/me、/shrug、/tableflip、/unflip、/nick…（unconfirmed） | 未做 | 未排 | 互動送出在 G 之後才有基礎，但輸入端未排 |
 | @silent | 前綴 @silent 送出不推播（SUPPRESS_NOTIFICATIONS 旗標） | 未做 | 未排 | |
-| 「+」選單與上傳 | 「+」選單（Upload a File、Create Thread、Create Poll、Use Apps/Activities，unconfirmed）；上傳（按鈕、拖放、貼上、Cmd+Shift+U，unconfirmed）；附件托盤（Modify：改名、alt text、劇透、移除）；明確媒體上傳阻擋 | 未做 | 未排 | 「+」選單是 stub，拖放為 CLAUDE.md 所列入口 |
+| 「+」選單與上傳 | 「+」選單（Upload a File、Create Thread、Create Poll、Use Apps/Activities，unconfirmed）；上傳（按鈕、拖放、貼上、Cmd+Shift+U，unconfirmed）；附件托盤（Modify：改名、alt text、劇透、移除）；明確媒體上傳阻擋 | 部分 | 未排 | composer CU/CUA（2026-10-17，實機驗收 OK）：Upload a File、整個視窗拖放（官方提示層，Shift 直接送出）、貼上檔案/截圖/長文（message.txt）、「照片」與 Mail 的 file promise、附件卡（Swiftcord 外觀＋暴雷、Modify、移除）、HEIC/JXR 依實驗轉檔、送出時上傳（Safari 跨站 PUT＋預檢，標頭順序為已知差異）、待送與失敗重試、各種上限提示、ATTACH_FILES；Create Thread／Poll／Apps 仍是 stub，Cmd+Shift+U 與明確媒體阻擋未做 |
 | 選擇器按鈕 | Emoji 選擇器（分類、搜尋、伺服器區段、Nitro 鎖定，unconfirmed）；GIF 選擇器（2026 供應商由 Tenor 換為 Klipy/GIPHY，unconfirmed）；貼圖選擇器（標準包、伺服器貼圖、Nitro 跨伺服器） | 未做 | P1（emoji 選擇器） | GIF/貼圖/emoji 按鈕目前為裝飾；P1 的選擇器是獨立視圖，是否接入輸入框待 P1 合約 |
 | 禮物、Apps 與 Confetti 按鈕 | Gift 按鈕（Nitro/Shop 禮物）；App Launcher 按鈕（Recents、Collections、搜尋、App 指令）；Emoji Confetti 按鈕與橫幅 | 未做 | 未排 | |
 | 投票建立 | 問題、最多 10 個答案（可附 emoji）、持續時間（1h、4h、8h…）、多選 | 未做 | 未排 | |
 | 語音訊息錄製 | 僅行動版（按住麥克風、滑動鎖定、垃圾桶取消）；桌面只能播放 | macOS 無此功能 | 未排 | 桌面官方客戶端也無錄製；播放見 Message display |
-| 回覆模式 | 輸入框上方「Replying to {name}」與 @ ON/OFF 提及開關 | 部分 | 未排 | 回覆列與取消完成；@ ON/OFF 開關未提 |
+| 回覆模式 | 輸入框上方「Replying to {name}」與 @ ON/OFF 提及開關 | 部分 | B | 回覆列與取消完成，進出用 Swiftcord 的 blurReplace＋彈簧轉場（composer CG）；@ ON/OFF 開關屬選單 B |
 | 編輯模式 | 行內編輯器取代訊息，Enter 儲存、Esc 取消（unconfirmed 細節）；空輸入框按 Up 編輯上一則自己的訊息 | 未做 | B | |
 | 輸入中事件送出 | 打字時送出 typing 事件（約每 10 秒，unconfirmed） | 未做 | 未排 | status：send typing 未做 |
 | 輸入框狀態：發送限制 | Slowmode 倒數（5 秒–6 小時，Bypass Slowmode 權限）、Timed-out 狀態（輸入框停用）、無權限狀態（unconfirmed 文案）、DM 被封鎖或隱私設定禁止（unconfirmed） | 未做 | 未排 | F1 的權限計算是前置基礎但輸入框狀態未排 |

@@ -1,4 +1,4 @@
-# velella Composer Growth, Long Text and Attachments Plan (revision 1.10)
+# velella Composer Growth, Long Text and Attachments Plan (revision 1.11)
 
 Repo: /Users/nanako/side-project/velella, branch `sel-int` (merged into `m1` with the menu wave). Ground truth:
 
@@ -138,3 +138,11 @@ Fidelity baseline: velella identifies as the Safari web client, so every upload 
 | CU-9 | P3 | Cancel after the message create was dispatched races the DELETE | Fixed in contract: once the create is dispatched, cancel no longer DELETEs and the outcome is whatever the create returns; DELETE only for completed uploads of a send cancelled before the create |
 | CU-10 | P3 | The slot request's retry policy is unnamed; ATTACH_FILES is enforced only by hiding UI | Fixed in contract: the slot request retries on transport errors, 5xx and 429 (with §17's waits) at most 12 times with backoff, no other status (official `{retries: 12, backoff}`, A1); core refuses send-with-attachments, sending nothing, unless F1 says ATTACH_FILES is allowed or the channel is a DM (Unknown refuses, S-6/S-7); long-paste conversion runs only when attaching is allowed |
 | P4 | P4 | Exact byte constants; slot `id` scheme; `"description":""` after an edit; pasted TIFF; the allow-list has no method dimension; the Shift-drop location; the `uploadLongMessages` setting | Fixed in contract: limits in bytes (500 MB = 524,288,000; 1 GiB = 1,073,741,824; 50 MiB = 52,428,800; 20 MiB = 20,971,520; 10 MiB = 10,485,760); slot `id` from a process-wide monotonic decimal counter (lodash `uniqueId` semantics), message ids by index; an edited description is sent even when `""` (official `!= null`); pasted images prefer `public.png`, TIFF is encoded to PNG; the GCS rule lives in an upload-only allow-list consulted only by the upload operation; the Shift-drop location `instant_upload` is established (OA A35, found after the review's input); long-paste conversion follows the user's `uploadLongMessages` setting where velella can read it, else the official default (on) |
+
+## Live acceptance (user, 2026-10-17)
+
+| Check | Result |
+|---|---|
+| CU host (D13a) | Passed: the first upload logged `discord-attachments-uploads-prd.storage.googleapis.com`; Discord kept the filename and type (message 1560819151642173601) |
+| CUA 1-10 (Upload a File, paste a screenshot, long paste, spoiler, Modify, remove, send with progress, cancel, Shift-drop, a Photos drag) | All passed. Item 2 (⌘V of an image-only clipboard) first failed: the plain-text editor's Paste was disabled for PNG/TIFF; fixed in 7d32ca0, then passed |
+| CG composer | Used throughout the checks; the user's side-by-side capture led to the 15 pt font (b23702c) |
